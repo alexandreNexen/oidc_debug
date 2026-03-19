@@ -1,0 +1,11 @@
+{
+  "name": "oidc_debug",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Application web de diagnostic OpenID Connect",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  }
+}
