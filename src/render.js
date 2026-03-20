@@ -265,12 +265,13 @@ function renderInput(label, name, value, options = {}) {
   const placeholder = options.placeholder || "";
   const help = options.help || "";
   const required = options.required ? "required" : "";
+  const disabled = options.disabled ? "disabled" : "";
   const inputClass = options.long ? "field field--wide" : "field";
 
   return `
     <label class="${inputClass}">
       <span>${escapeHtml(label)}</span>
-      <input type="${escapeHtml(type)}" name="${escapeHtml(name)}" value="${escapeHtml(value || "")}" placeholder="${escapeHtml(placeholder)}" ${required} />
+      <input type="${escapeHtml(type)}" name="${escapeHtml(name)}" value="${escapeHtml(value || "")}" placeholder="${escapeHtml(placeholder)}" ${required} ${disabled} />
       ${help ? `<small>${escapeHtml(help)}</small>` : ""}
     </label>
   `;
@@ -290,6 +291,27 @@ function renderSelect(label, name, value, entries) {
       </select>
     </label>
   `;
+}
+
+function renderServerSecretField(config, serverClientSecretConfigured) {
+  const secretRequired = ["client_secret_basic", "client_secret_post"].includes(config.tokenEndpointAuthMethod);
+  const statusLabel = !secretRequired
+    ? "Non utilise par cette configuration"
+    : serverClientSecretConfigured
+      ? "Configure cote serveur"
+      : "Absent cote serveur";
+  const statusTone = !secretRequired || serverClientSecretConfigured ? "success" : "warning";
+  const help = secretRequired
+    ? "Le navigateur ne voit jamais cette valeur. Configure `OIDC_CLIENT_SECRET` dans Render."
+    : "La methode d'authentification /token choisie n'utilise pas de secret client.";
+
+  return renderInput("Client Secret", "clientSecret", "", {
+    type: "password",
+    long: true,
+    disabled: true,
+    placeholder: "Gere uniquement par le serveur",
+    help: `${statusLabel}. ${help}`
+  }).replace("</label>", `<small><span class="${statusClass(statusTone)}">${escapeHtml(statusLabel)}</span></small></label>`);
 }
 
 function callbackStatus(callback) {
@@ -369,12 +391,16 @@ function summaryCards(session) {
     .join("");
 }
 
-export function renderPage({ session, activeTab = "configuration", baseUrl, flash = null }) {
+export function renderPage({ session, activeTab = "configuration", baseUrl, serverClientSecretConfigured = false, flash = null }) {
   const callback = session.steps.callback;
   const callbackBadge = callbackStatus(callback);
   const sessionJsonUrl = `/oidc/session/${encodeURIComponent(session.id)}`;
   const redactedSnapshot = {
-    config: redactObject(session.config),
+    config: {
+      ...redactObject(session.config),
+      clientSecret: serverClientSecretConfigured ? "[server-only]" : "",
+      serverClientSecretConfigured
+    },
     steps: redactObject(session.steps),
     tokens: redactObject(session.tokens)
   };
@@ -439,7 +465,7 @@ export function renderPage({ session, activeTab = "configuration", baseUrl, flas
                 ${renderInput("UserInfo endpoint", "userInfoEndpoint", session.config.userInfoEndpoint, { long: true })}
                 ${renderInput("JWKS URI", "jwksUri", session.config.jwksUri, { long: true })}
                 ${renderInput("Client ID", "clientId", session.config.clientId)}
-                ${renderInput("Client Secret", "clientSecret", session.config.clientSecret, { type: "password" })}
+                ${renderServerSecretField(session.config, serverClientSecretConfigured)}
                 ${renderSelect("Client type", "clientType", session.config.clientType, [
                   ["public", "Public"],
                   ["confidential", "Confidential"]

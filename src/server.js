@@ -25,6 +25,7 @@ const projectRoot = path.resolve(__dirname, "..");
 const PORT = Number(process.env.PORT || 3000);
 const NODE_ENV = process.env.NODE_ENV || "development";
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+const SERVER_CLIENT_SECRET = process.env.OIDC_CLIENT_SECRET || "";
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomUUID();
 const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 const SESSION_COOKIE = "oidc_debug_sid";
@@ -47,6 +48,72 @@ const logLevels = {
   warn: 30,
   error: 40
 };
+
+function configUsesClientSecret(config = {}) {
+  return ["client_secret_basic", "client_secret_post"].includes(config.tokenEndpointAuthMethod);
+}
+
+function getTokenExchangeConfig(config = {}) {
+  if (!configUsesClientSecret(config)) {
+    return {
+      ...config,
+      clientSecret: ""
+    };
+  }
+
+  if (!SERVER_CLIENT_SECRET) {
+    throw new Error(
+      "Le secret client doit etre configure cote serveur via `OIDC_CLIENT_SECRET` pour utiliser cette methode d'authentification /token."
+    );
+  }
+
+  return {
+    ...config,
+    clientSecret: SERVER_CLIENT_SECRET
+  };
+}
+
+function sanitizeTokenRequest(request) {
+  if (!request) {
+    return null;
+  }
+
+  const headers = redactObject(request.headers || {});
+  const params = redactObject(request.params || {});
+  const contentType = request.headers?.["content-type"] || "";
+  const redactedBody = request.redactedBody || redactBodyText(request.body || "", contentType);
+  const redactedCurl = buildCurlCommand({
+    url: request.url,
+    method: request.method,
+    headers,
+    body: redactedBody
+  });
+
+  return {
+    ...request,
+    headers,
+    params,
+    body: "",
+    redactedBody,
+    curl: redactedCurl
+  };
+}
+
+function sanitizeSessionArtifacts(session) {
+  return {
+    ...session,
+    config: normalizeConfig(session.config || {}, BASE_URL),
+    steps: {
+      ...session.steps,
+      token: session.steps?.token
+        ? {
+            ...session.steps.token,
+            request: sanitizeTokenRequest(session.steps.token.request)
+          }
+        : null
+    }
+  };
+}
 
 function shouldLog(level) {
   return (logLevels[level] || 20) >= (logLevels[LOG_LEVEL] || 20);
@@ -104,9 +171,9 @@ function buildPersistedState() {
   return {
     version: 1,
     updatedAt: new Date().toISOString(),
-    defaultConfig: persistedDefaultConfig,
+    defaultConfig: normalizeConfig(persistedDefaultConfig, BASE_URL),
     sessions: Array.from(sessions.values()).map((session) => ({
-      ...session,
+      ...sanitizeSessionArtifacts(session),
       flash: null
     }))
   };
@@ -184,7 +251,12 @@ async function loadPersistedState() {
           discovery: candidate.steps?.discovery || null,
           authorize: candidate.steps?.authorize || null,
           callback: candidate.steps?.callback || null,
-          token: candidate.steps?.token || null,
+          token: candidate.steps?.token
+            ? {
+                ...candidate.steps.token,
+                request: sanitizeTokenRequest(candidate.steps.token.request)
+              }
+            : null,
           userinfo: candidate.steps?.userinfo || null
         },
         tokens: candidate.tokens || null,
@@ -429,13 +501,13 @@ async function serveStatic(res, asset) {
 }
 
 function sanitizeSession(session, reveal = false) {
+  const sanitized = sanitizeSessionArtifacts(session);
+
   if (!reveal) {
-    return redactObject(session);
+    return redactObject(sanitized);
   }
 
-  return {
-    ...session
-  };
+  return sanitized;
 }
 
 function evaluateState(expectedState, receivedState) {
@@ -600,6 +672,7 @@ const server = http.createServer(async (req, res) => {
           session,
           activeTab,
           baseUrl: BASE_URL,
+          serverClientSecretConfigured: Boolean(SERVER_CLIENT_SECRET),
           flash
         })
       );
@@ -808,13 +881,13 @@ const server = http.createServer(async (req, res) => {
 
       try {
         const requestSnapshot = buildTokenExchangeRequest({
-          config: session.config,
+          config: getTokenExchangeConfig(session.config),
           code,
           codeVerifier: session.flow.codeVerifier
         });
         const responseSnapshot = await executeHttp(requestSnapshot);
         session.steps.token = {
-          request: requestSnapshot,
+          request: sanitizeTokenRequest(requestSnapshot),
           response: responseSnapshot
         };
 
@@ -971,7 +1044,8 @@ async function start() {
       nodeEnv: NODE_ENV,
       logLevel: LOG_LEVEL,
       storageDir: STORAGE_DIR,
-      stateFile: STATE_FILE
+      stateFile: STATE_FILE,
+      serverClientSecretConfigured: Boolean(SERVER_CLIENT_SECRET)
     });
   });
 }

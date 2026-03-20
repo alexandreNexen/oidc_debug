@@ -28,6 +28,7 @@
 - `PORT`: port HTTP interne de l'application
 - `NODE_ENV`: mode d'execution
 - `BASE_URL`: URL publique utilisee pour construire le `redirect_uri` par defaut
+- `OIDC_CLIENT_SECRET`: secret client confidentiel, lu uniquement cote serveur pour l'echange `/token`
 - `SESSION_SECRET`: secret de signature du cookie de session
 - `LOG_LEVEL`: `debug`, `info`, `warn`, `error`
 - `STORAGE_DIR`: dossier de persistance des sessions et de la configuration
@@ -69,6 +70,8 @@ Les sessions et la configuration sont persistees dans `./data/state.json` via le
 ## Notes de securite
 
 - Les logs applicatifs redigent les secrets par defaut.
+- Le `client_secret` ne doit plus etre saisi dans l'UI. Configure-le uniquement via `OIDC_CLIENT_SECRET` dans l'environnement serveur (Render).
+- Les snapshots persistants excluent le `client_secret`.
 - Les secrets et tokens sont masques dans l'UI, avec option d'affichage/copie.
 - Les sessions de debug sont en memoire et expirees automatiquement.
 - Cette application n'est pas destinee a la production.

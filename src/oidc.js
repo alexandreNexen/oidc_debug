@@ -77,7 +77,7 @@ export function normalizeConfig(input = {}, baseUrl) {
     userInfoEndpoint: clean(input.userInfoEndpoint, defaults.userInfoEndpoint),
     jwksUri: clean(input.jwksUri, defaults.jwksUri),
     clientId: clean(input.clientId, defaults.clientId),
-    clientSecret: clean(input.clientSecret, defaults.clientSecret),
+    clientSecret: "",
     clientType: ["public", "confidential"].includes(clientType) ? clientType : defaults.clientType,
     redirectUri: clean(input.redirectUri, defaults.redirectUri) || defaults.redirectUri,
     tokenEndpointAuthMethod: ["client_secret_basic", "client_secret_post", "none"].includes(authMethod)
