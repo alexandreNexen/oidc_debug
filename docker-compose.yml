@@ -7,7 +7,6 @@ services:
       PORT: ${PORT:-3000}
       NODE_ENV: ${NODE_ENV:-production}
       BASE_URL: ${BASE_URL:-http://localhost:8080}
-      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
       SESSION_SECRET: ${SESSION_SECRET:-change-me-dev-only}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       STORAGE_DIR: ${STORAGE_DIR:-/data}

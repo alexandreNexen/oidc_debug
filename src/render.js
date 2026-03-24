@@ -1,4 +1,4 @@
-import { redactHeaders, redactObject, toPrettyJson } from "./oidc.js";
+import { DEFAULT_SCOPES, redactHeaders, redactObject, toPrettyJson } from "./oidc.js";
 
 function escapeHtml(value = "") {
   return String(value)
@@ -162,11 +162,7 @@ function renderRequestResponse(step) {
           }
         </header>
         ${response.error ? `<div class="flash flash--error">${escapeHtml(response.error)}</div>` : ""}
-        ${
-          response.diagnostics
-            ? renderPreCard("Diagnostic reseau", response.diagnostics)
-            : ""
-        }
+        ${response.diagnostics ? renderPreCard("Diagnostic reseau", response.diagnostics) : ""}
         ${renderPreCard("Headers", response.headers && Object.keys(response.headers).length ? response.headers : null)}
         ${response.body ? renderSecretBlock("Body brut", response.body, true) : `<p class="empty">Aucun body.</p>`}
         ${response.redactedBody ? renderPreCard("Body masque", response.redactedBody) : ""}
@@ -266,12 +262,13 @@ function renderInput(label, name, value, options = {}) {
   const help = options.help || "";
   const required = options.required ? "required" : "";
   const disabled = options.disabled ? "disabled" : "";
+  const readonly = options.readonly ? "readonly" : "";
   const inputClass = options.long ? "field field--wide" : "field";
 
   return `
     <label class="${inputClass}">
       <span>${escapeHtml(label)}</span>
-      <input type="${escapeHtml(type)}" name="${escapeHtml(name)}" value="${escapeHtml(value || "")}" placeholder="${escapeHtml(placeholder)}" ${required} ${disabled} />
+      <input type="${escapeHtml(type)}" name="${escapeHtml(name)}" value="${escapeHtml(value || "")}" placeholder="${escapeHtml(placeholder)}" ${required} ${disabled} ${readonly} />
       ${help ? `<small>${escapeHtml(help)}</small>` : ""}
     </label>
   `;
@@ -291,27 +288,6 @@ function renderSelect(label, name, value, entries) {
       </select>
     </label>
   `;
-}
-
-function renderServerSecretField(config, serverClientSecretConfigured) {
-  const secretRequired = ["client_secret_basic", "client_secret_post"].includes(config.tokenEndpointAuthMethod);
-  const statusLabel = !secretRequired
-    ? "Non utilise par cette configuration"
-    : serverClientSecretConfigured
-      ? "Configure cote serveur"
-      : "Absent cote serveur";
-  const statusTone = !secretRequired || serverClientSecretConfigured ? "success" : "warning";
-  const help = secretRequired
-    ? "Le navigateur ne voit jamais cette valeur. Configure `OIDC_CLIENT_SECRET` dans Render."
-    : "La methode d'authentification /token choisie n'utilise pas de secret client.";
-
-  return renderInput("Client Secret", "clientSecret", "", {
-    type: "password",
-    long: true,
-    disabled: true,
-    placeholder: "Gere uniquement par le serveur",
-    help: `${statusLabel}. ${help}`
-  }).replace("</label>", `<small><span class="${statusClass(statusTone)}">${escapeHtml(statusLabel)}</span></small></label>`);
 }
 
 function callbackStatus(callback) {
@@ -344,37 +320,31 @@ function callbackStatus(callback) {
   };
 }
 
-function summaryCards(session) {
+function summaryCards(session, providerConfig, selectedServiceProvider) {
   const authorizeReady = Boolean(session.steps.authorize?.request?.url);
   const callbackReceived = Boolean(session.steps.callback?.params);
   const tokenResponse = session.steps.token?.response?.status;
-  const userinfoResponse = session.steps.userinfo?.response?.status;
 
   const cards = [
     {
+      label: "Provider",
+      value: providerConfig.providerName || "Non defini",
+      kind: providerConfig.authorizationEndpoint && providerConfig.tokenEndpoint ? "success" : "warning"
+    },
+    {
+      label: "SP selectionne",
+      value: selectedServiceProvider?.name || selectedServiceProvider?.clientId || "Aucun",
+      kind: selectedServiceProvider ? "success" : "warning"
+    },
+    {
       label: "Authorize",
-      value: authorizeReady ? "Construit" : "A preparer",
+      value: authorizeReady ? "Pret" : "A lancer",
       kind: authorizeReady ? "success" : "warning"
     },
     {
-      label: "Callback",
-      value: callbackReceived ? "Recu" : "Absent",
-      kind: callbackReceived ? "success" : "warning"
-    },
-    {
       label: "Token",
-      value: tokenResponse ? `${tokenResponse}` : "Non execute",
+      value: tokenResponse ? `${tokenResponse}` : callbackReceived ? "En attente" : "Non lance",
       kind: tokenResponse >= 200 && tokenResponse < 300 ? "success" : tokenResponse >= 400 ? "error" : "warning"
-    },
-    {
-      label: "UserInfo",
-      value: userinfoResponse ? `${userinfoResponse}` : "Non execute",
-      kind:
-        userinfoResponse >= 200 && userinfoResponse < 300
-          ? "success"
-          : userinfoResponse >= 400
-            ? "error"
-            : "warning"
     }
   ];
 
@@ -391,16 +361,162 @@ function summaryCards(session) {
     .join("");
 }
 
-export function renderPage({ session, activeTab = "configuration", baseUrl, serverClientSecretConfigured = false, flash = null }) {
+function renderReadonlyPair(label, value, tone = "success") {
+  return `
+    <div class="readonly-item">
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value || "Non defini")}</strong>
+      <em class="${statusClass(tone)}"></em>
+    </div>
+  `;
+}
+
+function renderServiceProviderRows(serviceProviders, selectedServiceProvider) {
+  if (!serviceProviders.length) {
+    return `<p class="empty">Aucun Service Provider configure.</p>`;
+  }
+
+  return `
+    <div class="sp-list">
+      ${serviceProviders
+        .map((serviceProvider) => {
+          const selected = selectedServiceProvider?.id === serviceProvider.id;
+          const secretStatus = serviceProvider.clientType === "confidential"
+            ? serviceProvider.secretConfigured
+              ? "Secret configure"
+              : "Aucun secret configure"
+            : "Non requis";
+          const secretTone = serviceProvider.clientType === "confidential"
+            ? serviceProvider.secretConfigured
+              ? "success"
+              : "warning"
+            : "success";
+
+          return `
+            <article class="sp-row ${selected ? "sp-row--selected" : ""}">
+              <div class="sp-row__identity">
+                <strong>${escapeHtml(serviceProvider.name || serviceProvider.clientId || "Sans nom")}</strong>
+                <span>${escapeHtml(serviceProvider.clientId || "client_id manquant")}</span>
+              </div>
+              <div class="sp-row__meta">
+                <span class="${statusClass(selected ? "success" : "neutral")}">${selected ? "Selectionne" : "Disponible"}</span>
+                <span class="${statusClass(serviceProvider.clientType === "confidential" ? "success" : "warning")}">${escapeHtml(serviceProvider.clientType)}</span>
+                <span class="${statusClass(secretTone)}">${escapeHtml(secretStatus)}</span>
+              </div>
+              <div class="sp-row__actions">
+                <form method="post" action="/service-providers/select">
+                  <input type="hidden" name="id" value="${escapeHtml(serviceProvider.id)}" />
+                  <button class="ghost-button" type="submit">Selectionner</button>
+                </form>
+                <a class="ghost-button" href="/?tab=configuration&edit=${escapeHtml(serviceProvider.id)}">Editer</a>
+                <form method="post" action="/service-providers/delete" onsubmit="return confirm('Supprimer ce Service Provider ?');">
+                  <input type="hidden" name="id" value="${escapeHtml(serviceProvider.id)}" />
+                  <button class="ghost-button" type="submit">Supprimer</button>
+                </form>
+                <form method="post" action="/service-providers/test">
+                  <input type="hidden" name="id" value="${escapeHtml(serviceProvider.id)}" />
+                  <button class="primary-button" type="submit">Tester</button>
+                </form>
+              </div>
+            </article>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+function renderServiceProviderForm(editingServiceProvider, selectedServiceProvider, fixedRedirectUri) {
+  const model = editingServiceProvider || {
+    id: "",
+    name: "",
+    clientId: "",
+    clientType: "confidential",
+    scopes: DEFAULT_SCOPES,
+    secretConfigured: false
+  };
+  const editing = Boolean(editingServiceProvider?.id);
+  const secretLabel = model.clientType === "confidential"
+    ? model.secretConfigured
+      ? "Secret configure"
+      : "Aucun secret configure"
+    : "Non requis";
+  const secretHelp = model.clientType === "confidential"
+    ? editing
+      ? "Laissez vide pour conserver le secret existant. Saisir une nouvelle valeur le remplacera."
+      : "Le secret est stocke uniquement cote serveur et ne sera plus reaffiche."
+    : "Les clients publics restent toleres, mais l'application est optimisee pour les clients confidentiels.";
+
+  return `
+    <form class="subpanel" method="post" action="/service-providers/save">
+      <header class="subpanel__head">
+        <h3>${editing ? "Modifier un Service Provider" : "Nouveau Service Provider"}</h3>
+        ${
+          editing
+            ? `<a class="ghost-button" href="/?tab=configuration">Nouveau</a>`
+            : ""
+        }
+      </header>
+      <input type="hidden" name="id" value="${escapeHtml(model.id || "")}" />
+      <div class="form-grid">
+        ${renderInput("Nom", "name", model.name, {
+          required: true
+        })}
+        ${renderInput("Client ID", "clientId", model.clientId, {
+          required: true
+        })}
+        ${renderSelect("Client type", "clientType", model.clientType, [
+          ["confidential", "Confidential"],
+          ["public", "Public"]
+        ])}
+        ${renderInput("Scopes", "scopes", model.scopes || DEFAULT_SCOPES, {
+          long: true,
+          help: "Scopes OIDC envoyes pour ce Service Provider. Exemple: openid profile email offline_access"
+        })}
+        ${renderInput(
+          editing && model.secretConfigured ? "Remplacer le secret client" : "Client secret",
+          "clientSecret",
+          "",
+          {
+            type: "password",
+            help: `${secretLabel}. ${secretHelp}`,
+            long: true
+          }
+        )}
+      </div>
+      <div class="readonly-grid">
+        ${renderReadonlyPair("Redirect URI globale", fixedRedirectUri)}
+        ${renderReadonlyPair("Auth /token", model.clientType === "confidential" ? "client_secret_basic" : "none", model.clientType === "confidential" ? "success" : "warning")}
+        ${renderReadonlyPair("Response type", "code")}
+        ${renderReadonlyPair("Gestion runtime", "state, nonce et PKCE automatiques")}
+        ${renderReadonlyPair("Scopes", model.scopes || DEFAULT_SCOPES)}
+        ${renderReadonlyPair("SP actuellement selectionne", selectedServiceProvider?.name || selectedServiceProvider?.clientId || "Aucun", selectedServiceProvider ? "success" : "warning")}
+      </div>
+      <div class="form-actions">
+        <button type="submit" class="secondary-button" name="_action" value="save">Enregistrer</button>
+        <button type="submit" class="primary-button" name="_action" value="saveAndTest">Enregistrer et tester</button>
+      </div>
+    </form>
+  `;
+}
+
+export function renderPage({
+  session,
+  activeTab = "configuration",
+  flash = null,
+  providerConfig,
+  serviceProviders,
+  editingServiceProvider,
+  selectedServiceProvider,
+  fixedRedirectUri
+}) {
   const callback = session.steps.callback;
   const callbackBadge = callbackStatus(callback);
   const sessionJsonUrl = `/oidc/session/${encodeURIComponent(session.id)}`;
   const redactedSnapshot = {
-    config: {
-      ...redactObject(session.config),
-      clientSecret: serverClientSecretConfigured ? "[server-only]" : "",
-      serverClientSecretConfigured
-    },
+    providerConfig,
+    selectedServiceProvider,
+    runtimeContext: session.runtimeContext,
     steps: redactObject(session.steps),
     tokens: redactObject(session.tokens)
   };
@@ -417,7 +533,7 @@ export function renderPage({ session, activeTab = "configuration", baseUrl, serv
     <div class="background-glow"></div>
     <div class="shell">
       <section class="summary">
-        ${summaryCards(session)}
+        ${summaryCards(session, providerConfig, selectedServiceProvider)}
       </section>
 
       ${renderFlash(flash)}
@@ -437,83 +553,74 @@ export function renderPage({ session, activeTab = "configuration", baseUrl, serv
           <div class="panel__head">
             <div>
               <p class="eyebrow">Section 1</p>
-              <h2>Configuration OIDC</h2>
-              <div class="form-actions form-actions--head">
-                <button type="submit" class="primary-button" form="config-form" name="_action" value="save">Enregistrer</button>
-                <button type="submit" class="secondary-button" form="config-form" name="_action" value="login">Enregistrer et lancer</button>
-              </div>
+              <h2>Configuration provider et Service Providers</h2>
+              <p class="panel__lead">Une seule configuration provider globale, plusieurs SP reutilisables, et une redirect URI fixe pour tous les tests.</p>
             </div>
-            <span class="${statusClass("success")}">Runtime</span>
+            <span class="${statusClass(selectedServiceProvider ? "success" : "warning")}">${selectedServiceProvider ? "SP pret" : "SP requis"}</span>
           </div>
 
-          <div class="grid grid--two">
-            <form id="config-form" class="subpanel" method="post" action="/oidc/config/save">
-              <header class="subpanel__head">
-                <h3>Provider, client et flow</h3>
-              </header>
-              <div class="form-grid">
-                ${renderInput("Provider", "providerName", session.config.providerName)}
-                ${renderInput("Discovery URL", "discoveryUrl", session.config.discoveryUrl, {
-                  placeholder: "https://idp/.well-known/openid-configuration",
-                  long: true
-                })}
-                ${renderInput("Issuer", "issuer", session.config.issuer, { long: true })}
-                ${renderInput("Authorization endpoint", "authorizationEndpoint", session.config.authorizationEndpoint, {
-                  long: true
-                })}
-                ${renderInput("Token endpoint", "tokenEndpoint", session.config.tokenEndpoint, { long: true })}
-                ${renderInput("UserInfo endpoint", "userInfoEndpoint", session.config.userInfoEndpoint, { long: true })}
-                ${renderInput("JWKS URI", "jwksUri", session.config.jwksUri, { long: true })}
-                ${renderInput("Client ID", "clientId", session.config.clientId)}
-                ${renderServerSecretField(session.config, serverClientSecretConfigured)}
-                ${renderSelect("Client type", "clientType", session.config.clientType, [
-                  ["public", "Public"],
-                  ["confidential", "Confidential"]
-                ])}
-                ${renderInput("Redirect URI", "redirectUri", session.config.redirectUri, { long: true })}
-                ${renderSelect("Token auth method", "tokenEndpointAuthMethod", session.config.tokenEndpointAuthMethod, [
-                  ["none", "none"],
-                  ["client_secret_basic", "client_secret_basic"],
-                  ["client_secret_post", "client_secret_post"]
-                ])}
-                ${renderSelect("Response type", "responseType", session.config.responseType, [["code", "code"]])}
-                ${renderSelect("Response mode", "responseMode", session.config.responseMode, [
-                  ["query", "query"],
-                  ["form_post", "form_post"]
-                ])}
-                ${renderInput("Scopes", "scopes", session.config.scopes, { long: true })}
-                ${renderInput("State", "state", session.config.state)}
-                ${renderInput("Nonce", "nonce", session.config.nonce)}
-                <label class="field field--checkbox">
-                  <span>PKCE active</span>
-                  <input type="checkbox" name="pkceEnabled" ${session.config.pkceEnabled ? "checked" : ""} />
-                </label>
-                ${renderSelect("Code challenge method", "codeChallengeMethod", session.config.codeChallengeMethod, [
-                  ["S256", "S256"],
-                  ["plain", "plain"]
-                ])}
+          <div class="stack stack--lg">
+            <div class="grid grid--two">
+              <form class="subpanel" method="post" action="/provider/save">
+                <header class="subpanel__head">
+                  <h3>Configuration provider globale</h3>
+                </header>
+                <div class="form-grid">
+                  ${renderInput("Nom du provider", "providerName", providerConfig.providerName)}
+                  ${renderInput("Issuer", "issuer", providerConfig.issuer, { long: true })}
+                  ${renderInput("Authorization endpoint", "authorizationEndpoint", providerConfig.authorizationEndpoint, {
+                    long: true
+                  })}
+                  ${renderInput("Token endpoint", "tokenEndpoint", providerConfig.tokenEndpoint, { long: true })}
+                  ${renderInput("UserInfo endpoint", "userInfoEndpoint", providerConfig.userInfoEndpoint, { long: true })}
+                  ${renderInput("JWKS URI", "jwksUri", providerConfig.jwksUri, { long: true })}
+                  ${renderInput("Redirect URI globale", "redirectUri", fixedRedirectUri, {
+                    long: true,
+                    readonly: true,
+                    help: "Ajouter cette URI dans la configuration EZ-ACCESS pour que le callback fonctionne."
+                  })}
+                </div>
+                <div class="form-actions">
+                  <button type="submit" class="secondary-button">Enregistrer le provider</button>
+                </div>
+              </form>
+
+              <div class="subpanel">
+                <header class="subpanel__head">
+                  <h3>Import Discovery</h3>
+                </header>
+                <form method="post" action="/provider/load-discovery" class="stack">
+                  ${renderInput("Discovery URL", "discoveryUrl", providerConfig.discoveryUrl, {
+                    placeholder: "https://idp/.well-known/openid-configuration",
+                    long: true
+                  })}
+                  <div class="form-actions">
+                    <button type="submit" class="ghost-button">Charger les endpoints</button>
+                  </div>
+                </form>
+                <p class="note">Les endpoints viennent du discovery a l'origine, mais la configuration provider reste ensuite globale et persistante.</p>
+                <div class="spacer"></div>
+                <h4>Dernier appel Discovery</h4>
+                ${session.steps.discovery ? renderRequestResponse(session.steps.discovery) : `<p class="empty">Aucun import discovery execute.</p>`}
               </div>
-            </form>
+            </div>
 
             <div class="subpanel">
               <header class="subpanel__head">
-                <h3>Import Discovery</h3>
+                <h3>Liste des Service Providers</h3>
+                <span class="${statusClass(serviceProviders.length ? "success" : "warning")}">${escapeHtml(String(serviceProviders.length))} configuration(s)</span>
               </header>
-              <form method="post" action="/oidc/config/load-discovery" class="stack">
-                ${renderInput("Discovery URL", "discoveryUrl", session.config.discoveryUrl, {
-                  placeholder: "https://idp/.well-known/openid-configuration",
-                  long: true
-                })}
-                <div class="form-actions">
-                  <button type="submit" class="secondary-button">Charger depuis le discovery endpoint</button>
-                </div>
-              </form>
-              <div class="spacer"></div>
-              <h4>Snapshot redige</h4>
-              <pre>${escapeHtml(pretty(redactedSnapshot.config))}</pre>
-              <div class="spacer"></div>
-              <h4>Dernier appel Discovery</h4>
-              ${session.steps.discovery ? renderRequestResponse(session.steps.discovery) : `<p class="empty">Aucun import discovery execute.</p>`}
+              ${renderServiceProviderRows(serviceProviders, selectedServiceProvider)}
+            </div>
+
+            ${renderServiceProviderForm(editingServiceProvider, selectedServiceProvider, fixedRedirectUri)}
+
+            <div class="subpanel">
+              <header class="subpanel__head">
+                <h3>Snapshot courant</h3>
+                <a class="ghost-button" href="${escapeHtml(sessionJsonUrl)}">Exporter JSON</a>
+              </header>
+              <pre>${escapeHtml(pretty(redactedSnapshot))}</pre>
             </div>
           </div>
         </section>
@@ -524,7 +631,14 @@ export function renderPage({ session, activeTab = "configuration", baseUrl, serv
               <p class="eyebrow">Section 2</p>
               <h2>Authorize</h2>
               <div class="form-actions form-actions--head">
-                <a class="primary-button" href="/oidc/login">Lancer le flow</a>
+                ${
+                  selectedServiceProvider
+                    ? `<form method="post" action="/service-providers/test">
+                        <input type="hidden" name="id" value="${escapeHtml(selectedServiceProvider.id)}" />
+                        <button class="primary-button" type="submit">Tester ce SP</button>
+                      </form>`
+                    : `<a class="ghost-button" href="#configuration" data-tab-link="configuration">Choisir un SP</a>`
+                }
               </div>
             </div>
             <span class="${statusClass(session.steps.authorize?.request?.url ? "success" : "warning")}">
@@ -535,7 +649,21 @@ export function renderPage({ session, activeTab = "configuration", baseUrl, serv
             <header class="subpanel__head">
               <h3>Construction de l'URL /authorize</h3>
             </header>
-            ${session.steps.authorize?.request?.url ? renderRequestResponse(session.steps.authorize) : `<p class="empty">Aucun appel /authorize construit pour cette session.</p>`}
+            ${renderRequestResponse(session.steps.authorize)}
+            ${
+              session.runtimeContext
+                ? `
+                  <div class="readonly-grid">
+                    ${renderReadonlyPair("Provider", session.runtimeContext.providerName || "Non defini")}
+                    ${renderReadonlyPair("Service Provider", session.runtimeContext.serviceProviderName || session.runtimeContext.clientId)}
+                    ${renderReadonlyPair("Client ID", session.runtimeContext.clientId)}
+                    ${renderReadonlyPair("Redirect URI", session.runtimeContext.redirectUri)}
+                    ${renderReadonlyPair("Auth /token", session.runtimeContext.tokenEndpointAuthMethod)}
+                    ${renderReadonlyPair("Client type", session.runtimeContext.clientType)}
+                  </div>
+                `
+                : ""
+            }
             ${
               session.flow.expectedState || session.flow.codeVerifier
                 ? `
@@ -552,7 +680,7 @@ export function renderPage({ session, activeTab = "configuration", baseUrl, serv
                     ${
                       session.flow.codeVerifier
                         ? renderSecretBlock("PKCE code_verifier", session.flow.codeVerifier, true)
-                        : `<p class="empty">PKCE desactive.</p>`
+                        : `<p class="empty">PKCE indisponible.</p>`
                     }
                   </div>
                 `

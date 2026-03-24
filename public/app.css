@@ -222,6 +222,13 @@ body::before {
   justify-items: start;
 }
 
+.panel__lead {
+  margin: 0;
+  max-width: 70ch;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
 .form-actions--head {
   margin: 6px 0;
 }
@@ -295,6 +302,10 @@ body::before {
 .stack {
   display: grid;
   gap: 14px;
+}
+
+.stack--lg {
+  gap: 20px;
 }
 
 .spacer {
@@ -413,6 +424,98 @@ pre {
   line-height: 1.6;
 }
 
+.note {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.6;
+}
+
+.readonly-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.readonly-item {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  border-radius: var(--radius-md);
+  background: rgba(16, 32, 39, 0.06);
+  border: 1px solid rgba(16, 32, 39, 0.08);
+}
+
+.readonly-item span {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+.readonly-item strong {
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.readonly-item em {
+  justify-self: start;
+}
+
+.sp-list {
+  display: grid;
+  gap: 12px;
+}
+
+.sp-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) auto;
+  gap: 16px;
+  padding: 16px;
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.78);
+  border: 1px solid rgba(16, 32, 39, 0.08);
+  align-items: center;
+}
+
+.sp-row--selected {
+  border-color: rgba(23, 109, 104, 0.26);
+  box-shadow: 0 12px 30px rgba(23, 109, 104, 0.08);
+}
+
+.sp-row__identity,
+.sp-row__meta,
+.sp-row__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.sp-row__identity {
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.sp-row__identity strong {
+  font-size: 1rem;
+}
+
+.sp-row__identity span {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 0.9rem;
+}
+
+.sp-row__actions form {
+  margin: 0;
+}
+
+.sp-row__actions .ghost-button,
+.sp-row__actions .primary-button {
+  width: 100%;
+}
+
 .log-list {
   display: grid;
   gap: 14px;
@@ -454,7 +557,9 @@ summary {
   .grid--two,
   .grid--three,
   .summary,
-  .form-grid {
+  .form-grid,
+  .readonly-grid,
+  .sp-row {
     grid-template-columns: 1fr;
   }
 }
@@ -476,5 +581,9 @@ summary {
   .log-entry__meta {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .sp-row__actions {
+    width: 100%;
   }
 }

@@ -6,12 +6,15 @@ import { fileURLToPath } from "node:url";
 import {
   analyzeTokens,
   buildCurlCommand,
-  compareClaims,
+  buildEffectiveConfig,
   buildTokenExchangeRequest,
   buildUserInfoRequest,
-  createBaseConfig,
-  mergeDiscoveryIntoConfig,
-  normalizeConfig,
+  compareClaims,
+  createProviderConfig,
+  FIXED_REDIRECT_URI,
+  mergeDiscoveryIntoProviderConfig,
+  normalizeProviderConfig,
+  normalizeServiceProvider,
   prepareAuthorizationRequest,
   redactBodyText,
   redactObject,
@@ -25,7 +28,6 @@ const projectRoot = path.resolve(__dirname, "..");
 const PORT = Number(process.env.PORT || 3000);
 const NODE_ENV = process.env.NODE_ENV || "development";
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
-const SERVER_CLIENT_SECRET = process.env.OIDC_CLIENT_SECRET || "";
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomUUID();
 const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 const SESSION_COOKIE = "oidc_debug_sid";
@@ -39,9 +41,11 @@ const staticFiles = new Map([
 ]);
 
 const sessions = new Map();
-let persistedDefaultConfig = createBaseConfig(BASE_URL);
+let providerConfig = createProviderConfig();
+let serviceProviders = [];
 let persistTimer = null;
 let persistInFlight = Promise.resolve();
+const secretKey = crypto.createHash("sha256").update(SESSION_SECRET).digest();
 const logLevels = {
   debug: 10,
   info: 20,
@@ -49,28 +53,43 @@ const logLevels = {
   error: 40
 };
 
-function configUsesClientSecret(config = {}) {
-  return ["client_secret_basic", "client_secret_post"].includes(config.tokenEndpointAuthMethod);
+function createId(prefix) {
+  return `${prefix}_${crypto.randomBytes(8).toString("hex")}`;
 }
 
-function getTokenExchangeConfig(config = {}) {
-  if (!configUsesClientSecret(config)) {
-    return {
-      ...config,
-      clientSecret: ""
-    };
-  }
-
-  if (!SERVER_CLIENT_SECRET) {
-    throw new Error(
-      "Le secret client doit etre configure cote serveur via `OIDC_CLIENT_SECRET` pour utiliser cette methode d'authentification /token."
-    );
-  }
+function encryptSecret(secret) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", secretKey, iv);
+  const ciphertext = Buffer.concat([cipher.update(String(secret), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
 
   return {
-    ...config,
-    clientSecret: SERVER_CLIENT_SECRET
+    algorithm: "aes-256-gcm",
+    iv: iv.toString("base64"),
+    tag: tag.toString("base64"),
+    ciphertext: ciphertext.toString("base64"),
+    updatedAt: new Date().toISOString()
   };
+}
+
+function decryptSecret(record) {
+  if (!record?.ciphertext || !record?.iv || !record?.tag) {
+    return "";
+  }
+
+  const decipher = crypto.createDecipheriv(
+    record.algorithm || "aes-256-gcm",
+    secretKey,
+    Buffer.from(record.iv, "base64")
+  );
+  decipher.setAuthTag(Buffer.from(record.tag, "base64"));
+
+  const decrypted = Buffer.concat([
+    decipher.update(Buffer.from(record.ciphertext, "base64")),
+    decipher.final()
+  ]);
+
+  return decrypted.toString("utf8");
 }
 
 function sanitizeTokenRequest(request) {
@@ -99,10 +118,37 @@ function sanitizeTokenRequest(request) {
   };
 }
 
+function sanitizeProviderConfig(input = providerConfig) {
+  return normalizeProviderConfig(input);
+}
+
+function sanitizeServiceProviderForUi(serviceProvider) {
+  if (!serviceProvider) {
+    return null;
+  }
+
+  const normalized = normalizeServiceProvider(serviceProvider, serviceProvider);
+
+  return {
+    ...normalized,
+    secretConfigured: Boolean(serviceProvider.secretRecord?.ciphertext),
+    createdAt: serviceProvider.createdAt || null,
+    updatedAt: serviceProvider.updatedAt || null
+  };
+}
+
+function sortServiceProviders(entries = []) {
+  return [...entries].sort((left, right) => left.name.localeCompare(right.name, "fr"));
+}
+
 function sanitizeSessionArtifacts(session) {
   return {
     ...session,
-    config: normalizeConfig(session.config || {}, BASE_URL),
+    runtimeContext: session.runtimeContext
+      ? {
+          ...session.runtimeContext
+        }
+      : null,
     steps: {
       ...session.steps,
       token: session.steps?.token
@@ -115,38 +161,14 @@ function sanitizeSessionArtifacts(session) {
   };
 }
 
-function shouldLog(level) {
-  return (logLevels[level] || 20) >= (logLevels[LOG_LEVEL] || 20);
-}
-
-function appLog(level, message, data) {
-  if (!shouldLog(level)) {
-    return;
-  }
-
-  const redacted = data ? JSON.stringify(redactObject(data)) : "";
-  const line = `[oidc_debug] ${level.toUpperCase()} ${message}${redacted ? ` ${redacted}` : ""}`;
-
-  if (level === "error") {
-    console.error(line);
-    return;
-  }
-
-  if (level === "warn") {
-    console.warn(line);
-    return;
-  }
-
-  console.log(line);
-}
-
 function createSession() {
   const id = crypto.randomBytes(24).toString("hex");
   return {
     id,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-    config: { ...persistedDefaultConfig },
+    selectedServiceProviderId: "",
+    runtimeContext: null,
     flow: {
       expectedState: "",
       expectedNonce: "",
@@ -169,9 +191,10 @@ function createSession() {
 
 function buildPersistedState() {
   return {
-    version: 1,
+    version: 2,
     updatedAt: new Date().toISOString(),
-    defaultConfig: normalizeConfig(persistedDefaultConfig, BASE_URL),
+    providerConfig: sanitizeProviderConfig(providerConfig),
+    serviceProviders,
     sessions: Array.from(sessions.values()).map((session) => ({
       ...sanitizeSessionArtifacts(session),
       flash: null
@@ -222,16 +245,65 @@ async function flushPersistState() {
   await persistInFlight;
 }
 
+function migrateLegacyState(parsed = {}) {
+  const legacyProvider = parsed?.defaultConfig || {};
+  const nextProviderConfig = normalizeProviderConfig({
+    providerName: legacyProvider.providerName,
+    discoveryUrl: legacyProvider.discoveryUrl,
+    issuer: legacyProvider.issuer,
+    authorizationEndpoint: legacyProvider.authorizationEndpoint,
+    tokenEndpoint: legacyProvider.tokenEndpoint,
+    userInfoEndpoint: legacyProvider.userInfoEndpoint,
+    jwksUri: legacyProvider.jwksUri
+  });
+
+  const migratedServiceProviders = [];
+
+  if (legacyProvider.clientId) {
+    migratedServiceProviders.push({
+      id: createId("sp"),
+      name: legacyProvider.providerName ? `${legacyProvider.providerName} principal` : "SP migre",
+      clientId: legacyProvider.clientId,
+      clientType: legacyProvider.clientType === "public" ? "public" : "confidential",
+      secretRecord: null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    });
+  }
+
+  return {
+    version: 2,
+    updatedAt: new Date().toISOString(),
+    providerConfig: nextProviderConfig,
+    serviceProviders: migratedServiceProviders,
+    sessions: []
+  };
+}
+
 async function loadPersistedState() {
   try {
     const raw = await readFile(STATE_FILE, "utf8");
     const parsed = JSON.parse(raw);
+    const hydrated = parsed?.version === 2 ? parsed : migrateLegacyState(parsed);
 
-    if (parsed?.defaultConfig) {
-      persistedDefaultConfig = normalizeConfig(parsed.defaultConfig, BASE_URL);
-    }
+    providerConfig = sanitizeProviderConfig(hydrated.providerConfig);
+    serviceProviders = sortServiceProviders(
+      (hydrated.serviceProviders || []).map((entry) => {
+        const normalized = normalizeServiceProvider(entry, entry);
 
-    for (const candidate of parsed?.sessions || []) {
+        return {
+          id: normalized.id || createId("sp"),
+          name: normalized.name,
+          clientId: normalized.clientId,
+          clientType: normalized.clientType,
+          secretRecord: entry.secretRecord || null,
+          createdAt: entry.createdAt || new Date().toISOString(),
+          updatedAt: entry.updatedAt || new Date().toISOString()
+        };
+      })
+    );
+
+    for (const candidate of hydrated.sessions || []) {
       if (!candidate?.id) {
         continue;
       }
@@ -240,7 +312,8 @@ async function loadPersistedState() {
         id: candidate.id,
         createdAt: candidate.createdAt || new Date().toISOString(),
         updatedAt: candidate.updatedAt || new Date().toISOString(),
-        config: normalizeConfig(candidate.config || persistedDefaultConfig, BASE_URL),
+        selectedServiceProviderId: candidate.selectedServiceProviderId || "",
+        runtimeContext: candidate.runtimeContext || null,
         flow: {
           expectedState: candidate.flow?.expectedState || "",
           expectedNonce: candidate.flow?.expectedNonce || "",
@@ -268,7 +341,8 @@ async function loadPersistedState() {
 
     appLog("info", "Etat applicatif restaure depuis le disque", {
       stateFile: STATE_FILE,
-      sessions: sessions.size
+      sessions: sessions.size,
+      serviceProviders: serviceProviders.length
     });
   } catch (error) {
     if (error.code === "ENOENT") {
@@ -342,7 +416,13 @@ function decodeSessionCookie(rawValue = "") {
   if (signature.length !== expected.length) {
     return null;
   }
+
   return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected)) ? sessionId : null;
+}
+
+function touchSession(session) {
+  session.updatedAt = new Date().toISOString();
+  schedulePersistState();
 }
 
 function getOrCreateSession(req, res) {
@@ -352,15 +432,14 @@ function getOrCreateSession(req, res) {
 
   if (sessionId && sessions.has(sessionId)) {
     const session = sessions.get(sessionId);
-    session.updatedAt = new Date().toISOString();
-    schedulePersistState();
+    touchSession(session);
     return session;
   }
 
   const session = createSession();
   sessions.set(session.id, session);
   setSessionCookie(res, session.id);
-  schedulePersistState();
+  touchSession(session);
   appLog("info", "Nouvelle session creee", { sessionId: session.id });
   return session;
 }
@@ -378,9 +457,7 @@ function addSessionLog(session, level, event, message, data = null) {
     message,
     data: data ? redactObject(data) : null
   });
-  session.updatedAt = new Date().toISOString();
-  persistedDefaultConfig = normalizeConfig(session.config, BASE_URL);
-  schedulePersistState();
+  touchSession(session);
   appLog(level, message, { event, ...(data || {}) });
 }
 
@@ -399,7 +476,25 @@ function consumeFlash(session) {
   return flash;
 }
 
-function resetFlowState(session, reason = "config_changed") {
+function getServiceProvider(serviceProviderId) {
+  return serviceProviders.find((entry) => entry.id === serviceProviderId) || null;
+}
+
+function resolveSelectedServiceProvider(session) {
+  const selected = getServiceProvider(session.selectedServiceProviderId);
+  if (selected) {
+    return selected;
+  }
+
+  if (!serviceProviders.length) {
+    return null;
+  }
+
+  return serviceProviders[0];
+}
+
+function resetFlowState(session, reason = "configuration_changed") {
+  session.runtimeContext = null;
   session.flow = {
     expectedState: "",
     expectedNonce: "",
@@ -412,33 +507,100 @@ function resetFlowState(session, reason = "config_changed") {
   session.steps.userinfo = null;
   session.tokens = null;
   session.comparison = null;
-  session.updatedAt = new Date().toISOString();
-  schedulePersistState();
+  touchSession(session);
 
-  addSessionLog(session, "info", "flow_reset", "Les etapes dependantes de la configuration ont ete reinitialisees.", {
+  addSessionLog(session, "info", "flow_reset", "Les etapes du test ont ete reinitialisees.", {
     reason
   });
 }
 
-function configFingerprint(config) {
-  return JSON.stringify(normalizeConfig(config, BASE_URL));
+function applyProviderConfigUpdate(nextConfig) {
+  const previous = JSON.stringify(providerConfig);
+  const normalized = sanitizeProviderConfig({
+    ...providerConfig,
+    ...nextConfig
+  });
+  providerConfig = normalized;
+  schedulePersistState();
+  return previous !== JSON.stringify(normalized);
 }
 
-function applyConfigUpdate(session, nextConfig, reason) {
-  const previousFingerprint = configFingerprint(session.config);
-  const normalizedConfig = normalizeConfig(nextConfig, BASE_URL);
-  const nextFingerprint = configFingerprint(normalizedConfig);
+function upsertServiceProvider(input, rawSecret) {
+  const existing = input.id ? getServiceProvider(input.id) : null;
+  const normalized = normalizeServiceProvider(input, existing || {});
+  const now = new Date().toISOString();
+  const isNew = !existing;
+  const next = {
+    id: normalized.id || createId("sp"),
+    name: normalized.name,
+    clientId: normalized.clientId,
+    clientType: normalized.clientType,
+    secretRecord:
+      normalized.clientType === "confidential"
+        ? existing?.secretRecord || null
+        : null,
+    createdAt: existing?.createdAt || now,
+    updatedAt: now
+  };
 
-  session.config = normalizedConfig;
-  persistedDefaultConfig = normalizedConfig;
-  schedulePersistState();
-
-  if (previousFingerprint !== nextFingerprint) {
-    resetFlowState(session, reason);
-    return true;
+  if (normalized.clientType === "confidential" && rawSecret) {
+    next.secretRecord = encryptSecret(rawSecret);
   }
 
-  return false;
+  if (existing) {
+    serviceProviders = serviceProviders.map((entry) => (entry.id === existing.id ? next : entry));
+  } else {
+    serviceProviders = [...serviceProviders, next];
+  }
+
+  serviceProviders = sortServiceProviders(serviceProviders);
+  schedulePersistState();
+
+  return {
+    serviceProvider: next,
+    isNew,
+    secretUpdated: Boolean(normalized.clientType === "confidential" && rawSecret)
+  };
+}
+
+function removeServiceProvider(serviceProviderId) {
+  const before = serviceProviders.length;
+  serviceProviders = serviceProviders.filter((entry) => entry.id !== serviceProviderId);
+
+  for (const session of sessions.values()) {
+    if (session.selectedServiceProviderId === serviceProviderId) {
+      session.selectedServiceProviderId = "";
+      resetFlowState(session, "service_provider_deleted");
+    }
+  }
+
+  schedulePersistState();
+  return serviceProviders.length !== before;
+}
+
+function shouldLog(level) {
+  return (logLevels[level] || 20) >= (logLevels[LOG_LEVEL] || 20);
+}
+
+function appLog(level, message, data) {
+  if (!shouldLog(level)) {
+    return;
+  }
+
+  const redacted = data ? JSON.stringify(redactObject(data)) : "";
+  const line = `[oidc_debug] ${level.toUpperCase()} ${message}${redacted ? ` ${redacted}` : ""}`;
+
+  if (level === "error") {
+    console.error(line);
+    return;
+  }
+
+  if (level === "warn") {
+    console.warn(line);
+    return;
+  }
+
+  console.log(line);
 }
 
 async function readBody(req) {
@@ -502,12 +664,17 @@ async function serveStatic(res, asset) {
 
 function sanitizeSession(session, reveal = false) {
   const sanitized = sanitizeSessionArtifacts(session);
+  const payload = {
+    ...sanitized,
+    providerConfig: sanitizeProviderConfig(providerConfig),
+    serviceProviders: serviceProviders.map(sanitizeServiceProviderForUi)
+  };
 
   if (!reveal) {
-    return redactObject(sanitized);
+    return redactObject(payload);
   }
 
-  return sanitized;
+  return payload;
 }
 
 function evaluateState(expectedState, receivedState) {
@@ -642,15 +809,53 @@ function inferActiveTab(pathname) {
     return "logs";
   }
 
-  if (pathname === "/config") {
-    return "configuration";
-  }
-
   return "configuration";
 }
 
 function ensureHtmlSessionRoute(req) {
   return req.headers.accept?.includes("text/html") || req.headers.accept === "*/*" || !req.headers.accept;
+}
+
+function buildRunConfig(session, serviceProviderId) {
+  const selected = getServiceProvider(serviceProviderId) || resolveSelectedServiceProvider(session);
+
+  if (!selected) {
+    throw new Error("Aucune configuration Service Provider disponible.");
+  }
+
+  const secret = selected.clientType === "confidential" ? decryptSecret(selected.secretRecord) : "";
+
+  if (selected.clientType === "confidential" && !secret) {
+    throw new Error("Aucun secret configure pour ce Service Provider confidentiel.");
+  }
+
+  session.selectedServiceProviderId = selected.id;
+
+  return {
+    selected,
+    config: buildEffectiveConfig({
+      providerConfig,
+      serviceProvider: selected,
+      clientSecret: secret
+    })
+  };
+}
+
+function buildPageModel(session, activeTab, url) {
+  const editServiceProviderId = url.searchParams.get("edit") || "";
+  const editingServiceProvider = sanitizeServiceProviderForUi(getServiceProvider(editServiceProviderId));
+  const selectedServiceProvider = sanitizeServiceProviderForUi(getServiceProvider(session.selectedServiceProviderId));
+
+  return {
+    session,
+    activeTab,
+    flash: consumeFlash(session),
+    providerConfig: sanitizeProviderConfig(providerConfig),
+    serviceProviders: serviceProviders.map(sanitizeServiceProviderForUi),
+    editingServiceProvider,
+    selectedServiceProvider,
+    fixedRedirectUri: FIXED_REDIRECT_URI
+  };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -665,17 +870,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/config" || url.pathname === "/logs")) {
       const session = getOrCreateSession(req, res);
       const activeTab = routeTab(url) || inferActiveTab(url.pathname);
-      const flash = consumeFlash(session);
-      sendHtml(
-        res,
-        renderPage({
-          session,
-          activeTab,
-          baseUrl: BASE_URL,
-          serverClientSecretConfigured: Boolean(SERVER_CLIENT_SECRET),
-          flash
-        })
-      );
+      sendHtml(res, renderPage(buildPageModel(session, activeTab, url)));
       return;
     }
 
@@ -694,37 +889,35 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.method === "POST" && url.pathname === "/oidc/config/save") {
+    if (req.method === "POST" && url.pathname === "/provider/save") {
       const session = getOrCreateSession(req, res);
       const rawBody = await readBody(req);
       const body = parseBody(req, rawBody);
-      const configChanged = applyConfigUpdate(session, body, "manual_config_update");
+      const changed = applyProviderConfigUpdate(body);
 
-      addSessionLog(session, "info", "config_saved", "Configuration OIDC enregistree.", {
-        config: session.config
-      });
-
-      if (body._action === "login") {
-        redirect(res, "/oidc/login");
-        return;
+      if (changed) {
+        resetFlowState(session, "provider_config_update");
       }
 
+      addSessionLog(session, "info", "provider_saved", "Configuration provider enregistree.", {
+        providerConfig
+      });
       setFlash(
         session,
         "info",
-        configChanged
-          ? "Configuration mise a jour. Les etapes precedentes ont ete reinitialisees."
-          : "Configuration mise a jour."
+        changed
+          ? "Configuration provider mise a jour. Le test courant a ete reinitialise."
+          : "Configuration provider mise a jour."
       );
       redirect(res, "/?tab=configuration");
       return;
     }
 
-    if (req.method === "POST" && url.pathname === "/oidc/config/load-discovery") {
+    if (req.method === "POST" && url.pathname === "/provider/load-discovery") {
       const session = getOrCreateSession(req, res);
       const rawBody = await readBody(req);
       const body = parseBody(req, rawBody);
-      const discoveryUrl = body.discoveryUrl || session.config.discoveryUrl;
+      const discoveryUrl = body.discoveryUrl || providerConfig.discoveryUrl;
 
       if (!discoveryUrl) {
         setFlash(session, "warn", "Discovery URL manquante.");
@@ -732,7 +925,10 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      session.config.discoveryUrl = discoveryUrl;
+      providerConfig = sanitizeProviderConfig({
+        ...providerConfig,
+        discoveryUrl
+      });
       const requestSnapshot = {
         url: discoveryUrl,
         method: "GET",
@@ -758,19 +954,14 @@ const server = http.createServer(async (req, res) => {
       };
 
       if (responseSnapshot.ok && Object.keys(responseSnapshot.parsed || {}).length > 0) {
-        const mergedConfig = mergeDiscoveryIntoConfig(session.config, responseSnapshot.parsed);
-        const configChanged = applyConfigUpdate(session, mergedConfig, "discovery_config_update");
-        addSessionLog(session, "info", "discovery_loaded", "Configuration chargee depuis le discovery endpoint.", {
+        providerConfig = mergeDiscoveryIntoProviderConfig(providerConfig, responseSnapshot.parsed);
+        schedulePersistState();
+        resetFlowState(session, "discovery_config_update");
+        addSessionLog(session, "info", "discovery_loaded", "Configuration provider chargee depuis le discovery endpoint.", {
           discoveryUrl,
           response: responseSnapshot
         });
-        setFlash(
-          session,
-          "info",
-          configChanged
-            ? "Discovery charge avec succes. Les etapes precedentes ont ete reinitialisees."
-            : "Discovery charge avec succes."
-        );
+        setFlash(session, "info", "Discovery charge avec succes.");
       } else {
         addSessionLog(session, "warn", "discovery_failed", "Echec du chargement du discovery endpoint.", {
           discoveryUrl,
@@ -789,12 +980,123 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "POST" && url.pathname === "/service-providers/save") {
+      const session = getOrCreateSession(req, res);
+      const rawBody = await readBody(req);
+      const body = parseBody(req, rawBody);
+      const secret = String(body.clientSecret || "").trim();
+      const { serviceProvider, isNew, secretUpdated } = upsertServiceProvider(body, secret);
+
+      if (session.selectedServiceProviderId === serviceProvider.id || !session.selectedServiceProviderId) {
+        session.selectedServiceProviderId = serviceProvider.id;
+        resetFlowState(session, "service_provider_update");
+      } else {
+        touchSession(session);
+      }
+
+      addSessionLog(session, "info", "service_provider_saved", "Configuration Service Provider enregistree.", {
+        serviceProvider: sanitizeServiceProviderForUi(serviceProvider),
+        secretUpdated
+      });
+
+      if (body._action === "saveAndTest") {
+        redirect(res, `/oidc/login?sp=${encodeURIComponent(serviceProvider.id)}`);
+        return;
+      }
+
+      setFlash(
+        session,
+        "info",
+        isNew
+          ? "Service Provider cree."
+          : secretUpdated
+            ? "Service Provider mis a jour. Le secret a ete remplace."
+            : "Service Provider mis a jour."
+      );
+      redirect(res, `/?tab=configuration&edit=${encodeURIComponent(serviceProvider.id)}`);
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/service-providers/delete") {
+      const session = getOrCreateSession(req, res);
+      const rawBody = await readBody(req);
+      const body = parseBody(req, rawBody);
+      const serviceProviderId = body.id || "";
+
+      if (!serviceProviderId || !removeServiceProvider(serviceProviderId)) {
+        setFlash(session, "warn", "Service Provider introuvable.");
+        redirect(res, "/?tab=configuration");
+        return;
+      }
+
+      addSessionLog(session, "info", "service_provider_deleted", "Configuration Service Provider supprimee.", {
+        serviceProviderId
+      });
+      setFlash(session, "info", "Service Provider supprime.");
+      redirect(res, "/?tab=configuration");
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/service-providers/select") {
+      const session = getOrCreateSession(req, res);
+      const rawBody = await readBody(req);
+      const body = parseBody(req, rawBody);
+      const selected = getServiceProvider(body.id || "");
+
+      if (!selected) {
+        setFlash(session, "warn", "Service Provider introuvable.");
+        redirect(res, "/?tab=configuration");
+        return;
+      }
+
+      const changed = session.selectedServiceProviderId !== selected.id;
+      session.selectedServiceProviderId = selected.id;
+
+      if (changed) {
+        resetFlowState(session, "service_provider_selected");
+      } else {
+        touchSession(session);
+      }
+
+      setFlash(session, "info", `Service Provider selectionne: ${selected.name || selected.clientId}.`);
+      redirect(res, "/?tab=configuration");
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/service-providers/test") {
+      const session = getOrCreateSession(req, res);
+      const rawBody = await readBody(req);
+      const body = parseBody(req, rawBody);
+      const selected = getServiceProvider(body.id || "");
+
+      if (!selected) {
+        setFlash(session, "warn", "Service Provider introuvable.");
+        redirect(res, "/?tab=configuration");
+        return;
+      }
+
+      session.selectedServiceProviderId = selected.id;
+      touchSession(session);
+      redirect(res, `/oidc/login?sp=${encodeURIComponent(selected.id)}`);
+      return;
+    }
+
     if (req.method === "GET" && url.pathname === "/oidc/login") {
       const session = getOrCreateSession(req, res);
+      const requestedServiceProviderId = url.searchParams.get("sp") || session.selectedServiceProviderId;
 
       try {
-        const prepared = prepareAuthorizationRequest(session.config);
-        session.config = prepared.config;
+        const runConfig = buildRunConfig(session, requestedServiceProviderId);
+        const prepared = prepareAuthorizationRequest(runConfig.config);
+        session.runtimeContext = {
+          providerName: providerConfig.providerName,
+          redirectUri: FIXED_REDIRECT_URI,
+          serviceProviderId: runConfig.selected.id,
+          serviceProviderName: runConfig.selected.name,
+          clientId: runConfig.selected.clientId,
+          clientType: runConfig.selected.clientType,
+          tokenEndpointAuthMethod: prepared.config.tokenEndpointAuthMethod
+        };
         session.flow.expectedState = prepared.runtime.state;
         session.flow.expectedNonce = prepared.runtime.nonce;
         session.flow.codeVerifier = prepared.runtime.codeVerifier;
@@ -817,18 +1119,21 @@ const server = http.createServer(async (req, res) => {
         session.steps.userinfo = null;
         session.tokens = null;
         session.comparison = null;
+        touchSession(session);
         addSessionLog(session, "info", "authorize_request", "URL /authorize construite.", {
-          request: prepared.request
+          request: prepared.request,
+          serviceProvider: sanitizeServiceProviderForUi(runConfig.selected)
         });
         redirect(res, prepared.request.url);
         return;
       } catch (error) {
         addSessionLog(session, "error", "authorize_request_failed", "Impossible de construire /authorize.", {
           error: error.message,
-          config: session.config
+          providerConfig,
+          serviceProvider: sanitizeServiceProviderForUi(getServiceProvider(requestedServiceProviderId))
         });
         setFlash(session, "error", error.message);
-        redirect(res, "/?tab=authorize");
+        redirect(res, "/?tab=configuration");
         return;
       }
     }
@@ -847,6 +1152,7 @@ const server = http.createServer(async (req, res) => {
         raw: req.method === "POST" ? rawBody : url.searchParams.toString(),
         stateCheck
       };
+      touchSession(session);
 
       const level = params.error ? "error" : stateCheck === "mismatch" ? "warn" : "info";
       addSessionLog(
@@ -880,8 +1186,9 @@ const server = http.createServer(async (req, res) => {
       const code = body.code || session.steps.callback?.params?.code;
 
       try {
+        const runConfig = buildRunConfig(session, session.runtimeContext?.serviceProviderId || session.selectedServiceProviderId);
         const requestSnapshot = buildTokenExchangeRequest({
-          config: getTokenExchangeConfig(session.config),
+          config: runConfig.config,
           code,
           codeVerifier: session.flow.codeVerifier
         });
@@ -890,10 +1197,12 @@ const server = http.createServer(async (req, res) => {
           request: sanitizeTokenRequest(requestSnapshot),
           response: responseSnapshot
         };
+        touchSession(session);
 
         if (responseSnapshot.ok) {
           session.tokens = analyzeTokens(responseSnapshot.parsed || {});
           session.comparison = null;
+          touchSession(session);
           addSessionLog(session, "info", "token_exchanged", "Authorization code echange contre des tokens.", {
             response: responseSnapshot
           });
@@ -922,6 +1231,7 @@ const server = http.createServer(async (req, res) => {
             error: error.message
           }
         };
+        touchSession(session);
         addSessionLog(session, "error", "token_exchange_failed", "Echec de la preparation de la requete /token.", {
           error: error.message
         });
@@ -938,7 +1248,7 @@ const server = http.createServer(async (req, res) => {
 
       try {
         const requestSnapshot = buildUserInfoRequest({
-          endpoint: session.config.userInfoEndpoint,
+          endpoint: providerConfig.userInfoEndpoint,
           accessToken
         });
         const responseSnapshot = await executeHttp(requestSnapshot);
@@ -946,10 +1256,12 @@ const server = http.createServer(async (req, res) => {
           request: requestSnapshot,
           response: responseSnapshot
         };
+        touchSession(session);
 
         if (responseSnapshot.ok) {
           const idTokenClaims = session.tokens?.idToken?.decoded?.payload || {};
           session.comparison = compareClaims(idTokenClaims, responseSnapshot.parsed || {});
+          touchSession(session);
           addSessionLog(session, "info", "userinfo_loaded", "Endpoint /userinfo appele avec succes.", {
             response: responseSnapshot
           });
@@ -978,6 +1290,7 @@ const server = http.createServer(async (req, res) => {
             error: error.message
           }
         };
+        touchSession(session);
         addSessionLog(session, "error", "userinfo_failed", "Impossible de preparer /userinfo.", {
           error: error.message
         });
@@ -991,7 +1304,9 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "GET" && url.pathname === "/health") {
       sendJson(res, 200, {
         status: "ok",
-        nodeEnv: NODE_ENV
+        nodeEnv: NODE_ENV,
+        redirectUri: FIXED_REDIRECT_URI,
+        serviceProviders: serviceProviders.length
       });
       return;
     }
@@ -1037,6 +1352,13 @@ process.on("SIGTERM", () => {
 
 async function start() {
   await loadPersistedState();
+
+  if (!process.env.SESSION_SECRET) {
+    appLog("warn", "SESSION_SECRET absent: les secrets persistants ne seront plus dechiffrables apres redemarrage.", {
+      stateFile: STATE_FILE
+    });
+  }
+
   server.listen(PORT, () => {
     appLog("info", "Serveur demarre", {
       port: PORT,
@@ -1045,7 +1367,8 @@ async function start() {
       logLevel: LOG_LEVEL,
       storageDir: STORAGE_DIR,
       stateFile: STATE_FILE,
-      serverClientSecretConfigured: Boolean(SERVER_CLIENT_SECRET)
+      redirectUri: FIXED_REDIRECT_URI,
+      serviceProviders: serviceProviders.length
     });
   });
 }

@@ -1,5 +1,8 @@
 import crypto from "node:crypto";
 
+export const FIXED_REDIRECT_URI = "https://oidc-debug.onrender.com/oidc/callback";
+export const DEFAULT_SCOPES = "openid profile email";
+
 const SENSITIVE_TOKENS = [
   "access_token",
   "authorization",
@@ -16,42 +19,6 @@ function isSensitiveKey(key = "") {
   return SENSITIVE_TOKENS.some((candidate) => normalized.includes(candidate));
 }
 
-export function createBaseConfig(baseUrl) {
-  return {
-    providerName: "",
-    discoveryUrl: "",
-    issuer: "",
-    authorizationEndpoint: "",
-    tokenEndpoint: "",
-    userInfoEndpoint: "",
-    jwksUri: "",
-    clientId: "",
-    clientSecret: "",
-    clientType: "public",
-    redirectUri: new URL("/oidc/callback", baseUrl).toString(),
-    tokenEndpointAuthMethod: "none",
-    responseType: "code",
-    responseMode: "query",
-    scopes: "openid profile email",
-    state: "",
-    nonce: "",
-    pkceEnabled: true,
-    codeChallengeMethod: "S256"
-  };
-}
-
-function readBoolean(value, fallback = false) {
-  if (typeof value === "boolean") {
-    return value;
-  }
-
-  if (typeof value === "string") {
-    return ["1", "on", "true", "yes"].includes(value.toLowerCase());
-  }
-
-  return fallback;
-}
-
 function clean(value, fallback = "") {
   if (value === undefined || value === null) {
     return fallback;
@@ -60,13 +27,21 @@ function clean(value, fallback = "") {
   return String(value).trim();
 }
 
-export function normalizeConfig(input = {}, baseUrl) {
-  const defaults = createBaseConfig(baseUrl);
-  const clientType = clean(input.clientType || defaults.clientType, defaults.clientType);
-  const authMethod = clean(
-    input.tokenEndpointAuthMethod || defaults.tokenEndpointAuthMethod,
-    defaults.tokenEndpointAuthMethod
-  );
+export function createProviderConfig() {
+  return {
+    providerName: "",
+    discoveryUrl: "",
+    issuer: "",
+    authorizationEndpoint: "",
+    tokenEndpoint: "",
+    userInfoEndpoint: "",
+    jwksUri: "",
+    redirectUri: FIXED_REDIRECT_URI
+  };
+}
+
+export function normalizeProviderConfig(input = {}) {
+  const defaults = createProviderConfig();
 
   return {
     providerName: clean(input.providerName, defaults.providerName),
@@ -76,31 +51,58 @@ export function normalizeConfig(input = {}, baseUrl) {
     tokenEndpoint: clean(input.tokenEndpoint, defaults.tokenEndpoint),
     userInfoEndpoint: clean(input.userInfoEndpoint, defaults.userInfoEndpoint),
     jwksUri: clean(input.jwksUri, defaults.jwksUri),
-    clientId: clean(input.clientId, defaults.clientId),
-    clientSecret: "",
-    clientType: ["public", "confidential"].includes(clientType) ? clientType : defaults.clientType,
-    redirectUri: clean(input.redirectUri, defaults.redirectUri) || defaults.redirectUri,
-    tokenEndpointAuthMethod: ["client_secret_basic", "client_secret_post", "none"].includes(authMethod)
-      ? authMethod
-      : defaults.tokenEndpointAuthMethod,
-    responseType: clean(input.responseType, defaults.responseType) || defaults.responseType,
-    responseMode: clean(input.responseMode, defaults.responseMode) || defaults.responseMode,
-    scopes: clean(input.scopes, defaults.scopes) || defaults.scopes,
-    state: clean(input.state, defaults.state),
-    nonce: clean(input.nonce, defaults.nonce),
-    pkceEnabled: readBoolean(input.pkceEnabled, defaults.pkceEnabled),
-    codeChallengeMethod: clean(input.codeChallengeMethod, defaults.codeChallengeMethod) || defaults.codeChallengeMethod
+    redirectUri: FIXED_REDIRECT_URI
   };
 }
 
-export function mergeDiscoveryIntoConfig(config, discovery = {}) {
+export function normalizeServiceProvider(input = {}, current = {}) {
+  const clientType = clean(input.clientType || current.clientType || "confidential", "confidential");
+
   return {
+    id: clean(input.id, clean(current.id)),
+    name: clean(input.name, clean(current.name)),
+    clientId: clean(input.clientId, clean(current.clientId)),
+    clientType: ["public", "confidential"].includes(clientType) ? clientType : "confidential",
+    scopes: clean(input.scopes, clean(current.scopes, DEFAULT_SCOPES)) || DEFAULT_SCOPES
+  };
+}
+
+export function mergeDiscoveryIntoProviderConfig(config, discovery = {}) {
+  return normalizeProviderConfig({
     ...config,
     issuer: clean(discovery.issuer, config.issuer),
     authorizationEndpoint: clean(discovery.authorization_endpoint, config.authorizationEndpoint),
     tokenEndpoint: clean(discovery.token_endpoint, config.tokenEndpoint),
     userInfoEndpoint: clean(discovery.userinfo_endpoint, config.userInfoEndpoint),
     jwksUri: clean(discovery.jwks_uri, config.jwksUri)
+  });
+}
+
+export function buildEffectiveConfig({ providerConfig, serviceProvider, clientSecret = "" }) {
+  const normalizedProvider = normalizeProviderConfig(providerConfig);
+  const normalizedSp = normalizeServiceProvider(serviceProvider);
+  const confidential = normalizedSp.clientType === "confidential";
+
+  return {
+    providerName: normalizedProvider.providerName,
+    discoveryUrl: normalizedProvider.discoveryUrl,
+    issuer: normalizedProvider.issuer,
+    authorizationEndpoint: normalizedProvider.authorizationEndpoint,
+    tokenEndpoint: normalizedProvider.tokenEndpoint,
+    userInfoEndpoint: normalizedProvider.userInfoEndpoint,
+    jwksUri: normalizedProvider.jwksUri,
+    clientId: normalizedSp.clientId,
+    clientSecret: confidential ? clean(clientSecret) : "",
+    clientType: normalizedSp.clientType,
+    redirectUri: FIXED_REDIRECT_URI,
+    tokenEndpointAuthMethod: confidential ? "client_secret_basic" : "none",
+    responseType: "code",
+    responseMode: "query",
+    scopes: normalizedSp.scopes || DEFAULT_SCOPES,
+    state: "",
+    nonce: "",
+    pkceEnabled: true,
+    codeChallengeMethod: "S256"
   };
 }
 
@@ -134,16 +136,8 @@ export function prepareAuthorizationRequest(config) {
     throw new Error("redirect_uri manquant.");
   }
 
-  if (config.responseType !== "code") {
-    throw new Error("V1 ne supporte que le Authorization Code Flow (`response_type=code`).");
-  }
-
-  if (config.responseMode === "fragment") {
-    throw new Error("`response_mode=fragment` n'est pas supporte par ce backend.");
-  }
-
-  const state = config.state || randomOpaque(12);
-  const nonce = config.nonce || randomOpaque(12);
+  const state = randomOpaque(12);
+  const nonce = randomOpaque(12);
   const runtime = {
     state,
     nonce,
@@ -151,38 +145,33 @@ export function prepareAuthorizationRequest(config) {
     codeChallenge: ""
   };
 
-  const effectiveConfig = {
-    ...config,
-    state,
-    nonce
-  };
-
   const params = {
-    client_id: effectiveConfig.clientId,
-    redirect_uri: effectiveConfig.redirectUri,
-    response_type: effectiveConfig.responseType,
-    scope: effectiveConfig.scopes,
+    client_id: config.clientId,
+    redirect_uri: config.redirectUri,
+    response_type: "code",
+    response_mode: "query",
+    scope: config.scopes || DEFAULT_SCOPES,
     state,
     nonce
   };
 
-  if (effectiveConfig.responseMode) {
-    params.response_mode = effectiveConfig.responseMode;
-  }
-
-  if (effectiveConfig.pkceEnabled) {
-    const pair = generatePkcePair(effectiveConfig.codeChallengeMethod);
+  if (config.pkceEnabled !== false) {
+    const pair = generatePkcePair(config.codeChallengeMethod || "S256");
     runtime.codeVerifier = pair.codeVerifier;
     runtime.codeChallenge = pair.codeChallenge;
     params.code_challenge = pair.codeChallenge;
-    params.code_challenge_method = effectiveConfig.codeChallengeMethod;
+    params.code_challenge_method = config.codeChallengeMethod || "S256";
   }
 
   const search = serializeForm(params);
-  const url = `${effectiveConfig.authorizationEndpoint}?${search}`;
+  const url = `${config.authorizationEndpoint}?${search}`;
 
   return {
-    config: effectiveConfig,
+    config: {
+      ...config,
+      state,
+      nonce
+    },
     runtime,
     request: {
       url,
@@ -220,7 +209,7 @@ export function buildTokenExchangeRequest({ config, code, codeVerifier }) {
     redirect_uri: config.redirectUri
   };
 
-  if (config.pkceEnabled && codeVerifier) {
+  if (config.pkceEnabled !== false && codeVerifier) {
     bodyParams.code_verifier = codeVerifier;
   }
 
@@ -231,13 +220,6 @@ export function buildTokenExchangeRequest({ config, code, codeVerifier }) {
 
     const basic = Buffer.from(`${config.clientId}:${config.clientSecret}`, "utf8").toString("base64");
     headers.authorization = `Basic ${basic}`;
-  } else if (config.tokenEndpointAuthMethod === "client_secret_post") {
-    if (!config.clientSecret) {
-      throw new Error("client_secret requis pour `client_secret_post`.");
-    }
-
-    bodyParams.client_id = config.clientId;
-    bodyParams.client_secret = config.clientSecret;
   } else {
     bodyParams.client_id = config.clientId;
   }
