@@ -593,9 +593,6 @@ export function renderPage({
                   </div>
                 </form>
                 <p class="note">Le well-known est conserve comme source de verite. Les endpoints sont resolus au moment du test et ne sont plus affiches ici.</p>
-                <div class="spacer"></div>
-                <h4>Dernier appel Discovery</h4>
-                ${session.steps.discovery ? renderRequestResponse(session.steps.discovery) : `<p class="empty">Aucun import discovery execute.</p>`}
               </div>
             </div>
 

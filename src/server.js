@@ -28,12 +28,12 @@ const projectRoot = path.resolve(__dirname, "..");
 const PORT = Number(process.env.PORT || 3000);
 const NODE_ENV = process.env.NODE_ENV || "development";
 const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
-const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomUUID();
 const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 const SESSION_COOKIE = "oidc_debug_sid";
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 const STORAGE_DIR = process.env.STORAGE_DIR || path.join(projectRoot, "data");
 const STATE_FILE = path.join(STORAGE_DIR, "state.json");
+const SESSION_SECRET_FILE = path.join(STORAGE_DIR, "session-secret");
 
 const staticFiles = new Map([
   ["/assets/app.css", { filePath: path.join(projectRoot, "public", "app.css"), contentType: "text/css; charset=utf-8" }],
@@ -45,7 +45,9 @@ let providerConfig = createProviderConfig();
 let serviceProviders = [];
 let persistTimer = null;
 let persistInFlight = Promise.resolve();
-const secretKey = crypto.createHash("sha256").update(SESSION_SECRET).digest();
+let runtimeSessionSecret = process.env.SESSION_SECRET || "";
+let runtimeSecretSource = process.env.SESSION_SECRET ? "env" : "pending";
+let secretKey = null;
 const logLevels = {
   debug: 10,
   info: 20,
@@ -53,13 +55,29 @@ const logLevels = {
   error: 40
 };
 
+function getSessionSecret() {
+  if (!runtimeSessionSecret) {
+    throw new Error("SESSION_SECRET non initialise.");
+  }
+
+  return runtimeSessionSecret;
+}
+
+function getSecretKey() {
+  if (!secretKey) {
+    throw new Error("Cle de chiffrement non initialisee.");
+  }
+
+  return secretKey;
+}
+
 function createId(prefix) {
   return `${prefix}_${crypto.randomBytes(8).toString("hex")}`;
 }
 
 function encryptSecret(secret) {
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv("aes-256-gcm", secretKey, iv);
+  const cipher = crypto.createCipheriv("aes-256-gcm", getSecretKey(), iv);
   const ciphertext = Buffer.concat([cipher.update(String(secret), "utf8"), cipher.final()]);
   const tag = cipher.getAuthTag();
 
@@ -79,7 +97,7 @@ function decryptSecret(record) {
 
   const decipher = crypto.createDecipheriv(
     record.algorithm || "aes-256-gcm",
-    secretKey,
+    getSecretKey(),
     Buffer.from(record.iv, "base64")
   );
   decipher.setAuthTag(Buffer.from(record.tag, "base64"));
@@ -361,6 +379,35 @@ async function loadPersistedState() {
   }
 }
 
+async function ensureRuntimeSecrets() {
+  if (process.env.SESSION_SECRET) {
+    runtimeSessionSecret = process.env.SESSION_SECRET;
+    runtimeSecretSource = "env";
+    secretKey = crypto.createHash("sha256").update(runtimeSessionSecret).digest();
+    return;
+  }
+
+  await mkdir(STORAGE_DIR, { recursive: true });
+
+  try {
+    runtimeSessionSecret = (await readFile(SESSION_SECRET_FILE, "utf8")).trim();
+    runtimeSecretSource = "file";
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+
+    runtimeSessionSecret = crypto.randomUUID();
+    runtimeSecretSource = "generated-file";
+    await writeFile(SESSION_SECRET_FILE, `${runtimeSessionSecret}\n`, {
+      encoding: "utf8",
+      mode: 0o600
+    });
+  }
+
+  secretKey = crypto.createHash("sha256").update(runtimeSessionSecret).digest();
+}
+
 function cleanupSessions() {
   const deadline = Date.now() - SESSION_TTL_MS;
   let removed = false;
@@ -399,7 +446,7 @@ function parseCookies(cookieHeader = "") {
 }
 
 function setSessionCookie(res, sessionId) {
-  const signature = crypto.createHmac("sha256", SESSION_SECRET).update(sessionId).digest("hex").slice(0, 16);
+  const signature = crypto.createHmac("sha256", getSessionSecret()).update(sessionId).digest("hex").slice(0, 16);
   const value = `${sessionId}.${signature}`;
   res.setHeader("Set-Cookie", `${SESSION_COOKIE}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax`);
 }
@@ -414,7 +461,7 @@ function decodeSessionCookie(rawValue = "") {
     return null;
   }
 
-  const expected = crypto.createHmac("sha256", SESSION_SECRET).update(sessionId).digest("hex").slice(0, 16);
+  const expected = crypto.createHmac("sha256", getSessionSecret()).update(sessionId).digest("hex").slice(0, 16);
   if (signature.length !== expected.length) {
     return null;
   }
@@ -1413,13 +1460,8 @@ process.on("SIGTERM", () => {
 });
 
 async function start() {
+  await ensureRuntimeSecrets();
   await loadPersistedState();
-
-  if (!process.env.SESSION_SECRET) {
-    appLog("warn", "SESSION_SECRET absent: les secrets persistants ne seront plus dechiffrables apres redemarrage.", {
-      stateFile: STATE_FILE
-    });
-  }
 
   server.listen(PORT, () => {
     appLog("info", "Serveur demarre", {
@@ -1429,6 +1471,8 @@ async function start() {
       logLevel: LOG_LEVEL,
       storageDir: STORAGE_DIR,
       stateFile: STATE_FILE,
+      sessionSecretSource: runtimeSecretSource,
+      sessionSecretFile: process.env.SESSION_SECRET ? null : SESSION_SECRET_FILE,
       redirectUri: FIXED_REDIRECT_URI,
       serviceProviders: serviceProviders.length
     });

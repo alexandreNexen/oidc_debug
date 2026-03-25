@@ -1,6 +1,18 @@
 import crypto from "node:crypto";
 
-export const FIXED_REDIRECT_URI = "https://oidc-debug.onrender.com/oidc/callback";
+const DEFAULT_BASE_URL = "http://localhost:3000";
+
+function buildRedirectUri() {
+  const configured = process.env.OIDC_REDIRECT_URI?.trim();
+  if (configured) {
+    return configured;
+  }
+
+  const baseUrl = process.env.BASE_URL?.trim() || DEFAULT_BASE_URL;
+  return new URL("/oidc/callback", baseUrl).toString();
+}
+
+export const FIXED_REDIRECT_URI = buildRedirectUri();
 
 const SENSITIVE_TOKENS = [
   "access_token",
