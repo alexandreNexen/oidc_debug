@@ -1,7 +1,6 @@
 import crypto from "node:crypto";
 
 export const FIXED_REDIRECT_URI = "https://oidc-debug.onrender.com/oidc/callback";
-export const DEFAULT_SCOPES = "openid profile email";
 
 const SENSITIVE_TOKENS = [
   "access_token",
@@ -63,7 +62,7 @@ export function normalizeServiceProvider(input = {}, current = {}) {
     name: clean(input.name, clean(current.name)),
     clientId: clean(input.clientId, clean(current.clientId)),
     clientType: ["public", "confidential"].includes(clientType) ? clientType : "confidential",
-    scopes: clean(input.scopes, clean(current.scopes, DEFAULT_SCOPES)) || DEFAULT_SCOPES
+    scopes: clean(input.scopes, clean(current.scopes))
   };
 }
 
@@ -98,7 +97,7 @@ export function buildEffectiveConfig({ providerConfig, serviceProvider, clientSe
     tokenEndpointAuthMethod: confidential ? "client_secret_basic" : "none",
     responseType: "code",
     responseMode: "query",
-    scopes: normalizedSp.scopes || DEFAULT_SCOPES,
+    scopes: normalizedSp.scopes,
     state: "",
     nonce: "",
     pkceEnabled: true,
@@ -150,7 +149,7 @@ export function prepareAuthorizationRequest(config) {
     redirect_uri: config.redirectUri,
     response_type: "code",
     response_mode: "query",
-    scope: config.scopes || DEFAULT_SCOPES,
+    scope: config.scopes,
     state,
     nonce
   };

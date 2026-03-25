@@ -131,6 +131,7 @@ function sanitizeServiceProviderForUi(serviceProvider) {
 
   return {
     ...normalized,
+    scopes: normalized.scopes,
     secretConfigured: Boolean(serviceProvider.secretRecord?.ciphertext),
     createdAt: serviceProvider.createdAt || null,
     updatedAt: serviceProvider.updatedAt || null
@@ -296,6 +297,7 @@ async function loadPersistedState() {
           name: normalized.name,
           clientId: normalized.clientId,
           clientType: normalized.clientType,
+          scopes: normalized.scopes,
           secretRecord: entry.secretRecord || null,
           createdAt: entry.createdAt || new Date().toISOString(),
           updatedAt: entry.updatedAt || new Date().toISOString()
@@ -535,6 +537,7 @@ function upsertServiceProvider(input, rawSecret) {
     name: normalized.name,
     clientId: normalized.clientId,
     clientType: normalized.clientType,
+    scopes: normalized.scopes,
     secretRecord:
       normalized.clientType === "confidential"
         ? existing?.secretRecord || null
@@ -804,6 +807,56 @@ async function executeHttp(request) {
   }
 }
 
+function buildDiscoveryRequest(discoveryUrl) {
+  return {
+    url: discoveryUrl,
+    method: "GET",
+    headers: {
+      accept: "application/json"
+    },
+    params: {},
+    body: "",
+    redactedBody: "",
+    curl: buildCurlCommand({
+      url: discoveryUrl,
+      method: "GET",
+      headers: {
+        accept: "application/json"
+      }
+    })
+  };
+}
+
+async function resolveProviderConfigForRun() {
+  const baseConfig = sanitizeProviderConfig(providerConfig);
+
+  if (!baseConfig.discoveryUrl) {
+    return {
+      config: baseConfig,
+      discovery: null
+    };
+  }
+
+  const requestSnapshot = buildDiscoveryRequest(baseConfig.discoveryUrl);
+  const responseSnapshot = await executeHttp(requestSnapshot);
+
+  if (!responseSnapshot.ok || Object.keys(responseSnapshot.parsed || {}).length === 0) {
+    throw new Error(
+      responseSnapshot.error
+        ? `Impossible de charger le well-known: ${responseSnapshot.error}`
+        : `Le well-known a retourne ${responseSnapshot.status || "une erreur inconnue"}.`
+    );
+  }
+
+  return {
+    config: mergeDiscoveryIntoProviderConfig(baseConfig, responseSnapshot.parsed),
+    discovery: {
+      request: requestSnapshot,
+      response: responseSnapshot
+    }
+  };
+}
+
 function inferActiveTab(pathname) {
   if (pathname === "/logs") {
     return "logs";
@@ -816,7 +869,7 @@ function ensureHtmlSessionRoute(req) {
   return req.headers.accept?.includes("text/html") || req.headers.accept === "*/*" || !req.headers.accept;
 }
 
-function buildRunConfig(session, serviceProviderId) {
+async function buildRunConfig(session, serviceProviderId) {
   const selected = getServiceProvider(serviceProviderId) || resolveSelectedServiceProvider(session);
 
   if (!selected) {
@@ -831,13 +884,29 @@ function buildRunConfig(session, serviceProviderId) {
 
   session.selectedServiceProviderId = selected.id;
 
+  const resolvedProvider =
+    session.runtimeContext?.serviceProviderId === selected.id &&
+    session.runtimeContext?.authorizationEndpoint &&
+    session.runtimeContext?.tokenEndpoint
+      ? sanitizeProviderConfig({
+          providerName: session.runtimeContext.providerName,
+          discoveryUrl: session.runtimeContext.discoveryUrl,
+          issuer: session.runtimeContext.issuer,
+          authorizationEndpoint: session.runtimeContext.authorizationEndpoint,
+          tokenEndpoint: session.runtimeContext.tokenEndpoint,
+          userInfoEndpoint: session.runtimeContext.userInfoEndpoint,
+          jwksUri: session.runtimeContext.jwksUri
+        })
+      : (await resolveProviderConfigForRun()).config;
+
   return {
     selected,
     config: buildEffectiveConfig({
-      providerConfig,
+      providerConfig: resolvedProvider,
       serviceProvider: selected,
       clientSecret: secret
-    })
+    }),
+    provider: resolvedProvider
   };
 }
 
@@ -925,27 +994,10 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      providerConfig = sanitizeProviderConfig({
-        ...providerConfig,
+      const changed = applyProviderConfigUpdate({
         discoveryUrl
       });
-      const requestSnapshot = {
-        url: discoveryUrl,
-        method: "GET",
-        headers: {
-          accept: "application/json"
-        },
-        params: {},
-        body: "",
-        redactedBody: "",
-        curl: buildCurlCommand({
-          url: discoveryUrl,
-          method: "GET",
-          headers: {
-            accept: "application/json"
-          }
-        })
-      };
+      const requestSnapshot = buildDiscoveryRequest(discoveryUrl);
       const responseSnapshot = await executeHttp(requestSnapshot);
 
       session.steps.discovery = {
@@ -954,15 +1006,18 @@ const server = http.createServer(async (req, res) => {
       };
 
       if (responseSnapshot.ok && Object.keys(responseSnapshot.parsed || {}).length > 0) {
-        providerConfig = mergeDiscoveryIntoProviderConfig(providerConfig, responseSnapshot.parsed);
-        schedulePersistState();
-        resetFlowState(session, "discovery_config_update");
-        addSessionLog(session, "info", "discovery_loaded", "Configuration provider chargee depuis le discovery endpoint.", {
+        if (changed) {
+          resetFlowState(session, "discovery_url_update");
+        } else {
+          touchSession(session);
+        }
+        addSessionLog(session, "info", "discovery_loaded", "Well-known verifie avec succes.", {
           discoveryUrl,
           response: responseSnapshot
         });
-        setFlash(session, "info", "Discovery charge avec succes.");
+        setFlash(session, "info", "Well-known verifie avec succes.");
       } else {
+        touchSession(session);
         addSessionLog(session, "warn", "discovery_failed", "Echec du chargement du discovery endpoint.", {
           discoveryUrl,
           response: responseSnapshot
@@ -1086,15 +1141,22 @@ const server = http.createServer(async (req, res) => {
       const requestedServiceProviderId = url.searchParams.get("sp") || session.selectedServiceProviderId;
 
       try {
-        const runConfig = buildRunConfig(session, requestedServiceProviderId);
+        const runConfig = await buildRunConfig(session, requestedServiceProviderId);
         const prepared = prepareAuthorizationRequest(runConfig.config);
         session.runtimeContext = {
-          providerName: providerConfig.providerName,
+          providerName: runConfig.provider.providerName,
+          discoveryUrl: runConfig.provider.discoveryUrl,
+          issuer: runConfig.provider.issuer,
+          authorizationEndpoint: runConfig.provider.authorizationEndpoint,
+          tokenEndpoint: runConfig.provider.tokenEndpoint,
+          userInfoEndpoint: runConfig.provider.userInfoEndpoint,
+          jwksUri: runConfig.provider.jwksUri,
           redirectUri: FIXED_REDIRECT_URI,
           serviceProviderId: runConfig.selected.id,
           serviceProviderName: runConfig.selected.name,
           clientId: runConfig.selected.clientId,
           clientType: runConfig.selected.clientType,
+          scopes: runConfig.selected.scopes,
           tokenEndpointAuthMethod: prepared.config.tokenEndpointAuthMethod
         };
         session.flow.expectedState = prepared.runtime.state;
@@ -1186,7 +1248,7 @@ const server = http.createServer(async (req, res) => {
       const code = body.code || session.steps.callback?.params?.code;
 
       try {
-        const runConfig = buildRunConfig(session, session.runtimeContext?.serviceProviderId || session.selectedServiceProviderId);
+        const runConfig = await buildRunConfig(session, session.runtimeContext?.serviceProviderId || session.selectedServiceProviderId);
         const requestSnapshot = buildTokenExchangeRequest({
           config: runConfig.config,
           code,
@@ -1248,7 +1310,7 @@ const server = http.createServer(async (req, res) => {
 
       try {
         const requestSnapshot = buildUserInfoRequest({
-          endpoint: providerConfig.userInfoEndpoint,
+          endpoint: session.runtimeContext?.userInfoEndpoint || providerConfig.userInfoEndpoint,
           accessToken
         });
         const responseSnapshot = await executeHttp(requestSnapshot);

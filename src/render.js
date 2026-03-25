@@ -1,4 +1,4 @@
-import { DEFAULT_SCOPES, redactHeaders, redactObject, toPrettyJson } from "./oidc.js";
+import { redactHeaders, redactObject, toPrettyJson } from "./oidc.js";
 
 function escapeHtml(value = "") {
   return String(value)
@@ -324,12 +324,13 @@ function summaryCards(session, providerConfig, selectedServiceProvider) {
   const authorizeReady = Boolean(session.steps.authorize?.request?.url);
   const callbackReceived = Boolean(session.steps.callback?.params);
   const tokenResponse = session.steps.token?.response?.status;
+  const providerReady = Boolean(providerConfig.discoveryUrl || (providerConfig.authorizationEndpoint && providerConfig.tokenEndpoint));
 
   const cards = [
     {
       label: "Provider",
       value: providerConfig.providerName || "Non defini",
-      kind: providerConfig.authorizationEndpoint && providerConfig.tokenEndpoint ? "success" : "warning"
+      kind: providerReady ? "success" : "warning"
     },
     {
       label: "SP selectionne",
@@ -432,7 +433,7 @@ function renderServiceProviderForm(editingServiceProvider, selectedServiceProvid
     name: "",
     clientId: "",
     clientType: "confidential",
-    scopes: DEFAULT_SCOPES,
+    scopes: "",
     secretConfigured: false
   };
   const editing = Boolean(editingServiceProvider?.id);
@@ -469,7 +470,7 @@ function renderServiceProviderForm(editingServiceProvider, selectedServiceProvid
           ["confidential", "Confidential"],
           ["public", "Public"]
         ])}
-        ${renderInput("Scopes", "scopes", model.scopes || DEFAULT_SCOPES, {
+        ${renderInput("Scopes", "scopes", model.scopes || "", {
           long: true,
           help: "Scopes OIDC envoyes pour ce Service Provider. Exemple: openid profile email offline_access"
         })}
@@ -489,7 +490,7 @@ function renderServiceProviderForm(editingServiceProvider, selectedServiceProvid
         ${renderReadonlyPair("Auth /token", model.clientType === "confidential" ? "client_secret_basic" : "none", model.clientType === "confidential" ? "success" : "warning")}
         ${renderReadonlyPair("Response type", "code")}
         ${renderReadonlyPair("Gestion runtime", "state, nonce et PKCE automatiques")}
-        ${renderReadonlyPair("Scopes", model.scopes || DEFAULT_SCOPES)}
+        ${renderReadonlyPair("Scopes", model.scopes || "Aucun")}
         ${renderReadonlyPair("SP actuellement selectionne", selectedServiceProvider?.name || selectedServiceProvider?.clientId || "Aucun", selectedServiceProvider ? "success" : "warning")}
       </div>
       <div class="form-actions">
@@ -567,13 +568,6 @@ export function renderPage({
                 </header>
                 <div class="form-grid">
                   ${renderInput("Nom du provider", "providerName", providerConfig.providerName)}
-                  ${renderInput("Issuer", "issuer", providerConfig.issuer, { long: true })}
-                  ${renderInput("Authorization endpoint", "authorizationEndpoint", providerConfig.authorizationEndpoint, {
-                    long: true
-                  })}
-                  ${renderInput("Token endpoint", "tokenEndpoint", providerConfig.tokenEndpoint, { long: true })}
-                  ${renderInput("UserInfo endpoint", "userInfoEndpoint", providerConfig.userInfoEndpoint, { long: true })}
-                  ${renderInput("JWKS URI", "jwksUri", providerConfig.jwksUri, { long: true })}
                   ${renderInput("Redirect URI globale", "redirectUri", fixedRedirectUri, {
                     long: true,
                     readonly: true,
@@ -595,10 +589,10 @@ export function renderPage({
                     long: true
                   })}
                   <div class="form-actions">
-                    <button type="submit" class="ghost-button">Charger les endpoints</button>
+                    <button type="submit" class="ghost-button">Verifier le well-known</button>
                   </div>
                 </form>
-                <p class="note">Les endpoints viennent du discovery a l'origine, mais la configuration provider reste ensuite globale et persistante.</p>
+                <p class="note">Le well-known est conserve comme source de verite. Les endpoints sont resolus au moment du test et ne sont plus affiches ici.</p>
                 <div class="spacer"></div>
                 <h4>Dernier appel Discovery</h4>
                 ${session.steps.discovery ? renderRequestResponse(session.steps.discovery) : `<p class="empty">Aucun import discovery execute.</p>`}

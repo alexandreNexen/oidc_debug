@@ -15,15 +15,10 @@ Cette URI doit aussi etre ajoutee dans la configuration EZ-ACCESS pour que le ca
 La configuration provider persiste:
 
 - nom du provider
-- issuer
-- authorization endpoint
-- token endpoint
-- userinfo endpoint
-- jwks uri
-- discovery URL pour charger ou rafraichir les endpoints
+- discovery URL well-known comme source de verite pour resoudre les endpoints
 - redirect URI globale fixe
 
-Les endpoints peuvent etre charges une fois via le discovery endpoint, puis reutilises.
+Les endpoints sont resolves a l'execution depuis le well-known et ne sont plus saisis dans l'interface.
 
 ### Service Providers
 
@@ -43,6 +38,7 @@ Le `client_secret`:
 - n'est jamais renvoye en clair au navigateur
 
 L'UI affiche seulement `Secret configure`, `Aucun secret configure` ou `Non requis`.
+Les `scopes` envoyes sont strictement ceux du Service Provider, sans valeur par defaut injectee par l'application.
 
 ## Stack
 
