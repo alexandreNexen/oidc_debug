@@ -4,7 +4,7 @@
 
 - une configuration provider globale partagee par toute l'application
 - plusieurs configurations de Service Provider reutilisables
-- une redirect URI globale derivee de `BASE_URL` pour tous les tests
+- une redirect URI globale configurable dans l'UI pour tous les tests
 
 Cette URI doit aussi etre ajoutee dans la configuration EZ-ACCESS pour que le callback fonctionne.
 
@@ -16,7 +16,7 @@ La configuration provider persiste:
 
 - nom du provider
 - discovery URL well-known comme source de verite pour resoudre les endpoints
-- redirect URI globale derivee de `BASE_URL` ou forcee via `OIDC_REDIRECT_URI`
+- redirect URI globale configurable et persistante
 
 Les endpoints sont resolves a l'execution depuis le well-known et ne sont plus saisis dans l'interface.
 
@@ -52,7 +52,8 @@ Les `scopes` envoyes sont strictement ceux du Service Provider, sans valeur par 
 - `PORT`: port HTTP interne de l'application
 - `NODE_ENV`: mode d'execution
 - `BASE_URL`: URL publique de l'application
-- `OIDC_REDIRECT_URI`: override optionnel de la redirect URI, si differente de `BASE_URL + /oidc/callback`
+- `RENDER_EXTERNAL_URL`: variable Render detectee automatiquement comme fallback pour l'URL publique par defaut
+- `OIDC_REDIRECT_URI`: valeur initiale optionnelle pour pre-remplir la redirect URI globale
 - `SESSION_SECRET`: secret serveur utilise pour le cookie de session et pour chiffrer les secrets stockes
 - `LOG_LEVEL`: `debug`, `info`, `warn`, `error`
 - `STORAGE_DIR`: dossier de persistance
@@ -71,6 +72,7 @@ docker compose up --build
 Application disponible sur `http://localhost:8080`.
 
 Les donnees sont persistees dans `./data/state.json` et le secret serveur local dans `./data/session-secret` via le volume Docker `./data:/data`.
+Sur Render, le chemin par defaut devient `/app/storage`, qui doit correspondre au point de montage d'un persistent disk.
 
 ## Endpoints principaux
 
@@ -96,3 +98,4 @@ Les donnees sont persistees dans `./data/state.json` et le secret serveur local 
 - Les logs applicatifs redigent les secrets et tokens.
 - Si `SESSION_SECRET` change, les secrets persistants precedemment stockes ne pourront plus etre dechiffres.
 - Sans volume persistant sur `STORAGE_DIR`, un redeploiement repartira avec une configuration vide.
+- Sur Render, sans persistent disk monte sur `/app/storage` ou sans `STORAGE_DIR` explicite, la persistance ne survivra pas aux redeploiements.

@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 
-const DEFAULT_BASE_URL = "http://localhost:3000";
+const DEFAULT_BASE_URL = process.env.RENDER_EXTERNAL_URL?.trim() || `http://localhost:${process.env.PORT || 3000}`;
 
 function buildRedirectUri() {
   const configured = process.env.OIDC_REDIRECT_URI?.trim();
@@ -62,7 +62,7 @@ export function normalizeProviderConfig(input = {}) {
     tokenEndpoint: clean(input.tokenEndpoint, defaults.tokenEndpoint),
     userInfoEndpoint: clean(input.userInfoEndpoint, defaults.userInfoEndpoint),
     jwksUri: clean(input.jwksUri, defaults.jwksUri),
-    redirectUri: FIXED_REDIRECT_URI
+    redirectUri: clean(input.redirectUri, defaults.redirectUri)
   };
 }
 
@@ -89,7 +89,7 @@ export function mergeDiscoveryIntoProviderConfig(config, discovery = {}) {
   });
 }
 
-export function buildEffectiveConfig({ providerConfig, serviceProvider, clientSecret = "" }) {
+export function buildEffectiveConfig({ providerConfig, serviceProvider, clientSecret = "", redirectUri = FIXED_REDIRECT_URI }) {
   const normalizedProvider = normalizeProviderConfig(providerConfig);
   const normalizedSp = normalizeServiceProvider(serviceProvider);
   const confidential = normalizedSp.clientType === "confidential";
@@ -105,7 +105,7 @@ export function buildEffectiveConfig({ providerConfig, serviceProvider, clientSe
     clientId: normalizedSp.clientId,
     clientSecret: confidential ? clean(clientSecret) : "",
     clientType: normalizedSp.clientType,
-    redirectUri: FIXED_REDIRECT_URI,
+    redirectUri,
     tokenEndpointAuthMethod: confidential ? "client_secret_basic" : "none",
     responseType: "code",
     responseMode: "query",

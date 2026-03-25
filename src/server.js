@@ -27,11 +27,13 @@ const projectRoot = path.resolve(__dirname, "..");
 
 const PORT = Number(process.env.PORT || 3000);
 const NODE_ENV = process.env.NODE_ENV || "development";
-const BASE_URL = process.env.BASE_URL || `http://localhost:${PORT}`;
+const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || "";
+const IS_RENDER = process.env.RENDER === "true" || Boolean(RENDER_EXTERNAL_URL);
+const BASE_URL = process.env.BASE_URL || RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 const SESSION_COOKIE = "oidc_debug_sid";
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
-const STORAGE_DIR = process.env.STORAGE_DIR || path.join(projectRoot, "data");
+const STORAGE_DIR = process.env.STORAGE_DIR || (IS_RENDER ? "/app/storage" : path.join(projectRoot, "data"));
 const STATE_FILE = path.join(STORAGE_DIR, "state.json");
 const SESSION_SECRET_FILE = path.join(STORAGE_DIR, "session-secret");
 
@@ -703,8 +705,36 @@ function routeTab(url) {
   return url.searchParams.get("tab") || null;
 }
 
+function firstForwardedValue(value = "") {
+  if (Array.isArray(value)) {
+    return firstForwardedValue(value[0] || "");
+  }
+
+  return String(value).split(",")[0].trim();
+}
+
+function resolvePublicBaseUrl(req) {
+  if (process.env.BASE_URL?.trim()) {
+    return process.env.BASE_URL.trim();
+  }
+
+  const forwardedProto = firstForwardedValue(req.headers["x-forwarded-proto"]) || "http";
+  const forwardedHost = firstForwardedValue(req.headers["x-forwarded-host"]);
+  const host = forwardedHost || firstForwardedValue(req.headers.host);
+
+  if (host) {
+    return `${forwardedProto}://${host}`;
+  }
+
+  if (RENDER_EXTERNAL_URL) {
+    return RENDER_EXTERNAL_URL;
+  }
+
+  return `http://localhost:${PORT}`;
+}
+
 function currentPath(req) {
-  return new URL(req.url, BASE_URL);
+  return new URL(req.url, resolvePublicBaseUrl(req));
 }
 
 async function serveStatic(res, asset) {
@@ -916,7 +946,7 @@ function ensureHtmlSessionRoute(req) {
   return req.headers.accept?.includes("text/html") || req.headers.accept === "*/*" || !req.headers.accept;
 }
 
-async function buildRunConfig(session, serviceProviderId) {
+async function buildRunConfig(session, serviceProviderId, redirectUri = "") {
   const selected = getServiceProvider(serviceProviderId) || resolveSelectedServiceProvider(session);
 
   if (!selected) {
@@ -942,16 +972,20 @@ async function buildRunConfig(session, serviceProviderId) {
           authorizationEndpoint: session.runtimeContext.authorizationEndpoint,
           tokenEndpoint: session.runtimeContext.tokenEndpoint,
           userInfoEndpoint: session.runtimeContext.userInfoEndpoint,
-          jwksUri: session.runtimeContext.jwksUri
+          jwksUri: session.runtimeContext.jwksUri,
+          redirectUri: session.runtimeContext.redirectUri
         })
       : (await resolveProviderConfigForRun()).config;
+
+  const effectiveRedirectUri = redirectUri || resolvedProvider.redirectUri || FIXED_REDIRECT_URI;
 
   return {
     selected,
     config: buildEffectiveConfig({
       providerConfig: resolvedProvider,
       serviceProvider: selected,
-      clientSecret: secret
+      clientSecret: secret,
+      redirectUri: effectiveRedirectUri
     }),
     provider: resolvedProvider
   };
@@ -961,16 +995,17 @@ function buildPageModel(session, activeTab, url) {
   const editServiceProviderId = url.searchParams.get("edit") || "";
   const editingServiceProvider = sanitizeServiceProviderForUi(getServiceProvider(editServiceProviderId));
   const selectedServiceProvider = sanitizeServiceProviderForUi(getServiceProvider(session.selectedServiceProviderId));
+  const sanitizedProviderConfig = sanitizeProviderConfig(providerConfig);
 
   return {
     session,
     activeTab,
     flash: consumeFlash(session),
-    providerConfig: sanitizeProviderConfig(providerConfig),
+    providerConfig: sanitizedProviderConfig,
     serviceProviders: serviceProviders.map(sanitizeServiceProviderForUi),
     editingServiceProvider,
     selectedServiceProvider,
-    fixedRedirectUri: FIXED_REDIRECT_URI
+    fixedRedirectUri: sanitizedProviderConfig.redirectUri
   };
 }
 
@@ -1198,7 +1233,7 @@ const server = http.createServer(async (req, res) => {
           tokenEndpoint: runConfig.provider.tokenEndpoint,
           userInfoEndpoint: runConfig.provider.userInfoEndpoint,
           jwksUri: runConfig.provider.jwksUri,
-          redirectUri: FIXED_REDIRECT_URI,
+          redirectUri: runConfig.config.redirectUri,
           serviceProviderId: runConfig.selected.id,
           serviceProviderName: runConfig.selected.name,
           clientId: runConfig.selected.clientId,
@@ -1295,7 +1330,11 @@ const server = http.createServer(async (req, res) => {
       const code = body.code || session.steps.callback?.params?.code;
 
       try {
-        const runConfig = await buildRunConfig(session, session.runtimeContext?.serviceProviderId || session.selectedServiceProviderId);
+        const runConfig = await buildRunConfig(
+          session,
+          session.runtimeContext?.serviceProviderId || session.selectedServiceProviderId,
+          session.runtimeContext?.redirectUri || ""
+        );
         const requestSnapshot = buildTokenExchangeRequest({
           config: runConfig.config,
           code,
@@ -1411,10 +1450,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
+      const currentProviderConfig = sanitizeProviderConfig(providerConfig);
       sendJson(res, 200, {
         status: "ok",
         nodeEnv: NODE_ENV,
-        redirectUri: FIXED_REDIRECT_URI,
+        redirectUri: currentProviderConfig.redirectUri,
         serviceProviders: serviceProviders.length
       });
       return;
@@ -1463,6 +1503,20 @@ async function start() {
   await ensureRuntimeSecrets();
   await loadPersistedState();
 
+  if (IS_RENDER && !process.env.BASE_URL && RENDER_EXTERNAL_URL) {
+    appLog("warn", "BASE_URL absent: utilisation de RENDER_EXTERNAL_URL comme URL publique.", {
+      renderExternalUrl: RENDER_EXTERNAL_URL,
+      redirectUri: createProviderConfig().redirectUri
+    });
+  }
+
+  if (IS_RENDER && !process.env.STORAGE_DIR) {
+    appLog("warn", "STORAGE_DIR absent sur Render: utilisation de /app/storage. Verifier qu'un persistent disk est bien monte sur ce chemin.", {
+      storageDir: STORAGE_DIR,
+      stateFile: STATE_FILE
+    });
+  }
+
   server.listen(PORT, () => {
     appLog("info", "Serveur demarre", {
       port: PORT,
@@ -1473,7 +1527,7 @@ async function start() {
       stateFile: STATE_FILE,
       sessionSecretSource: runtimeSecretSource,
       sessionSecretFile: process.env.SESSION_SECRET ? null : SESSION_SECRET_FILE,
-      redirectUri: FIXED_REDIRECT_URI,
+      redirectUri: sanitizeProviderConfig(providerConfig).redirectUri,
       serviceProviders: serviceProviders.length
     });
   });

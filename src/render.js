@@ -570,8 +570,7 @@ export function renderPage({
                   ${renderInput("Nom du provider", "providerName", providerConfig.providerName)}
                   ${renderInput("Redirect URI globale", "redirectUri", fixedRedirectUri, {
                     long: true,
-                    readonly: true,
-                    help: "Ajouter cette URI dans la configuration EZ-ACCESS pour que le callback fonctionne."
+                    help: "Cette valeur doit correspondre exactement a la redirect URI enregistree cote EZ-ACCESS."
                   })}
                 </div>
                 <div class="form-actions">
