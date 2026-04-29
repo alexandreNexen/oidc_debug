@@ -3,8 +3,10 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { getEzAccessEnvironment, listEzAccessEnvironments } from "./config.js";
 import {
   analyzeTokens,
+  decodeJwt,
   buildCurlCommand,
   buildEffectiveConfig,
   buildTokenExchangeRequest,
@@ -21,6 +23,15 @@ import {
   safeJsonParse
 } from "./oidc.js";
 import { renderPage } from "./render.js";
+import { createFlowService, STEP_ORDER } from "./services/flows.js";
+import { createServiceProviderService, isServiceProviderReady, serviceProviderStatus } from "./services/serviceProviders.js";
+import { renderDashboard } from "./views/dashboard.js";
+import { renderFlowDetailsPage } from "./views/flowDetails.js";
+import { renderFlowResultPage } from "./views/flowResult.js";
+import { renderServiceProvidersPage } from "./views/serviceProviders.js";
+import { renderServiceProviderEditPage } from "./views/serviceProviderEdit.js";
+import { renderServiceProviderNewPage } from "./views/serviceProviderNew.js";
+import { renderLogsPage } from "./views/logs.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -45,11 +56,34 @@ const staticFiles = new Map([
 const sessions = new Map();
 let providerConfig = createProviderConfig();
 let serviceProviders = [];
+let flows = [];
+let flowSteps = [];
 let persistTimer = null;
 let persistInFlight = Promise.resolve();
 let runtimeSessionSecret = process.env.SESSION_SECRET || "";
 let runtimeSecretSource = process.env.SESSION_SECRET ? "env" : "pending";
 let secretKey = null;
+const serviceProviderService = createServiceProviderService({
+  getEntries: () => serviceProviders,
+  setEntries: (nextEntries) => {
+    serviceProviders = nextEntries;
+  },
+  createId,
+  encryptSecret,
+  onChange: schedulePersistState
+});
+const flowService = createFlowService({
+  getFlows: () => flows,
+  setFlows: (nextFlows) => {
+    flows = nextFlows;
+  },
+  getSteps: () => flowSteps,
+  setSteps: (nextSteps) => {
+    flowSteps = nextSteps;
+  },
+  createId,
+  onChange: schedulePersistState
+});
 const logLevels = {
   debug: 10,
   info: 20,
@@ -148,18 +182,27 @@ function sanitizeServiceProviderForUi(serviceProvider) {
   }
 
   const normalized = normalizeServiceProvider(serviceProvider, serviceProvider);
+  const environment = getEzAccessEnvironment(serviceProvider.environment || "");
 
   return {
     ...normalized,
+    environment: environment?.key || "",
+    environmentLabel: environment?.key === "preprod" ? "Preprod" : environment?.key === "prod" ? "Prod" : "",
     scopes: normalized.scopes,
     secretConfigured: Boolean(serviceProvider.secretRecord?.ciphertext),
+    status: serviceProviderStatus(serviceProvider),
     createdAt: serviceProvider.createdAt || null,
     updatedAt: serviceProvider.updatedAt || null
   };
 }
 
-function sortServiceProviders(entries = []) {
-  return [...entries].sort((left, right) => left.name.localeCompare(right.name, "fr"));
+function sanitizeEzAccessEnvironmentForUi(environment) {
+  return {
+    key: environment.key,
+    label: environment.label,
+    shortLabel: environment.key === "preprod" ? "Preprod" : "Prod",
+    discoveryConfigured: Boolean(environment.discoveryUrl)
+  };
 }
 
 function sanitizeSessionArtifacts(session) {
@@ -216,6 +259,8 @@ function buildPersistedState() {
     updatedAt: new Date().toISOString(),
     providerConfig: sanitizeProviderConfig(providerConfig),
     serviceProviders,
+    flows,
+    flowSteps,
     sessions: Array.from(sessions.values()).map((session) => ({
       ...sanitizeSessionArtifacts(session),
       flash: null
@@ -240,7 +285,7 @@ function schedulePersistState() {
     persistInFlight = persistInFlight
       .then(() => persistStateNow())
       .catch((error) => {
-        appLog("error", "Echec de persistance de l'etat applicatif", {
+        appLog("error", "Failed to persist application state", {
           error: error.message,
           stateFile: STATE_FILE
         });
@@ -257,7 +302,7 @@ async function flushPersistState() {
   persistInFlight = persistInFlight
     .then(() => persistStateNow())
     .catch((error) => {
-      appLog("error", "Echec de persistance de l'etat applicatif", {
+      appLog("error", "Failed to persist application state", {
         error: error.message,
         stateFile: STATE_FILE
       });
@@ -297,6 +342,8 @@ function migrateLegacyState(parsed = {}) {
     updatedAt: new Date().toISOString(),
     providerConfig: nextProviderConfig,
     serviceProviders: migratedServiceProviders,
+    flows: [],
+    flowSteps: [],
     sessions: []
   };
 }
@@ -308,22 +355,8 @@ async function loadPersistedState() {
     const hydrated = parsed?.version === 2 ? parsed : migrateLegacyState(parsed);
 
     providerConfig = sanitizeProviderConfig(hydrated.providerConfig);
-    serviceProviders = sortServiceProviders(
-      (hydrated.serviceProviders || []).map((entry) => {
-        const normalized = normalizeServiceProvider(entry, entry);
-
-        return {
-          id: normalized.id || createId("sp"),
-          name: normalized.name,
-          clientId: normalized.clientId,
-          clientType: normalized.clientType,
-          scopes: normalized.scopes,
-          secretRecord: entry.secretRecord || null,
-          createdAt: entry.createdAt || new Date().toISOString(),
-          updatedAt: entry.updatedAt || new Date().toISOString()
-        };
-      })
-    );
+    serviceProviderService.hydrateServiceProviders(hydrated.serviceProviders || []);
+    flowService.hydrateFlows(hydrated.flows || [], hydrated.flowSteps || []);
 
     for (const candidate of hydrated.sessions || []) {
       if (!candidate?.id) {
@@ -364,17 +397,18 @@ async function loadPersistedState() {
     appLog("info", "Etat applicatif restaure depuis le disque", {
       stateFile: STATE_FILE,
       sessions: sessions.size,
-      serviceProviders: serviceProviders.length
+      serviceProviders: serviceProviders.length,
+      flows: flows.length
     });
   } catch (error) {
     if (error.code === "ENOENT") {
-      appLog("info", "Aucun etat persiste trouve, demarrage avec etat vide", {
+      appLog("info", "No persisted state found, starting with empty state", {
         stateFile: STATE_FILE
       });
       return;
     }
 
-    appLog("error", "Impossible de charger l'etat persiste", {
+    appLog("error", "Unable to load persisted state", {
       error: error.message,
       stateFile: STATE_FILE
     });
@@ -528,7 +562,7 @@ function consumeFlash(session) {
 }
 
 function getServiceProvider(serviceProviderId) {
-  return serviceProviders.find((entry) => entry.id === serviceProviderId) || null;
+  return serviceProviderService.getServiceProvider(serviceProviderId);
 }
 
 function resolveSelectedServiceProvider(session) {
@@ -541,7 +575,7 @@ function resolveSelectedServiceProvider(session) {
     return null;
   }
 
-  return serviceProviders[0];
+  return serviceProviderService.listServiceProviders()[0];
 }
 
 function resetFlowState(session, reason = "configuration_changed") {
@@ -577,47 +611,11 @@ function applyProviderConfigUpdate(nextConfig) {
 }
 
 function upsertServiceProvider(input, rawSecret) {
-  const existing = input.id ? getServiceProvider(input.id) : null;
-  const normalized = normalizeServiceProvider(input, existing || {});
-  const now = new Date().toISOString();
-  const isNew = !existing;
-  const next = {
-    id: normalized.id || createId("sp"),
-    name: normalized.name,
-    clientId: normalized.clientId,
-    clientType: normalized.clientType,
-    scopes: normalized.scopes,
-    secretRecord:
-      normalized.clientType === "confidential"
-        ? existing?.secretRecord || null
-        : null,
-    createdAt: existing?.createdAt || now,
-    updatedAt: now
-  };
-
-  if (normalized.clientType === "confidential" && rawSecret) {
-    next.secretRecord = encryptSecret(rawSecret);
-  }
-
-  if (existing) {
-    serviceProviders = serviceProviders.map((entry) => (entry.id === existing.id ? next : entry));
-  } else {
-    serviceProviders = [...serviceProviders, next];
-  }
-
-  serviceProviders = sortServiceProviders(serviceProviders);
-  schedulePersistState();
-
-  return {
-    serviceProvider: next,
-    isNew,
-    secretUpdated: Boolean(normalized.clientType === "confidential" && rawSecret)
-  };
+  return serviceProviderService.upsertServiceProvider(input, rawSecret);
 }
 
 function removeServiceProvider(serviceProviderId) {
-  const before = serviceProviders.length;
-  serviceProviders = serviceProviders.filter((entry) => entry.id !== serviceProviderId);
+  const removed = serviceProviderService.deleteServiceProvider(serviceProviderId);
 
   for (const session of sessions.values()) {
     if (session.selectedServiceProviderId === serviceProviderId) {
@@ -627,7 +625,7 @@ function removeServiceProvider(serviceProviderId) {
   }
 
   schedulePersistState();
-  return serviceProviders.length !== before;
+  return removed;
 }
 
 function shouldLog(level) {
@@ -737,6 +735,41 @@ function currentPath(req) {
   return new URL(req.url, resolvePublicBaseUrl(req));
 }
 
+function matchServiceProviderEditPath(pathname) {
+  const match = pathname.match(/^\/service-providers\/([^/]+)\/edit$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function matchServiceProviderUpdatePath(pathname) {
+  const match = pathname.match(/^\/service-providers\/([^/]+)$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function matchServiceProviderDeletePath(pathname) {
+  const match = pathname.match(/^\/service-providers\/([^/]+)\/delete$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function matchFlowStartPath(pathname) {
+  const match = pathname.match(/^\/flows\/start\/([^/]+)$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function matchFlowResultPath(pathname) {
+  const match = pathname.match(/^\/flows\/([^/]+)$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function matchFlowDetailsPath(pathname) {
+  const match = pathname.match(/^\/flows\/([^/]+)\/details$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function matchFlowRerunPath(pathname) {
+  const match = pathname.match(/^\/flows\/([^/]+)\/rerun$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
 async function serveStatic(res, asset) {
   const content = await readFile(asset.filePath, "utf8");
   send(res, 200, content, asset.contentType);
@@ -747,7 +780,7 @@ function sanitizeSession(session, reveal = false) {
   const payload = {
     ...sanitized,
     providerConfig: sanitizeProviderConfig(providerConfig),
-    serviceProviders: serviceProviders.map(sanitizeServiceProviderForUi)
+    serviceProviders: serviceProviderService.listServiceProviders().map(sanitizeServiceProviderForUi)
   };
 
   if (!reveal) {
@@ -785,41 +818,41 @@ function guessNetworkHint(details = {}, requestUrl = "") {
   const lowerHost = String(hostname).toLowerCase();
 
   if (lowerHost === "localhost" || lowerHost === "127.0.0.1" || lowerUrl.includes("://localhost") || lowerUrl.includes("://127.0.0.1")) {
-    return "Le endpoint cible utilise localhost/127.0.0.1. Depuis Docker, cela designe le conteneur lui-meme, pas l'hote ni l'IdP.";
+    return "The target endpoint uses localhost/127.0.0.1. From Docker, that points to the container itself, not the host or the IdP.";
   }
 
   if (code === "ENOTFOUND") {
-    return "Le nom DNS du token endpoint n'est pas resolu depuis le conteneur.";
+    return "The token endpoint DNS name cannot be resolved from the container.";
   }
 
   if (code === "ECONNREFUSED") {
-    return "La connexion TCP est refusee. Le service cible n'ecoute probablement pas sur cet hote/port.";
+    return "The TCP connection was refused. The target service is probably not listening on that host/port.";
   }
 
   if (code === "ECONNRESET") {
-    return "La connexion a ete interrompue par le serveur ou un equipement intermediaire.";
+    return "The connection was interrupted by the server or an intermediate device.";
   }
 
   if (code === "ETIMEDOUT" || causeMessage.toLowerCase().includes("timeout")) {
-    return "Le endpoint ne repond pas dans le delai attendu. Il peut etre injoignable ou filtre.";
+    return "The endpoint did not respond within the expected timeout. It may be unreachable or filtered.";
   }
 
   if (causeMessage.toLowerCase().includes("certificate") || causeMessage.toLowerCase().includes("self-signed")) {
-    return "Le handshake TLS a echoue. Le certificat du serveur n'est probablement pas reconnu par Node dans le conteneur.";
+    return "The TLS handshake failed. The server certificate is probably not recognized by Node in the container.";
   }
 
   if (causeMessage.toLowerCase().includes("ssl") || causeMessage.toLowerCase().includes("tls")) {
-    return "Le handshake TLS a echoue. Verifie le certificat, la chaine de confiance et l'URL https ciblee.";
+    return "The TLS handshake failed. Check the certificate, the trust chain and the target https URL.";
   }
 
-  return "Erreur reseau basse couche avant toute reponse HTTP. Verifie l'URL, la resolution DNS, l'accessibilite reseau et TLS.";
+  return "Low-level network error before any HTTP response. Check the URL, DNS resolution, network accessibility and TLS.";
 }
 
 function formatFetchError(error, request) {
   const cause = error?.cause || null;
   const details = {
     name: error?.name || "Error",
-    message: error?.message || "Erreur fetch inconnue.",
+    message: error?.message || "Unknown fetch error.",
     causeName: cause?.name || "",
     causeMessage: cause?.message || "",
     code: cause?.code || error?.code || "",
@@ -920,8 +953,8 @@ async function resolveProviderConfigForRun() {
   if (!responseSnapshot.ok || Object.keys(responseSnapshot.parsed || {}).length === 0) {
     throw new Error(
       responseSnapshot.error
-        ? `Impossible de charger le well-known: ${responseSnapshot.error}`
-        : `Le well-known a retourne ${responseSnapshot.status || "une erreur inconnue"}.`
+        ? `Unable to load the well-known: ${responseSnapshot.error}`
+        : `The well-known returned ${responseSnapshot.status || "an unknown error"}.`
     );
   }
 
@@ -950,13 +983,13 @@ async function buildRunConfig(session, serviceProviderId, redirectUri = "") {
   const selected = getServiceProvider(serviceProviderId) || resolveSelectedServiceProvider(session);
 
   if (!selected) {
-    throw new Error("Aucune configuration Service Provider disponible.");
+    throw new Error("No Service Provider configuration available.");
   }
 
   const secret = selected.clientType === "confidential" ? decryptSecret(selected.secretRecord) : "";
 
   if (selected.clientType === "confidential" && !secret) {
-    throw new Error("Aucun secret configure pour ce Service Provider confidentiel.");
+    throw new Error("No secret configured for this confidential Service Provider.");
   }
 
   session.selectedServiceProviderId = selected.id;
@@ -991,6 +1024,571 @@ async function buildRunConfig(session, serviceProviderId, redirectUri = "") {
   };
 }
 
+function selectedClaims(claims = {}) {
+  const allowed = ["iss", "sub", "aud", "exp", "iat", "email", "name", "groups", "roles"];
+  return allowed.reduce((acc, key) => {
+    if (claims?.[key] !== undefined) {
+      acc[key] = claims[key];
+    }
+    return acc;
+  }, {});
+}
+
+function tokenReceived(value) {
+  return value ? "received" : "missing";
+}
+
+function flowStatusLabel(status = "running") {
+  if (status === "success") {
+    return { label: "Success", tone: "success" };
+  }
+
+  if (status === "failed") {
+    return { label: "Failed", tone: "error" };
+  }
+
+  if (status === "partial_success") {
+    return { label: "Partial success", tone: "warning" };
+  }
+
+  return { label: "Running", tone: "neutral" };
+}
+
+function environmentLabel(environmentKey = "") {
+  if (environmentKey === "preprod") {
+    return "Preprod";
+  }
+
+  if (environmentKey === "prod") {
+    return "Prod";
+  }
+
+  return "";
+}
+
+function stepStatusLabel(status = "pending") {
+  if (status === "success") {
+    return { label: "Success", tone: "success" };
+  }
+
+  if (status === "error") {
+    return { label: "Error", tone: "error" };
+  }
+
+  if (status === "skipped") {
+    return { label: "Skipped", tone: "warning" };
+  }
+
+  return { label: "Pending", tone: "neutral" };
+}
+
+function recommendedAction(failedStep = "") {
+  if (failedStep === "authorize") {
+    return "Authorization request could not be created.";
+  }
+
+  if (failedStep === "callback") {
+    return "Ez-Access returned an error during callback or the state validation failed.";
+  }
+
+  if (failedStep === "token") {
+    return "Token exchange failed. Verify the Client ID, Client Secret, Redirect URI and client authentication method.";
+  }
+
+  if (failedStep === "userinfo") {
+    return "UserInfo request failed. Verify the access token, scopes and UserInfo endpoint availability.";
+  }
+
+  return "";
+}
+
+function flowSummary(flow) {
+  if (!flow) {
+    return null;
+  }
+
+  return {
+    id: flow.id,
+    serviceProviderId: flow.serviceProviderId,
+    status: flow.status,
+    statusBadge: flowStatusLabel(flow.status),
+    startedAt: flow.startedAt,
+    completedAt: flow.completedAt,
+    failedStep: flow.failedStep,
+    errorCode: flow.errorCode,
+    errorDescription: flow.errorDescription,
+    durationMs: flow.durationMs,
+    serviceProviderName: flow.runtime?.serviceProviderName || "",
+    clientId: flow.runtime?.clientId || "",
+    environment: flow.runtime?.environment || "",
+    environmentLabel: flow.runtime?.environmentLabel || environmentLabel(flow.runtime?.environment)
+  };
+}
+
+function flowStepSummary(stepName, step) {
+  return {
+    stepName,
+    status: step?.status || "pending",
+    badge: stepStatusLabel(step?.status || "pending"),
+    httpMethod: step?.httpMethod || "",
+    endpoint: step?.endpoint || "",
+    httpStatus: step?.httpStatus ?? null,
+    requestData: step?.requestData || null,
+    responseData: step?.responseData || null,
+    errorData: step?.errorData || null,
+    createdAt: step?.createdAt || null,
+    completedAt: step?.completedAt || null
+  };
+}
+
+function buildFlowViewModel(session, flowId, url) {
+  const flow = flowService.getFlow(flowId);
+  if (!flow) {
+    return null;
+  }
+
+  const serviceProvider = getServiceProvider(flow.serviceProviderId);
+  const steps = flowService.getFlowSteps(flow.id);
+  const stepsByName = new Map(steps.map((step) => [step.stepName, step]));
+  const selectedStep = STEP_ORDER.includes(url.searchParams.get("step"))
+    ? url.searchParams.get("step")
+    : steps.find((step) => step.status === "error")?.stepName || "authorize";
+
+  return {
+    flash: consumeFlash(session),
+    flow: flowSummary(flow),
+    flowRaw: flow,
+    serviceProvider: sanitizeServiceProviderForUi(serviceProvider) || {
+      id: flow.serviceProviderId,
+      name: flow.runtime?.serviceProviderName || "Service Provider",
+      environment: flow.runtime?.environment || "",
+      environmentLabel: flow.runtime?.environmentLabel || environmentLabel(flow.runtime?.environment),
+      clientId: flow.runtime?.clientId || "",
+      scopes: flow.runtime?.scopes || ""
+    },
+    steps: STEP_ORDER.map((stepName) => flowStepSummary(stepName, stepsByName.get(stepName))),
+    selectedStep,
+    recommendedAction: recommendedAction(flow.failedStep)
+  };
+}
+
+function attachFlowsToServiceProviders(entries) {
+  return entries.map((serviceProvider) => ({
+    ...serviceProvider,
+    lastFlow: flowSummary(flowService.getLastFlowForServiceProvider(serviceProvider.id))
+  }));
+}
+
+function buildAuthorizeStep({ flow, runConfig, prepared }) {
+  return {
+    stepName: "authorize",
+    status: "success",
+    httpMethod: "GET",
+    endpoint: runConfig.config.authorizationEndpoint,
+    httpStatus: 302,
+    requestData: {
+      method: "GET",
+      endpoint: runConfig.config.authorizationEndpoint,
+      environment: flow.runtime?.environmentLabel || "",
+      client_id: runConfig.config.clientId,
+      redirect_uri: runConfig.config.redirectUri,
+      scopes: runConfig.config.scopes,
+      response_type: runConfig.config.responseType,
+      state: "present",
+      nonce: prepared.runtime.nonce ? "present" : "missing",
+      pkce: prepared.runtime.codeChallenge ? prepared.config.codeChallengeMethod || "S256" : "disabled"
+    },
+    responseData: {
+      redirect_to: "Ez-Access",
+      authorization_url: "present",
+      authorization_url_full: prepared.request.url,
+      flow_id: flow.id
+    },
+    completedAt: new Date().toISOString()
+  };
+}
+
+async function resolveEzAccessProviderConfig(environmentKey) {
+  const environment = getEzAccessEnvironment(environmentKey);
+
+  if (!environment) {
+    throw new Error("Ez-Access environment is invalid.");
+  }
+
+  if (!environment.discoveryUrl) {
+    throw new Error(`Ez-Access ${environmentLabel(environment.key) || environment.key} Discovery URL is not configured.`);
+  }
+
+  const requestSnapshot = buildDiscoveryRequest(environment.discoveryUrl);
+  const responseSnapshot = await executeHttp(requestSnapshot);
+
+  if (!responseSnapshot.ok || Object.keys(responseSnapshot.parsed || {}).length === 0) {
+    throw new Error(
+      responseSnapshot.error
+        ? `Ez-Access ${environmentLabel(environment.key)} discovery failed: ${responseSnapshot.error}`
+        : `Ez-Access ${environmentLabel(environment.key)} discovery returned ${responseSnapshot.status || "an unknown error"}.`
+    );
+  }
+
+  return {
+    environment,
+    provider: mergeDiscoveryIntoProviderConfig(
+      {
+        ...createProviderConfig(),
+        providerName: environment.label,
+        discoveryUrl: ""
+      },
+      responseSnapshot.parsed
+    )
+  };
+}
+
+function buildCallbackStep({ flow, req, params, stateCheck }) {
+  const hasError = Boolean(params.error);
+  const success = !hasError && stateCheck === "match" && Boolean(params.code);
+
+  return {
+    stepName: "callback",
+    status: success ? "success" : "error",
+    httpMethod: req.method,
+    endpoint: "/oidc/callback",
+    httpStatus: 200,
+    requestData: {
+      redirect_uri: flow.runtime?.redirectUri || "",
+      expected_parameters: "code, state",
+      expected_state: "present"
+    },
+    responseData: {
+      code: params.code ? "present" : "missing",
+      state: stateCheck === "match" ? "valid" : stateCheck,
+      error: params.error || "",
+      error_description: params.error_description || ""
+    },
+    errorData: success
+      ? null
+      : {
+          errorCode: params.error || (stateCheck === "match" ? "missing_code" : "state_validation_failed"),
+          errorDescription:
+            params.error_description ||
+            (stateCheck === "match" ? "Callback did not contain an authorization code." : "Callback state did not match the expected flow state.")
+        },
+    completedAt: new Date().toISOString()
+  };
+}
+
+function buildTokenStep({ requestSnapshot, responseSnapshot }) {
+  const parsed = responseSnapshot.parsed || {};
+  const idTokenClaims = decodeJwt(parsed.id_token || "");
+  const accessTokenClaims = decodeJwt(parsed.access_token || "");
+  const ok = Boolean(responseSnapshot.ok && (parsed.access_token || parsed.id_token));
+
+  return {
+    stepName: "token",
+    status: ok ? "success" : "error",
+    httpMethod: "POST",
+    endpoint: requestSnapshot.url,
+    httpStatus: responseSnapshot.status || 0,
+    requestData: {
+      method: "POST",
+      endpoint: requestSnapshot.url,
+      grant_type: "authorization_code",
+      client_id: requestSnapshot.params?.client_id || "sent via Authorization header",
+      client_secret: "********",
+      redirect_uri: requestSnapshot.params?.redirect_uri || "",
+      code: requestSnapshot.params?.code ? "present" : "missing",
+      code_verifier: requestSnapshot.params?.code_verifier ? "present" : "missing"
+    },
+    responseData: {
+      http_status: responseSnapshot.status || 0,
+      id_token: tokenReceived(parsed.id_token),
+      access_token: tokenReceived(parsed.access_token),
+      refresh_token: tokenReceived(parsed.refresh_token),
+      expires_in: parsed.expires_in || "",
+      token_type: parsed.token_type || "",
+      error: parsed.error || responseSnapshot.error || "",
+      error_description: parsed.error_description || "",
+      id_token_claims: idTokenClaims.isJwt ? selectedClaims(idTokenClaims.payload) : {},
+      access_token_claims: accessTokenClaims.isJwt ? selectedClaims(accessTokenClaims.payload) : {}
+    },
+    errorData: ok
+      ? null
+      : {
+          errorCode: parsed.error || responseSnapshot.error || "token_exchange_failed",
+          errorDescription: parsed.error_description || responseSnapshot.error || "Token endpoint did not return usable tokens.",
+          diagnostics: responseSnapshot.diagnostics || null
+        },
+    completedAt: new Date().toISOString()
+  };
+}
+
+function buildUserInfoStep({ requestSnapshot = null, responseSnapshot = null, skippedReason = "" }) {
+  if (skippedReason) {
+    return {
+      stepName: "userinfo",
+      status: "skipped",
+      httpMethod: "GET",
+      endpoint: requestSnapshot?.url || "",
+      httpStatus: null,
+      requestData: {
+        method: "GET",
+        endpoint: requestSnapshot?.url || "",
+        Authorization: "Bearer ********"
+      },
+      responseData: {
+        skipped_reason: skippedReason
+      },
+      errorData: null,
+      completedAt: new Date().toISOString()
+    };
+  }
+
+  const parsed = responseSnapshot.parsed || {};
+
+  return {
+    stepName: "userinfo",
+    status: responseSnapshot.ok ? "success" : "error",
+    httpMethod: "GET",
+    endpoint: requestSnapshot.url,
+    httpStatus: responseSnapshot.status || 0,
+    requestData: {
+      method: "GET",
+      endpoint: requestSnapshot.url,
+      Authorization: "Bearer ********"
+    },
+    responseData: {
+      http_status: responseSnapshot.status || 0,
+      ...selectedClaims(parsed),
+      error: parsed.error || responseSnapshot.error || "",
+      error_description: parsed.error_description || ""
+    },
+    errorData: responseSnapshot.ok
+      ? null
+      : {
+          errorCode: parsed.error || responseSnapshot.error || "userinfo_failed",
+          errorDescription: parsed.error_description || responseSnapshot.error || "UserInfo endpoint did not return a successful response.",
+          diagnostics: responseSnapshot.diagnostics || null
+        },
+    completedAt: new Date().toISOString()
+  };
+}
+
+function failFlow(flowId, failedStep, errorCode, errorDescription) {
+  return flowService.completeFlow(flowId, {
+    status: "failed",
+    failedStep,
+    errorCode: errorCode || `${failedStep}_failed`,
+    errorDescription: errorDescription || recommendedAction(failedStep)
+  });
+}
+
+function completePartialFlow(flowId, failedStep, errorCode, errorDescription) {
+  return flowService.completeFlow(flowId, {
+    status: "partial_success",
+    failedStep,
+    errorCode: errorCode || "",
+    errorDescription: errorDescription || ""
+  });
+}
+
+async function startNewUiFlow(session, serviceProviderId) {
+  const selected = getServiceProvider(serviceProviderId);
+  if (!selected) {
+    return { ok: false, notFound: true };
+  }
+
+  const flow = flowService.createFlow(selected.id, {
+    serviceProviderName: selected.name,
+    environment: selected.environment || "",
+    environmentLabel: environmentLabel(selected.environment),
+    clientId: selected.clientId,
+    scopes: selected.scopes
+  });
+
+  if (!isServiceProviderReady(selected)) {
+    failFlow(flow.id, "authorize", "service_provider_incomplete", "Service Provider is incomplete. Verify name, Client ID, Client Secret and scopes.");
+    flowService.addFlowStep(flow.id, {
+      stepName: "authorize",
+      status: "error",
+      httpMethod: "GET",
+      endpoint: "",
+      requestData: {
+        service_provider: selected.name || selected.clientId || selected.id
+      },
+      responseData: null,
+      errorData: {
+        errorCode: "service_provider_incomplete",
+        errorDescription: "Service Provider is incomplete. Verify name, Client ID, Client Secret and scopes."
+      },
+      completedAt: new Date().toISOString()
+    });
+    return { ok: false, flow };
+  }
+
+  try {
+    session.selectedServiceProviderId = selected.id;
+    const clientSecret = selected.clientType === "confidential" ? decryptSecret(selected.secretRecord) : "";
+    const { environment, provider } = await resolveEzAccessProviderConfig(selected.environment);
+    const effectiveRedirectUri = provider.redirectUri || FIXED_REDIRECT_URI;
+    const runConfig = {
+      selected,
+      provider,
+      config: buildEffectiveConfig({
+        providerConfig: provider,
+        serviceProvider: selected,
+        clientSecret,
+        redirectUri: effectiveRedirectUri
+      })
+    };
+    const prepared = prepareAuthorizationRequest(runConfig.config);
+    const runtime = {
+      serviceProviderName: runConfig.selected.name,
+      environment: environment.key,
+      environmentLabel: environmentLabel(environment.key),
+      clientId: runConfig.selected.clientId,
+      scopes: runConfig.selected.scopes,
+      provider: {
+        providerName: runConfig.provider.providerName,
+        issuer: runConfig.provider.issuer,
+        authorizationEndpoint: runConfig.provider.authorizationEndpoint,
+        tokenEndpoint: runConfig.provider.tokenEndpoint,
+        userInfoEndpoint: runConfig.provider.userInfoEndpoint,
+        jwksUri: runConfig.provider.jwksUri,
+        redirectUri: runConfig.provider.redirectUri
+      },
+      authorizationEndpoint: runConfig.config.authorizationEndpoint,
+      tokenEndpoint: runConfig.config.tokenEndpoint,
+      userInfoEndpoint: runConfig.config.userInfoEndpoint,
+      redirectUri: runConfig.config.redirectUri,
+      tokenEndpointAuthMethod: prepared.config.tokenEndpointAuthMethod,
+      expectedState: prepared.runtime.state,
+      expectedNonce: prepared.runtime.nonce,
+      codeVerifier: prepared.runtime.codeVerifier,
+      codeChallenge: prepared.runtime.codeChallenge
+    };
+
+    const updatedFlow = flowService.updateFlow(flow.id, { runtime });
+    flowService.addFlowStep(flow.id, buildAuthorizeStep({ flow: updatedFlow, runConfig, prepared }));
+    return {
+      ok: true,
+      flow: flowService.getFlow(flow.id),
+      authorizationUrl: prepared.request.url
+    };
+  } catch (error) {
+    failFlow(flow.id, "authorize", "authorize_request_failed", error.message);
+    flowService.addFlowStep(flow.id, {
+      stepName: "authorize",
+      status: "error",
+      httpMethod: "GET",
+      endpoint: providerConfig.authorizationEndpoint || "",
+      requestData: {
+        service_provider: selected.name || selected.clientId || selected.id
+      },
+      responseData: null,
+      errorData: {
+        errorCode: "authorize_request_failed",
+        errorDescription: error.message
+      },
+      completedAt: new Date().toISOString()
+    });
+    return { ok: false, flow: flowService.getFlow(flow.id) };
+  }
+}
+
+async function processNewUiCallback({ req, flow, params }) {
+  const stateCheck = evaluateState(flow.runtime?.expectedState || "", params.state);
+  const callbackStep = buildCallbackStep({ flow, req, params, stateCheck });
+  flowService.addFlowStep(flow.id, callbackStep);
+
+  if (callbackStep.status === "error") {
+    const errorData = callbackStep.errorData || {};
+    failFlow(flow.id, "callback", errorData.errorCode, errorData.errorDescription);
+    return flowService.getFlow(flow.id);
+  }
+
+  const selected = getServiceProvider(flow.serviceProviderId);
+  if (!selected) {
+    failFlow(flow.id, "token", "service_provider_missing", "Service Provider no longer exists.");
+    return flowService.getFlow(flow.id);
+  }
+
+  try {
+    const clientSecret = selected.clientType === "confidential" ? decryptSecret(selected.secretRecord) : "";
+    const effectiveConfig = buildEffectiveConfig({
+      providerConfig: flow.runtime?.provider || providerConfig,
+      serviceProvider: selected,
+      clientSecret,
+      redirectUri: flow.runtime?.redirectUri || FIXED_REDIRECT_URI
+    });
+    const requestSnapshot = buildTokenExchangeRequest({
+      config: effectiveConfig,
+      code: params.code,
+      codeVerifier: flow.runtime?.codeVerifier || ""
+    });
+    const responseSnapshot = await executeHttp(requestSnapshot);
+    const tokenStep = buildTokenStep({ requestSnapshot, responseSnapshot });
+    flowService.addFlowStep(flow.id, tokenStep);
+
+    if (tokenStep.status === "error") {
+      const errorData = tokenStep.errorData || {};
+      failFlow(flow.id, "token", errorData.errorCode, errorData.errorDescription);
+      return flowService.getFlow(flow.id);
+    }
+
+    const accessToken = responseSnapshot.parsed?.access_token || "";
+    const userInfoEndpoint = effectiveConfig.userInfoEndpoint || "";
+
+    if (!accessToken || !userInfoEndpoint) {
+      const skippedReason = !accessToken ? "access_token missing" : "UserInfo endpoint missing";
+      flowService.addFlowStep(flow.id, buildUserInfoStep({ skippedReason }));
+      completePartialFlow(flow.id, "userinfo", "userinfo_skipped", skippedReason);
+      return flowService.getFlow(flow.id);
+    }
+
+    const userInfoRequest = buildUserInfoRequest({
+      endpoint: userInfoEndpoint,
+      accessToken
+    });
+    const userInfoResponse = await executeHttp(userInfoRequest);
+    const userInfoStep = buildUserInfoStep({
+      requestSnapshot: userInfoRequest,
+      responseSnapshot: userInfoResponse
+    });
+    flowService.addFlowStep(flow.id, userInfoStep);
+
+    if (userInfoStep.status === "error") {
+      const errorData = userInfoStep.errorData || {};
+      completePartialFlow(flow.id, "userinfo", errorData.errorCode, errorData.errorDescription);
+      return flowService.getFlow(flow.id);
+    }
+
+    flowService.completeFlow(flow.id, { status: "success" });
+    return flowService.getFlow(flow.id);
+  } catch (error) {
+    flowService.addFlowStep(flow.id, {
+      stepName: "token",
+      status: "error",
+      httpMethod: "POST",
+      endpoint: flow.runtime?.tokenEndpoint || "",
+      requestData: {
+        method: "POST",
+        endpoint: flow.runtime?.tokenEndpoint || "",
+        client_id: selected.clientId,
+        client_secret: "********",
+        code: params.code ? "present" : "missing",
+        code_verifier: flow.runtime?.codeVerifier ? "present" : "missing"
+      },
+      responseData: null,
+      errorData: {
+        errorCode: "token_exchange_failed",
+        errorDescription: error.message
+      },
+      completedAt: new Date().toISOString()
+    });
+    failFlow(flow.id, "token", "token_exchange_failed", error.message);
+    return flowService.getFlow(flow.id);
+  }
+}
+
 function buildPageModel(session, activeTab, url) {
   const editServiceProviderId = url.searchParams.get("edit") || "";
   const editingServiceProvider = sanitizeServiceProviderForUi(getServiceProvider(editServiceProviderId));
@@ -1002,7 +1600,9 @@ function buildPageModel(session, activeTab, url) {
     activeTab,
     flash: consumeFlash(session),
     providerConfig: sanitizedProviderConfig,
-    serviceProviders: serviceProviders.map(sanitizeServiceProviderForUi),
+    serviceProviders: attachFlowsToServiceProviders(serviceProviderService.listServiceProviders().map(sanitizeServiceProviderForUi)),
+    recentFlows: flowService.listRecentFlows(5).map(flowSummary),
+    ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi),
     editingServiceProvider,
     selectedServiceProvider,
     fixedRedirectUri: sanitizedProviderConfig.redirectUri
@@ -1018,7 +1618,221 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/config" || url.pathname === "/logs")) {
+    if (req.method === "GET" && url.pathname === "/") {
+      const session = getOrCreateSession(req, res);
+      const model = buildPageModel(session, routeTab(url) || "dashboard", url);
+      sendHtml(res, renderDashboard(model));
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/service-providers") {
+      const session = getOrCreateSession(req, res);
+      const model = buildPageModel(session, "service-providers", url);
+      sendHtml(res, renderServiceProvidersPage(model));
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/service-providers/new") {
+      const session = getOrCreateSession(req, res);
+      const model = buildPageModel(session, "service-providers", url);
+      sendHtml(res, renderServiceProviderNewPage(model));
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/service-providers") {
+      const session = getOrCreateSession(req, res);
+      const rawBody = await readBody(req);
+      const body = parseBody(req, rawBody);
+      const result = serviceProviderService.createServiceProvider(body);
+
+      if (!result.ok) {
+        const model = {
+          ...buildPageModel(session, "service-providers", url),
+          form: result.validation
+        };
+        sendHtml(res, renderServiceProviderNewPage(model));
+        return;
+      }
+
+      session.selectedServiceProviderId = result.serviceProvider.id;
+      touchSession(session);
+      addSessionLog(session, "info", "service_provider_created", "Service Provider created.", {
+        serviceProvider: sanitizeServiceProviderForUi(result.serviceProvider)
+      });
+      setFlash(
+        session,
+        result.validation.warnings.length ? "warn" : "info",
+        result.validation.warnings.length
+          ? `Service Provider created. ${result.validation.warnings.join(" ")}`
+          : "Service Provider created."
+      );
+      redirect(res, "/service-providers");
+      return;
+    }
+
+    const editServiceProviderId = req.method === "GET" ? matchServiceProviderEditPath(url.pathname) : null;
+    if (editServiceProviderId) {
+      const session = getOrCreateSession(req, res);
+      const serviceProvider = getServiceProvider(editServiceProviderId);
+
+      if (!serviceProvider) {
+        setFlash(session, "warn", "Service Provider not found.");
+        redirect(res, "/service-providers");
+        return;
+      }
+
+      const model = {
+        ...buildPageModel(session, "service-providers", url),
+        serviceProvider: sanitizeServiceProviderForUi(serviceProvider)
+      };
+      sendHtml(res, renderServiceProviderEditPage(model));
+      return;
+    }
+
+    const deleteServiceProviderId = req.method === "POST" ? matchServiceProviderDeletePath(url.pathname) : null;
+    if (deleteServiceProviderId) {
+      const session = getOrCreateSession(req, res);
+
+      if (!removeServiceProvider(deleteServiceProviderId)) {
+        setFlash(session, "warn", "Service Provider not found.");
+        redirect(res, "/service-providers");
+        return;
+      }
+
+      addSessionLog(session, "info", "service_provider_deleted", "Service Provider deleted.", {
+        serviceProviderId: deleteServiceProviderId
+      });
+      setFlash(session, "info", "Service Provider deleted.");
+      redirect(res, "/service-providers");
+      return;
+    }
+
+    const updateServiceProviderId = req.method === "POST" ? matchServiceProviderUpdatePath(url.pathname) : null;
+    if (updateServiceProviderId && !["save", "delete", "select", "test"].includes(updateServiceProviderId)) {
+      const session = getOrCreateSession(req, res);
+      const rawBody = await readBody(req);
+      const body = parseBody(req, rawBody);
+      const result = serviceProviderService.updateServiceProvider(updateServiceProviderId, body);
+
+      if (result.notFound) {
+        setFlash(session, "warn", "Service Provider not found.");
+        redirect(res, "/service-providers");
+        return;
+      }
+
+      if (!result.ok) {
+        const model = {
+          ...buildPageModel(session, "service-providers", url),
+          serviceProvider: sanitizeServiceProviderForUi(result.serviceProvider),
+          form: result.validation
+        };
+        sendHtml(res, renderServiceProviderEditPage(model));
+        return;
+      }
+
+      if (session.selectedServiceProviderId === result.serviceProvider.id) {
+        resetFlowState(session, "service_provider_update");
+      } else {
+        touchSession(session);
+      }
+
+      addSessionLog(session, "info", "service_provider_updated", "Service Provider updated.", {
+        serviceProvider: sanitizeServiceProviderForUi(result.serviceProvider),
+        secretUpdated: result.secretUpdated
+      });
+      setFlash(
+        session,
+        result.validation.warnings.length ? "warn" : "info",
+        result.validation.warnings.length
+          ? `Service Provider updated. ${result.validation.warnings.join(" ")}`
+          : result.secretUpdated
+            ? "Service Provider updated. The secret was replaced."
+            : "Service Provider updated."
+      );
+      redirect(res, "/service-providers");
+      return;
+    }
+
+    const startFlowServiceProviderId = req.method === "POST" ? matchFlowStartPath(url.pathname) : null;
+    if (startFlowServiceProviderId) {
+      const session = getOrCreateSession(req, res);
+      const result = await startNewUiFlow(session, startFlowServiceProviderId);
+
+      if (result.notFound) {
+        setFlash(session, "warn", "Service Provider not found.");
+        redirect(res, "/service-providers");
+        return;
+      }
+
+      if (!result.ok) {
+        redirect(res, `/flows/${encodeURIComponent(result.flow.id)}`);
+        return;
+      }
+
+      redirect(res, result.authorizationUrl);
+      return;
+    }
+
+    const rerunFlowId = req.method === "POST" ? matchFlowRerunPath(url.pathname) : null;
+    if (rerunFlowId) {
+      const session = getOrCreateSession(req, res);
+      const flow = flowService.getFlow(rerunFlowId);
+
+      if (!flow) {
+        setFlash(session, "warn", "Flow not found.");
+        redirect(res, "/service-providers");
+        return;
+      }
+
+      const result = await startNewUiFlow(session, flow.serviceProviderId);
+      if (!result.ok) {
+        redirect(res, result.flow ? `/flows/${encodeURIComponent(result.flow.id)}` : "/service-providers");
+        return;
+      }
+
+      redirect(res, result.authorizationUrl);
+      return;
+    }
+
+    const flowDetailsId = req.method === "GET" ? matchFlowDetailsPath(url.pathname) : null;
+    if (flowDetailsId) {
+      const session = getOrCreateSession(req, res);
+      const model = buildFlowViewModel(session, flowDetailsId, url);
+
+      if (!model) {
+        setFlash(session, "warn", "Flow not found.");
+        redirect(res, "/service-providers");
+        return;
+      }
+
+      sendHtml(res, renderFlowDetailsPage(model));
+      return;
+    }
+
+    const flowResultId = req.method === "GET" ? matchFlowResultPath(url.pathname) : null;
+    if (flowResultId) {
+      const session = getOrCreateSession(req, res);
+      const model = buildFlowViewModel(session, flowResultId, url);
+
+      if (!model) {
+        setFlash(session, "warn", "Flow not found.");
+        redirect(res, "/service-providers");
+        return;
+      }
+
+      sendHtml(res, renderFlowResultPage(model));
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/logs") {
+      const session = getOrCreateSession(req, res);
+      const model = buildPageModel(session, "logs", url);
+      sendHtml(res, renderLogsPage(model));
+      return;
+    }
+
+    // Legacy debug view kept temporarily for backend compatibility. Not used by the new UI.
+    if (req.method === "GET" && url.pathname === "/config") {
       const session = getOrCreateSession(req, res);
       const activeTab = routeTab(url) || inferActiveTab(url.pathname);
       sendHtml(res, renderPage(buildPageModel(session, activeTab, url)));
@@ -1031,7 +1845,7 @@ const server = http.createServer(async (req, res) => {
 
       if (!session) {
         sendJson(res, 404, {
-          error: "Session introuvable."
+          error: "Session not found."
         });
         return;
       }
@@ -1050,17 +1864,17 @@ const server = http.createServer(async (req, res) => {
         resetFlowState(session, "provider_config_update");
       }
 
-      addSessionLog(session, "info", "provider_saved", "Configuration provider enregistree.", {
+        addSessionLog(session, "info", "provider_saved", "Provider configuration saved.", {
         providerConfig
       });
       setFlash(
         session,
         "info",
         changed
-          ? "Configuration provider mise a jour. Le test courant a ete reinitialise."
-          : "Configuration provider mise a jour."
+            ? "Provider configuration updated. The current test has been reset."
+            : "Provider configuration updated."
       );
-      redirect(res, "/?tab=configuration");
+      redirect(res, "/config?tab=configuration");
       return;
     }
 
@@ -1071,8 +1885,8 @@ const server = http.createServer(async (req, res) => {
       const discoveryUrl = body.discoveryUrl || providerConfig.discoveryUrl;
 
       if (!discoveryUrl) {
-        setFlash(session, "warn", "Discovery URL manquante.");
-        redirect(res, "/?tab=configuration");
+        setFlash(session, "warn", "Discovery URL missing.");
+        redirect(res, "/config?tab=configuration");
         return;
       }
 
@@ -1093,14 +1907,14 @@ const server = http.createServer(async (req, res) => {
         } else {
           touchSession(session);
         }
-        addSessionLog(session, "info", "discovery_loaded", "Well-known verifie avec succes.", {
+        addSessionLog(session, "info", "discovery_loaded", "Well-known verified successfully.", {
           discoveryUrl,
           response: responseSnapshot
         });
-        setFlash(session, "info", "Well-known verifie avec succes.");
+        setFlash(session, "info", "Well-known verified successfully.");
       } else {
         touchSession(session);
-        addSessionLog(session, "warn", "discovery_failed", "Echec du chargement du discovery endpoint.", {
+        addSessionLog(session, "warn", "discovery_failed", "Discovery endpoint load failed.", {
           discoveryUrl,
           response: responseSnapshot
         });
@@ -1108,12 +1922,12 @@ const server = http.createServer(async (req, res) => {
           session,
           "warn",
           responseSnapshot.error
-            ? `Erreur reseau sur le discovery endpoint: ${responseSnapshot.error}`
-            : `Discovery endpoint en echec (${responseSnapshot.status || "inconnu"}).`
+            ? `Network error on the discovery endpoint: ${responseSnapshot.error}`
+            : `Discovery endpoint failed (${responseSnapshot.status || "unknown"}).`
         );
       }
 
-      redirect(res, "/?tab=configuration");
+      redirect(res, "/config?tab=configuration");
       return;
     }
 
@@ -1131,7 +1945,7 @@ const server = http.createServer(async (req, res) => {
         touchSession(session);
       }
 
-      addSessionLog(session, "info", "service_provider_saved", "Configuration Service Provider enregistree.", {
+        addSessionLog(session, "info", "service_provider_saved", "Service Provider configuration saved.", {
         serviceProvider: sanitizeServiceProviderForUi(serviceProvider),
         secretUpdated
       });
@@ -1145,10 +1959,10 @@ const server = http.createServer(async (req, res) => {
         session,
         "info",
         isNew
-          ? "Service Provider cree."
+          ? "Service Provider created."
           : secretUpdated
-            ? "Service Provider mis a jour. Le secret a ete remplace."
-            : "Service Provider mis a jour."
+            ? "Service Provider updated. The secret has been replaced."
+            : "Service Provider updated."
       );
       redirect(res, `/?tab=configuration&edit=${encodeURIComponent(serviceProvider.id)}`);
       return;
@@ -1161,16 +1975,16 @@ const server = http.createServer(async (req, res) => {
       const serviceProviderId = body.id || "";
 
       if (!serviceProviderId || !removeServiceProvider(serviceProviderId)) {
-        setFlash(session, "warn", "Service Provider introuvable.");
-        redirect(res, "/?tab=configuration");
+        setFlash(session, "warn", "Service Provider not found.");
+        redirect(res, "/config?tab=configuration");
         return;
       }
 
-      addSessionLog(session, "info", "service_provider_deleted", "Configuration Service Provider supprimee.", {
+      addSessionLog(session, "info", "service_provider_deleted", "Service Provider configuration deleted.", {
         serviceProviderId
       });
-      setFlash(session, "info", "Service Provider supprime.");
-      redirect(res, "/?tab=configuration");
+      setFlash(session, "info", "Service Provider deleted.");
+      redirect(res, "/config?tab=configuration");
       return;
     }
 
@@ -1181,8 +1995,8 @@ const server = http.createServer(async (req, res) => {
       const selected = getServiceProvider(body.id || "");
 
       if (!selected) {
-        setFlash(session, "warn", "Service Provider introuvable.");
-        redirect(res, "/?tab=configuration");
+        setFlash(session, "warn", "Service Provider not found.");
+        redirect(res, "/config?tab=configuration");
         return;
       }
 
@@ -1195,8 +2009,8 @@ const server = http.createServer(async (req, res) => {
         touchSession(session);
       }
 
-      setFlash(session, "info", `Service Provider selectionne: ${selected.name || selected.clientId}.`);
-      redirect(res, "/?tab=configuration");
+      setFlash(session, "info", `Service Provider selected: ${selected.name || selected.clientId}.`);
+      redirect(res, "/config?tab=configuration");
       return;
     }
 
@@ -1207,8 +2021,8 @@ const server = http.createServer(async (req, res) => {
       const selected = getServiceProvider(body.id || "");
 
       if (!selected) {
-        setFlash(session, "warn", "Service Provider introuvable.");
-        redirect(res, "/?tab=configuration");
+        setFlash(session, "warn", "Service Provider not found.");
+        redirect(res, "/config?tab=configuration");
         return;
       }
 
@@ -1277,7 +2091,7 @@ const server = http.createServer(async (req, res) => {
           serviceProvider: sanitizeServiceProviderForUi(getServiceProvider(requestedServiceProviderId))
         });
         setFlash(session, "error", error.message);
-        redirect(res, "/?tab=configuration");
+        redirect(res, "/config?tab=configuration");
         return;
       }
     }
@@ -1287,6 +2101,14 @@ const server = http.createServer(async (req, res) => {
       const rawBody = req.method === "POST" ? await readBody(req) : "";
       const body = req.method === "POST" ? parseBody(req, rawBody) : {};
       const params = req.method === "POST" ? body : Object.fromEntries(url.searchParams.entries());
+
+      const newUiFlow = flowService.findRunningFlowByState(params.state || "");
+      if (newUiFlow) {
+        const completedFlow = await processNewUiCallback({ req, flow: newUiFlow, params });
+        redirect(res, `/flows/${encodeURIComponent(completedFlow.id)}`);
+        return;
+      }
+
       const stateCheck = evaluateState(session.flow.expectedState, params.state);
 
       session.steps.callback = {
@@ -1319,7 +2141,7 @@ const server = http.createServer(async (req, res) => {
         setFlash(session, "info", "Callback OIDC recu.");
       }
 
-      redirect(res, "/?tab=callback");
+      redirect(res, "/config?tab=callback");
       return;
     }
 
@@ -1354,7 +2176,7 @@ const server = http.createServer(async (req, res) => {
           addSessionLog(session, "info", "token_exchanged", "Authorization code echange contre des tokens.", {
             response: responseSnapshot
           });
-          setFlash(session, "info", "Echange /token termine.");
+          setFlash(session, "info", "/token exchange completed.");
         } else {
           addSessionLog(session, "warn", "token_exchange_failed", "Le token endpoint a repondu en erreur.", {
             response: responseSnapshot
@@ -1380,13 +2202,13 @@ const server = http.createServer(async (req, res) => {
           }
         };
         touchSession(session);
-        addSessionLog(session, "error", "token_exchange_failed", "Echec de la preparation de la requete /token.", {
+        addSessionLog(session, "error", "token_exchange_failed", "Failed to prepare the /token request.", {
           error: error.message
         });
         setFlash(session, "error", error.message);
       }
 
-      redirect(res, "/?tab=token");
+      redirect(res, "/config?tab=token");
       return;
     }
 
@@ -1410,20 +2232,20 @@ const server = http.createServer(async (req, res) => {
           const idTokenClaims = session.tokens?.idToken?.decoded?.payload || {};
           session.comparison = compareClaims(idTokenClaims, responseSnapshot.parsed || {});
           touchSession(session);
-          addSessionLog(session, "info", "userinfo_loaded", "Endpoint /userinfo appele avec succes.", {
+          addSessionLog(session, "info", "userinfo_loaded", "The /userinfo endpoint was called successfully.", {
             response: responseSnapshot
           });
-          setFlash(session, "info", "Appel /userinfo termine.");
+          setFlash(session, "info", "The /userinfo call completed.");
         } else {
-          addSessionLog(session, "warn", "userinfo_failed", "Le endpoint /userinfo a repondu en erreur.", {
+          addSessionLog(session, "warn", "userinfo_failed", "The /userinfo endpoint returned an error.", {
             response: responseSnapshot
           });
           setFlash(
             session,
             "warn",
             responseSnapshot.error
-              ? `Erreur reseau sur /userinfo: ${responseSnapshot.error}`
-              : `Le endpoint /userinfo a retourne ${responseSnapshot.status}.`
+                ? `Network error on /userinfo: ${responseSnapshot.error}`
+                : `/userinfo returned ${responseSnapshot.status}.`
           );
         }
       } catch (error) {
@@ -1439,13 +2261,13 @@ const server = http.createServer(async (req, res) => {
           }
         };
         touchSession(session);
-        addSessionLog(session, "error", "userinfo_failed", "Impossible de preparer /userinfo.", {
+        addSessionLog(session, "error", "userinfo_failed", "Unable to prepare /userinfo.", {
           error: error.message
         });
         setFlash(session, "error", error.message);
       }
 
-      redirect(res, "/?tab=userinfo");
+      redirect(res, "/config?tab=userinfo");
       return;
     }
 
@@ -1455,35 +2277,36 @@ const server = http.createServer(async (req, res) => {
         status: "ok",
         nodeEnv: NODE_ENV,
         redirectUri: currentProviderConfig.redirectUri,
-        serviceProviders: serviceProviders.length
+        serviceProviders: serviceProviders.length,
+        flows: flows.length
       });
       return;
     }
 
     if (ensureHtmlSessionRoute(req)) {
       const session = getOrCreateSession(req, res);
-      setFlash(session, "warn", `Route inconnue: ${url.pathname}`);
+      setFlash(session, "warn", `Unknown route: ${url.pathname}`);
       redirect(res, "/");
       return;
     }
 
     sendJson(res, 404, {
-      error: "Route introuvable."
+      error: "Route not found."
     });
   } catch (error) {
-    appLog("error", "Erreur non geree", {
+    appLog("error", "Unhandled error", {
       error: error.message,
       path: url.pathname
     });
     sendJson(res, 500, {
-      error: "Erreur interne.",
+      error: "Internal error.",
       detail: error.message
     });
   }
 });
 
 async function shutdown(signal) {
-  appLog("info", "Arret du serveur, persistance de l'etat", { signal });
+  appLog("info", "Server stopping, persisting state", { signal });
   try {
     await flushPersistState();
   } finally {
@@ -1504,14 +2327,14 @@ async function start() {
   await loadPersistedState();
 
   if (IS_RENDER && !process.env.BASE_URL && RENDER_EXTERNAL_URL) {
-    appLog("warn", "BASE_URL absent: utilisation de RENDER_EXTERNAL_URL comme URL publique.", {
+    appLog("warn", "BASE_URL missing: using RENDER_EXTERNAL_URL as the public URL.", {
       renderExternalUrl: RENDER_EXTERNAL_URL,
       redirectUri: createProviderConfig().redirectUri
     });
   }
 
   if (IS_RENDER && !process.env.STORAGE_DIR) {
-    appLog("warn", "STORAGE_DIR absent sur Render: utilisation de /app/storage. Verifier qu'un persistent disk est bien monte sur ce chemin.", {
+    appLog("warn", "STORAGE_DIR missing on Render: using /app/storage. Make sure a persistent disk is mounted at this path.", {
       storageDir: STORAGE_DIR,
       stateFile: STATE_FILE
     });
@@ -1528,7 +2351,8 @@ async function start() {
       sessionSecretSource: runtimeSecretSource,
       sessionSecretFile: process.env.SESSION_SECRET ? null : SESSION_SECRET_FILE,
       redirectUri: sanitizeProviderConfig(providerConfig).redirectUri,
-      serviceProviders: serviceProviders.length
+      serviceProviders: serviceProviders.length,
+      flows: flows.length
     });
   });
 }

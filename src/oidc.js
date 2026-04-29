@@ -136,15 +136,15 @@ export function generatePkcePair(method = "S256") {
 
 export function prepareAuthorizationRequest(config) {
   if (!config.authorizationEndpoint) {
-    throw new Error("Authorization endpoint manquant.");
+    throw new Error("Authorization endpoint missing.");
   }
 
   if (!config.clientId) {
-    throw new Error("client_id manquant.");
+    throw new Error("Missing client_id.");
   }
 
   if (!config.redirectUri) {
-    throw new Error("redirect_uri manquant.");
+    throw new Error("Missing redirect_uri.");
   }
 
   const state = randomOpaque(12);
@@ -198,15 +198,15 @@ export function prepareAuthorizationRequest(config) {
 
 export function buildTokenExchangeRequest({ config, code, codeVerifier }) {
   if (!config.tokenEndpoint) {
-    throw new Error("Token endpoint manquant.");
+    throw new Error("Token endpoint missing.");
   }
 
   if (!config.clientId) {
-    throw new Error("client_id manquant.");
+    throw new Error("Missing client_id.");
   }
 
   if (!code) {
-    throw new Error("Authorization code manquant.");
+    throw new Error("Missing authorization code.");
   }
 
   const headers = {
@@ -226,7 +226,7 @@ export function buildTokenExchangeRequest({ config, code, codeVerifier }) {
 
   if (config.tokenEndpointAuthMethod === "client_secret_basic") {
     if (!config.clientSecret) {
-      throw new Error("client_secret requis pour `client_secret_basic`.");
+      throw new Error("client_secret required for `client_secret_basic`.");
     }
 
     const basic = Buffer.from(`${config.clientId}:${config.clientSecret}`, "utf8").toString("base64");
@@ -255,11 +255,11 @@ export function buildTokenExchangeRequest({ config, code, codeVerifier }) {
 
 export function buildUserInfoRequest({ endpoint, accessToken }) {
   if (!endpoint) {
-    throw new Error("UserInfo endpoint manquant.");
+    throw new Error("UserInfo endpoint missing.");
   }
 
   if (!accessToken) {
-    throw new Error("Access token manquant.");
+    throw new Error("Missing access token.");
   }
 
   const headers = {

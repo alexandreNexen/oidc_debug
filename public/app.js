@@ -8,22 +8,44 @@ function decodeBase64(value) {
   }
 }
 
-async function copyText(base64Value, label, button) {
-  const text = decodeBase64(base64Value);
+async function copyToClipboard(text, button) {
   if (!text) {
     return;
   }
 
   try {
     await navigator.clipboard.writeText(text);
+    if (!button) {
+      return;
+    }
+
     const previous = button.textContent;
-    button.textContent = `${label} copie`;
+    button.textContent = "Copied";
+    button.classList.add("is-copied");
     setTimeout(() => {
       button.textContent = previous;
+      button.classList.remove("is-copied");
     }, 1200);
   } catch {
-    button.textContent = "Copie impossible";
+    if (button) {
+      button.textContent = "Copy failed";
+    }
   }
+}
+
+function setupCopyButtons() {
+  document.querySelectorAll("[data-copy]").forEach((button) => {
+    button.addEventListener("click", () => {
+      copyToClipboard(button.dataset.copy || "", button);
+    });
+  });
+
+  document.querySelectorAll("[data-copy-value]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const text = decodeBase64(button.dataset.copyValue || "");
+      copyToClipboard(text, button);
+    });
+  });
 }
 
 function activateTab(tabId) {
@@ -37,6 +59,10 @@ function activateTab(tabId) {
 }
 
 function setupTabs() {
+  if (!document.querySelector("[data-tab-link]")) {
+    return;
+  }
+
   const initial = window.location.hash.replace("#", "") || document.body.dataset.activeTab || "configuration";
   activateTab(initial);
 
@@ -54,14 +80,6 @@ function setupTabs() {
   });
 }
 
-function setupCopyButtons() {
-  document.querySelectorAll("[data-copy-value]").forEach((button) => {
-    button.addEventListener("click", () => {
-      copyText(button.dataset.copyValue || "", button.dataset.copyLabel || "Valeur", button);
-    });
-  });
-}
-
 function setupSecretToggles() {
   document.querySelectorAll("[data-toggle-secret]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -74,19 +92,31 @@ function setupSecretToggles() {
       if (showingActual) {
         target.textContent = decodeBase64(target.dataset.masked || "");
         target.dataset.state = "masked";
-        button.textContent = "Afficher";
+        button.textContent = "Show";
         return;
       }
 
       target.textContent = decodeBase64(target.dataset.actual || "");
       target.dataset.state = "actual";
-      button.textContent = "Masquer";
+      button.textContent = "Hide";
+    });
+  });
+}
+
+function setupConfirmForms() {
+  document.querySelectorAll("form[data-confirm]").forEach((form) => {
+    form.addEventListener("submit", (event) => {
+      const message = form.dataset.confirm || "Confirm this action?";
+      if (!window.confirm(message)) {
+        event.preventDefault();
+      }
     });
   });
 }
 
 window.addEventListener("DOMContentLoaded", () => {
-  setupTabs();
   setupCopyButtons();
+  setupTabs();
   setupSecretToggles();
+  setupConfirmForms();
 });
