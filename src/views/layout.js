@@ -31,8 +31,7 @@ export function renderPageHeader({ title, description = "", actions = "" }) {
 function renderTopbar(activeNav) {
   const navItems = [
     { id: "dashboard", label: "Dashboard", href: "/" },
-    { id: "service-providers", label: "Service Providers", href: "/service-providers" },
-    { id: "logs", label: "Logs", href: "/logs" }
+    { id: "service-providers", label: "Service Providers", href: "/service-providers" }
   ];
 
   const navHtml = navItems
@@ -47,7 +46,6 @@ function renderTopbar(activeNav) {
       <div class="topbar__inner">
         <div class="topbar__brand">
           <span class="topbar__title">Ez-Access OIDC Debug Console</span>
-          <span class="topbar__subtitle muted">Console de diagnostic des intégrations OIDC Service Provider</span>
         </div>
         <nav class="topbar__nav" aria-label="Navigation principale">${navHtml}</nav>
       </div>

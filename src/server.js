@@ -5,13 +5,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { getEzAccessEnvironment, listEzAccessEnvironments } from "./config.js";
 import {
-  analyzeTokens,
   decodeJwt,
   buildCurlCommand,
   buildEffectiveConfig,
   buildTokenExchangeRequest,
   buildUserInfoRequest,
-  compareClaims,
   createProviderConfig,
   FIXED_REDIRECT_URI,
   mergeDiscoveryIntoProviderConfig,
@@ -20,9 +18,9 @@ import {
   prepareAuthorizationRequest,
   redactBodyText,
   redactObject,
-  safeJsonParse
+  safeJsonParse,
+  sanitizeDiagnosticData
 } from "./oidc.js";
-import { renderPage } from "./render.js";
 import { createFlowService, STEP_ORDER } from "./services/flows.js";
 import { createServiceProviderService, isServiceProviderReady, serviceProviderStatus } from "./services/serviceProviders.js";
 import { renderDashboard } from "./views/dashboard.js";
@@ -31,7 +29,6 @@ import { renderFlowResultPage } from "./views/flowResult.js";
 import { renderServiceProvidersPage } from "./views/serviceProviders.js";
 import { renderServiceProviderEditPage } from "./views/serviceProviderEdit.js";
 import { renderServiceProviderNewPage } from "./views/serviceProviderNew.js";
-import { renderLogsPage } from "./views/logs.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -172,6 +169,58 @@ function sanitizeTokenRequest(request) {
   };
 }
 
+function parseSnapshotBody(body = "", contentType = "") {
+  if (!body) {
+    return null;
+  }
+
+  if (contentType.includes("application/x-www-form-urlencoded")) {
+    return Object.fromEntries(new URLSearchParams(body).entries());
+  }
+
+  if (contentType.includes("application/json")) {
+    return safeJsonParse(body);
+  }
+
+  return body;
+}
+
+function sanitizeRawRequest(request = null) {
+  if (!request) {
+    return null;
+  }
+
+  const headers = sanitizeDiagnosticData(request.headers || {});
+  const contentType = request.headers?.["content-type"] || request.headers?.["Content-Type"] || "";
+  const parsedBody = parseSnapshotBody(request.body || "", contentType);
+
+  return sanitizeDiagnosticData({
+    method: request.method || "",
+    url: request.url || "",
+    headers,
+    params: request.params || {},
+    body: parsedBody || undefined
+  });
+}
+
+function sanitizeRawResponse(response = null) {
+  if (!response) {
+    return null;
+  }
+
+  const contentType = response.headers?.["content-type"] || response.headers?.["Content-Type"] || "";
+  const parsedBody = response.parsed || parseSnapshotBody(response.body || "", contentType);
+
+  return sanitizeDiagnosticData({
+    status: response.status ?? 0,
+    ok: Boolean(response.ok),
+    headers: response.headers || {},
+    body: parsedBody || response.redactedBody || response.error || "",
+    error: response.error || "",
+    diagnostics: response.diagnostics || null
+  });
+}
+
 function sanitizeProviderConfig(input = providerConfig) {
   return normalizeProviderConfig(input);
 }
@@ -221,7 +270,9 @@ function sanitizeSessionArtifacts(session) {
             request: sanitizeTokenRequest(session.steps.token.request)
           }
         : null
-    }
+    },
+    tokens: session.tokens ? sanitizeDiagnosticData(session.tokens) : null,
+    logs: Array.isArray(session.logs) ? sanitizeDiagnosticData(session.logs) : []
   };
 }
 
@@ -529,10 +580,6 @@ function getOrCreateSession(req, res) {
   return session;
 }
 
-function getSessionById(id) {
-  return sessions.get(id) || null;
-}
-
 function addSessionLog(session, level, event, message, data = null) {
   session.logs.push({
     id: crypto.randomBytes(6).toString("hex"),
@@ -540,10 +587,10 @@ function addSessionLog(session, level, event, message, data = null) {
     level,
     event,
     message,
-    data: data ? redactObject(data) : null
+    data: data ? sanitizeDiagnosticData(redactObject(data)) : null
   });
   touchSession(session);
-  appLog(level, message, { event, ...(data || {}) });
+  appLog(level, message, sanitizeDiagnosticData({ event, ...(data || {}) }));
 }
 
 function setFlash(session, level, message) {
@@ -565,19 +612,6 @@ function getServiceProvider(serviceProviderId) {
   return serviceProviderService.getServiceProvider(serviceProviderId);
 }
 
-function resolveSelectedServiceProvider(session) {
-  const selected = getServiceProvider(session.selectedServiceProviderId);
-  if (selected) {
-    return selected;
-  }
-
-  if (!serviceProviders.length) {
-    return null;
-  }
-
-  return serviceProviderService.listServiceProviders()[0];
-}
-
 function resetFlowState(session, reason = "configuration_changed") {
   session.runtimeContext = null;
   session.flow = {
@@ -597,21 +631,6 @@ function resetFlowState(session, reason = "configuration_changed") {
   addSessionLog(session, "info", "flow_reset", "Les etapes du test ont ete reinitialisees.", {
     reason
   });
-}
-
-function applyProviderConfigUpdate(nextConfig) {
-  const previous = JSON.stringify(providerConfig);
-  const normalized = sanitizeProviderConfig({
-    ...providerConfig,
-    ...nextConfig
-  });
-  providerConfig = normalized;
-  schedulePersistState();
-  return previous !== JSON.stringify(normalized);
-}
-
-function upsertServiceProvider(input, rawSecret) {
-  return serviceProviderService.upsertServiceProvider(input, rawSecret);
 }
 
 function removeServiceProvider(serviceProviderId) {
@@ -686,6 +705,10 @@ function send(res, statusCode, body, contentType) {
 
 function sendHtml(res, html) {
   send(res, 200, html, "text/html; charset=utf-8");
+}
+
+function sendHtmlStatus(res, statusCode, html) {
+  send(res, statusCode, html, "text/html; charset=utf-8");
 }
 
 function sendJson(res, statusCode, payload) {
@@ -773,21 +796,6 @@ function matchFlowRerunPath(pathname) {
 async function serveStatic(res, asset) {
   const content = await readFile(asset.filePath, "utf8");
   send(res, 200, content, asset.contentType);
-}
-
-function sanitizeSession(session, reveal = false) {
-  const sanitized = sanitizeSessionArtifacts(session);
-  const payload = {
-    ...sanitized,
-    providerConfig: sanitizeProviderConfig(providerConfig),
-    serviceProviders: serviceProviderService.listServiceProviders().map(sanitizeServiceProviderForUi)
-  };
-
-  if (!reveal) {
-    return redactObject(payload);
-  }
-
-  return payload;
 }
 
 function evaluateState(expectedState, receivedState) {
@@ -937,91 +945,8 @@ function buildDiscoveryRequest(discoveryUrl) {
   };
 }
 
-async function resolveProviderConfigForRun() {
-  const baseConfig = sanitizeProviderConfig(providerConfig);
-
-  if (!baseConfig.discoveryUrl) {
-    return {
-      config: baseConfig,
-      discovery: null
-    };
-  }
-
-  const requestSnapshot = buildDiscoveryRequest(baseConfig.discoveryUrl);
-  const responseSnapshot = await executeHttp(requestSnapshot);
-
-  if (!responseSnapshot.ok || Object.keys(responseSnapshot.parsed || {}).length === 0) {
-    throw new Error(
-      responseSnapshot.error
-        ? `Unable to load the well-known: ${responseSnapshot.error}`
-        : `The well-known returned ${responseSnapshot.status || "an unknown error"}.`
-    );
-  }
-
-  return {
-    config: mergeDiscoveryIntoProviderConfig(baseConfig, responseSnapshot.parsed),
-    discovery: {
-      request: requestSnapshot,
-      response: responseSnapshot
-    }
-  };
-}
-
-function inferActiveTab(pathname) {
-  if (pathname === "/logs") {
-    return "logs";
-  }
-
-  return "configuration";
-}
-
 function ensureHtmlSessionRoute(req) {
   return req.headers.accept?.includes("text/html") || req.headers.accept === "*/*" || !req.headers.accept;
-}
-
-async function buildRunConfig(session, serviceProviderId, redirectUri = "") {
-  const selected = getServiceProvider(serviceProviderId) || resolveSelectedServiceProvider(session);
-
-  if (!selected) {
-    throw new Error("No Service Provider configuration available.");
-  }
-
-  const secret = selected.clientType === "confidential" ? decryptSecret(selected.secretRecord) : "";
-
-  if (selected.clientType === "confidential" && !secret) {
-    throw new Error("No secret configured for this confidential Service Provider.");
-  }
-
-  session.selectedServiceProviderId = selected.id;
-
-  const resolvedProvider =
-    session.runtimeContext?.serviceProviderId === selected.id &&
-    session.runtimeContext?.authorizationEndpoint &&
-    session.runtimeContext?.tokenEndpoint
-      ? sanitizeProviderConfig({
-          providerName: session.runtimeContext.providerName,
-          discoveryUrl: session.runtimeContext.discoveryUrl,
-          issuer: session.runtimeContext.issuer,
-          authorizationEndpoint: session.runtimeContext.authorizationEndpoint,
-          tokenEndpoint: session.runtimeContext.tokenEndpoint,
-          userInfoEndpoint: session.runtimeContext.userInfoEndpoint,
-          jwksUri: session.runtimeContext.jwksUri,
-          redirectUri: session.runtimeContext.redirectUri
-        })
-      : (await resolveProviderConfigForRun()).config;
-
-  const effectiveRedirectUri = redirectUri || resolvedProvider.redirectUri || FIXED_REDIRECT_URI;
-
-  return {
-    selected,
-    config: buildEffectiveConfig({
-      providerConfig: resolvedProvider,
-      serviceProvider: selected,
-      clientSecret: secret,
-      redirectUri: effectiveRedirectUri
-    }),
-    provider: resolvedProvider
-  };
 }
 
 function selectedClaims(claims = {}) {
@@ -1135,6 +1060,8 @@ function flowStepSummary(stepName, step) {
     httpStatus: step?.httpStatus ?? null,
     requestData: step?.requestData || null,
     responseData: step?.responseData || null,
+    rawRequestData: step?.rawRequestData || null,
+    rawResponseData: step?.rawResponseData || null,
     errorData: step?.errorData || null,
     createdAt: step?.createdAt || null,
     completedAt: step?.completedAt || null
@@ -1204,6 +1131,18 @@ function buildAuthorizeStep({ flow, runConfig, prepared }) {
       authorization_url_full: prepared.request.url,
       flow_id: flow.id
     },
+    rawRequestData: sanitizeRawRequest(prepared.request),
+    rawResponseData: sanitizeRawResponse({
+      status: 302,
+      ok: true,
+      headers: {
+        location: "Ez-Access authorize redirect"
+      },
+      parsed: {
+        redirect_to: "Ez-Access",
+        authorization_url: "present"
+      }
+    }),
     completedAt: new Date().toISOString()
   };
 }
@@ -1264,6 +1203,18 @@ function buildCallbackStep({ flow, req, params, stateCheck }) {
       error: params.error || "",
       error_description: params.error_description || ""
     },
+    rawRequestData: sanitizeDiagnosticData({
+      method: req.method,
+      url: "/oidc/callback",
+      params
+    }),
+    rawResponseData: sanitizeDiagnosticData({
+      status: 200,
+      state: stateCheck === "match" ? "valid" : stateCheck,
+      code: params.code ? "present" : "missing",
+      error: params.error || "",
+      error_description: params.error_description || ""
+    }),
     errorData: success
       ? null
       : {
@@ -1310,6 +1261,8 @@ function buildTokenStep({ requestSnapshot, responseSnapshot }) {
       id_token_claims: idTokenClaims.isJwt ? selectedClaims(idTokenClaims.payload) : {},
       access_token_claims: accessTokenClaims.isJwt ? selectedClaims(accessTokenClaims.payload) : {}
     },
+    rawRequestData: sanitizeRawRequest(requestSnapshot),
+    rawResponseData: sanitizeRawResponse(responseSnapshot),
     errorData: ok
       ? null
       : {
@@ -1337,6 +1290,8 @@ function buildUserInfoStep({ requestSnapshot = null, responseSnapshot = null, sk
       responseData: {
         skipped_reason: skippedReason
       },
+      rawRequestData: sanitizeRawRequest(requestSnapshot),
+      rawResponseData: null,
       errorData: null,
       completedAt: new Date().toISOString()
     };
@@ -1361,6 +1316,8 @@ function buildUserInfoStep({ requestSnapshot = null, responseSnapshot = null, sk
       error: parsed.error || responseSnapshot.error || "",
       error_description: parsed.error_description || ""
     },
+    rawRequestData: sanitizeRawRequest(requestSnapshot),
+    rawResponseData: sanitizeRawResponse(responseSnapshot),
     errorData: responseSnapshot.ok
       ? null
       : {
@@ -1415,6 +1372,8 @@ async function startNewUiFlow(session, serviceProviderId) {
         service_provider: selected.name || selected.clientId || selected.id
       },
       responseData: null,
+      rawRequestData: null,
+      rawResponseData: null,
       errorData: {
         errorCode: "service_provider_incomplete",
         errorDescription: "Service Provider is incomplete. Verify name, Client ID, Client Secret and scopes."
@@ -1484,6 +1443,8 @@ async function startNewUiFlow(session, serviceProviderId) {
         service_provider: selected.name || selected.clientId || selected.id
       },
       responseData: null,
+      rawRequestData: null,
+      rawResponseData: null,
       errorData: {
         errorCode: "authorize_request_failed",
         errorDescription: error.message
@@ -1578,6 +1539,16 @@ async function processNewUiCallback({ req, flow, params }) {
         code_verifier: flow.runtime?.codeVerifier ? "present" : "missing"
       },
       responseData: null,
+      rawRequestData: sanitizeDiagnosticData({
+        method: "POST",
+        endpoint: flow.runtime?.tokenEndpoint || "",
+        client_id: selected.clientId,
+        code: params.code ? "present" : "missing",
+        code_verifier: flow.runtime?.codeVerifier ? "present" : "missing"
+      }),
+      rawResponseData: {
+        error: error.message
+      },
       errorData: {
         errorCode: "token_exchange_failed",
         errorDescription: error.message
@@ -1824,278 +1795,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.method === "GET" && url.pathname === "/logs") {
-      const session = getOrCreateSession(req, res);
-      const model = buildPageModel(session, "logs", url);
-      sendHtml(res, renderLogsPage(model));
-      return;
-    }
-
-    // Legacy debug view kept temporarily for backend compatibility. Not used by the new UI.
-    if (req.method === "GET" && url.pathname === "/config") {
-      const session = getOrCreateSession(req, res);
-      const activeTab = routeTab(url) || inferActiveTab(url.pathname);
-      sendHtml(res, renderPage(buildPageModel(session, activeTab, url)));
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname.startsWith("/oidc/session/")) {
-      const sessionId = decodeURIComponent(url.pathname.replace("/oidc/session/", ""));
-      const session = getSessionById(sessionId);
-
-      if (!session) {
-        sendJson(res, 404, {
-          error: "Session not found."
-        });
-        return;
-      }
-
-      sendJson(res, 200, sanitizeSession(session, url.searchParams.get("reveal") === "1"));
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/provider/save") {
-      const session = getOrCreateSession(req, res);
-      const rawBody = await readBody(req);
-      const body = parseBody(req, rawBody);
-      const changed = applyProviderConfigUpdate(body);
-
-      if (changed) {
-        resetFlowState(session, "provider_config_update");
-      }
-
-        addSessionLog(session, "info", "provider_saved", "Provider configuration saved.", {
-        providerConfig
-      });
-      setFlash(
-        session,
-        "info",
-        changed
-            ? "Provider configuration updated. The current test has been reset."
-            : "Provider configuration updated."
-      );
-      redirect(res, "/config?tab=configuration");
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/provider/load-discovery") {
-      const session = getOrCreateSession(req, res);
-      const rawBody = await readBody(req);
-      const body = parseBody(req, rawBody);
-      const discoveryUrl = body.discoveryUrl || providerConfig.discoveryUrl;
-
-      if (!discoveryUrl) {
-        setFlash(session, "warn", "Discovery URL missing.");
-        redirect(res, "/config?tab=configuration");
-        return;
-      }
-
-      const changed = applyProviderConfigUpdate({
-        discoveryUrl
-      });
-      const requestSnapshot = buildDiscoveryRequest(discoveryUrl);
-      const responseSnapshot = await executeHttp(requestSnapshot);
-
-      session.steps.discovery = {
-        request: requestSnapshot,
-        response: responseSnapshot
-      };
-
-      if (responseSnapshot.ok && Object.keys(responseSnapshot.parsed || {}).length > 0) {
-        if (changed) {
-          resetFlowState(session, "discovery_url_update");
-        } else {
-          touchSession(session);
-        }
-        addSessionLog(session, "info", "discovery_loaded", "Well-known verified successfully.", {
-          discoveryUrl,
-          response: responseSnapshot
-        });
-        setFlash(session, "info", "Well-known verified successfully.");
-      } else {
-        touchSession(session);
-        addSessionLog(session, "warn", "discovery_failed", "Discovery endpoint load failed.", {
-          discoveryUrl,
-          response: responseSnapshot
-        });
-        setFlash(
-          session,
-          "warn",
-          responseSnapshot.error
-            ? `Network error on the discovery endpoint: ${responseSnapshot.error}`
-            : `Discovery endpoint failed (${responseSnapshot.status || "unknown"}).`
-        );
-      }
-
-      redirect(res, "/config?tab=configuration");
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/service-providers/save") {
-      const session = getOrCreateSession(req, res);
-      const rawBody = await readBody(req);
-      const body = parseBody(req, rawBody);
-      const secret = String(body.clientSecret || "").trim();
-      const { serviceProvider, isNew, secretUpdated } = upsertServiceProvider(body, secret);
-
-      if (session.selectedServiceProviderId === serviceProvider.id || !session.selectedServiceProviderId) {
-        session.selectedServiceProviderId = serviceProvider.id;
-        resetFlowState(session, "service_provider_update");
-      } else {
-        touchSession(session);
-      }
-
-        addSessionLog(session, "info", "service_provider_saved", "Service Provider configuration saved.", {
-        serviceProvider: sanitizeServiceProviderForUi(serviceProvider),
-        secretUpdated
-      });
-
-      if (body._action === "saveAndTest") {
-        redirect(res, `/oidc/login?sp=${encodeURIComponent(serviceProvider.id)}`);
-        return;
-      }
-
-      setFlash(
-        session,
-        "info",
-        isNew
-          ? "Service Provider created."
-          : secretUpdated
-            ? "Service Provider updated. The secret has been replaced."
-            : "Service Provider updated."
-      );
-      redirect(res, `/?tab=configuration&edit=${encodeURIComponent(serviceProvider.id)}`);
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/service-providers/delete") {
-      const session = getOrCreateSession(req, res);
-      const rawBody = await readBody(req);
-      const body = parseBody(req, rawBody);
-      const serviceProviderId = body.id || "";
-
-      if (!serviceProviderId || !removeServiceProvider(serviceProviderId)) {
-        setFlash(session, "warn", "Service Provider not found.");
-        redirect(res, "/config?tab=configuration");
-        return;
-      }
-
-      addSessionLog(session, "info", "service_provider_deleted", "Service Provider configuration deleted.", {
-        serviceProviderId
-      });
-      setFlash(session, "info", "Service Provider deleted.");
-      redirect(res, "/config?tab=configuration");
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/service-providers/select") {
-      const session = getOrCreateSession(req, res);
-      const rawBody = await readBody(req);
-      const body = parseBody(req, rawBody);
-      const selected = getServiceProvider(body.id || "");
-
-      if (!selected) {
-        setFlash(session, "warn", "Service Provider not found.");
-        redirect(res, "/config?tab=configuration");
-        return;
-      }
-
-      const changed = session.selectedServiceProviderId !== selected.id;
-      session.selectedServiceProviderId = selected.id;
-
-      if (changed) {
-        resetFlowState(session, "service_provider_selected");
-      } else {
-        touchSession(session);
-      }
-
-      setFlash(session, "info", `Service Provider selected: ${selected.name || selected.clientId}.`);
-      redirect(res, "/config?tab=configuration");
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/service-providers/test") {
-      const session = getOrCreateSession(req, res);
-      const rawBody = await readBody(req);
-      const body = parseBody(req, rawBody);
-      const selected = getServiceProvider(body.id || "");
-
-      if (!selected) {
-        setFlash(session, "warn", "Service Provider not found.");
-        redirect(res, "/config?tab=configuration");
-        return;
-      }
-
-      session.selectedServiceProviderId = selected.id;
-      touchSession(session);
-      redirect(res, `/oidc/login?sp=${encodeURIComponent(selected.id)}`);
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/oidc/login") {
-      const session = getOrCreateSession(req, res);
-      const requestedServiceProviderId = url.searchParams.get("sp") || session.selectedServiceProviderId;
-
-      try {
-        const runConfig = await buildRunConfig(session, requestedServiceProviderId);
-        const prepared = prepareAuthorizationRequest(runConfig.config);
-        session.runtimeContext = {
-          providerName: runConfig.provider.providerName,
-          discoveryUrl: runConfig.provider.discoveryUrl,
-          issuer: runConfig.provider.issuer,
-          authorizationEndpoint: runConfig.provider.authorizationEndpoint,
-          tokenEndpoint: runConfig.provider.tokenEndpoint,
-          userInfoEndpoint: runConfig.provider.userInfoEndpoint,
-          jwksUri: runConfig.provider.jwksUri,
-          redirectUri: runConfig.config.redirectUri,
-          serviceProviderId: runConfig.selected.id,
-          serviceProviderName: runConfig.selected.name,
-          clientId: runConfig.selected.clientId,
-          clientType: runConfig.selected.clientType,
-          scopes: runConfig.selected.scopes,
-          tokenEndpointAuthMethod: prepared.config.tokenEndpointAuthMethod
-        };
-        session.flow.expectedState = prepared.runtime.state;
-        session.flow.expectedNonce = prepared.runtime.nonce;
-        session.flow.codeVerifier = prepared.runtime.codeVerifier;
-        session.flow.codeChallenge = prepared.runtime.codeChallenge;
-        session.steps.authorize = {
-          requestedAt: new Date().toISOString(),
-          request: prepared.request,
-          response: {
-            status: 302,
-            headers: {
-              location: prepared.request.url
-            },
-            body: "",
-            redactedBody: "",
-            parsed: null
-          }
-        };
-        session.steps.callback = null;
-        session.steps.token = null;
-        session.steps.userinfo = null;
-        session.tokens = null;
-        session.comparison = null;
-        touchSession(session);
-        addSessionLog(session, "info", "authorize_request", "URL /authorize construite.", {
-          request: prepared.request,
-          serviceProvider: sanitizeServiceProviderForUi(runConfig.selected)
-        });
-        redirect(res, prepared.request.url);
-        return;
-      } catch (error) {
-        addSessionLog(session, "error", "authorize_request_failed", "Impossible de construire /authorize.", {
-          error: error.message,
-          providerConfig,
-          serviceProvider: sanitizeServiceProviderForUi(getServiceProvider(requestedServiceProviderId))
-        });
-        setFlash(session, "error", error.message);
-        redirect(res, "/config?tab=configuration");
-        return;
-      }
-    }
-
     if ((req.method === "GET" || req.method === "POST") && url.pathname === "/oidc/callback") {
       const session = getOrCreateSession(req, res);
       const rawBody = req.method === "POST" ? await readBody(req) : "";
@@ -2109,165 +1808,9 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const stateCheck = evaluateState(session.flow.expectedState, params.state);
-
-      session.steps.callback = {
-        receivedAt: new Date().toISOString(),
-        method: req.method,
-        params,
-        raw: req.method === "POST" ? rawBody : url.searchParams.toString(),
-        stateCheck
-      };
-      touchSession(session);
-
-      const level = params.error ? "error" : stateCheck === "mismatch" ? "warn" : "info";
-      addSessionLog(
-        session,
-        level,
-        "callback_received",
-        params.error ? "Callback OIDC recu avec erreur." : "Callback OIDC recu.",
-        {
-          callback: session.steps.callback
-        }
-      );
-
-      if (params.error) {
-        setFlash(session, "error", `${params.error}: ${params.error_description || "erreur renvoyee par le provider."}`);
-      } else if (stateCheck === "mismatch") {
-        setFlash(session, "warn", "Le state recu ne correspond pas a la valeur attendue.");
-      } else if (stateCheck === "missing") {
-        setFlash(session, "warn", "Le callback ne contient pas de state.");
-      } else {
-        setFlash(session, "info", "Callback OIDC recu.");
-      }
-
-      redirect(res, "/config?tab=callback");
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/oidc/token/exchange") {
-      const session = getOrCreateSession(req, res);
-      const rawBody = await readBody(req);
-      const body = parseBody(req, rawBody);
-      const code = body.code || session.steps.callback?.params?.code;
-
-      try {
-        const runConfig = await buildRunConfig(
-          session,
-          session.runtimeContext?.serviceProviderId || session.selectedServiceProviderId,
-          session.runtimeContext?.redirectUri || ""
-        );
-        const requestSnapshot = buildTokenExchangeRequest({
-          config: runConfig.config,
-          code,
-          codeVerifier: session.flow.codeVerifier
-        });
-        const responseSnapshot = await executeHttp(requestSnapshot);
-        session.steps.token = {
-          request: sanitizeTokenRequest(requestSnapshot),
-          response: responseSnapshot
-        };
-        touchSession(session);
-
-        if (responseSnapshot.ok) {
-          session.tokens = analyzeTokens(responseSnapshot.parsed || {});
-          session.comparison = null;
-          touchSession(session);
-          addSessionLog(session, "info", "token_exchanged", "Authorization code echange contre des tokens.", {
-            response: responseSnapshot
-          });
-          setFlash(session, "info", "/token exchange completed.");
-        } else {
-          addSessionLog(session, "warn", "token_exchange_failed", "Le token endpoint a repondu en erreur.", {
-            response: responseSnapshot
-          });
-          setFlash(
-            session,
-            "warn",
-            responseSnapshot.error
-              ? `Erreur reseau sur /token: ${responseSnapshot.error}`
-              : `Le token endpoint a retourne ${responseSnapshot.status}.`
-          );
-        }
-      } catch (error) {
-        session.steps.token = {
-          request: null,
-          response: {
-            status: 0,
-            headers: {},
-            body: "",
-            redactedBody: "",
-            parsed: null,
-            error: error.message
-          }
-        };
-        touchSession(session);
-        addSessionLog(session, "error", "token_exchange_failed", "Failed to prepare the /token request.", {
-          error: error.message
-        });
-        setFlash(session, "error", error.message);
-      }
-
-      redirect(res, "/config?tab=token");
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/oidc/userinfo") {
-      const session = getOrCreateSession(req, res);
-      const accessToken = session.tokens?.accessToken?.value || session.steps.token?.response?.parsed?.access_token;
-
-      try {
-        const requestSnapshot = buildUserInfoRequest({
-          endpoint: session.runtimeContext?.userInfoEndpoint || providerConfig.userInfoEndpoint,
-          accessToken
-        });
-        const responseSnapshot = await executeHttp(requestSnapshot);
-        session.steps.userinfo = {
-          request: requestSnapshot,
-          response: responseSnapshot
-        };
-        touchSession(session);
-
-        if (responseSnapshot.ok) {
-          const idTokenClaims = session.tokens?.idToken?.decoded?.payload || {};
-          session.comparison = compareClaims(idTokenClaims, responseSnapshot.parsed || {});
-          touchSession(session);
-          addSessionLog(session, "info", "userinfo_loaded", "The /userinfo endpoint was called successfully.", {
-            response: responseSnapshot
-          });
-          setFlash(session, "info", "The /userinfo call completed.");
-        } else {
-          addSessionLog(session, "warn", "userinfo_failed", "The /userinfo endpoint returned an error.", {
-            response: responseSnapshot
-          });
-          setFlash(
-            session,
-            "warn",
-            responseSnapshot.error
-                ? `Network error on /userinfo: ${responseSnapshot.error}`
-                : `/userinfo returned ${responseSnapshot.status}.`
-          );
-        }
-      } catch (error) {
-        session.steps.userinfo = {
-          request: null,
-          response: {
-            status: 0,
-            headers: {},
-            body: "",
-            redactedBody: "",
-            parsed: null,
-            error: error.message
-          }
-        };
-        touchSession(session);
-        addSessionLog(session, "error", "userinfo_failed", "Unable to prepare /userinfo.", {
-          error: error.message
-        });
-        setFlash(session, "error", error.message);
-      }
-
-      redirect(res, "/config?tab=userinfo");
+      sendJson(res, 404, {
+        error: "No running flow matches this OIDC callback state."
+      });
       return;
     }
 
@@ -2284,9 +1827,11 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (ensureHtmlSessionRoute(req)) {
-      const session = getOrCreateSession(req, res);
-      setFlash(session, "warn", `Unknown route: ${url.pathname}`);
-      redirect(res, "/");
+      sendHtmlStatus(
+        res,
+        404,
+        "<!doctype html><html lang=\"fr\"><head><meta charset=\"utf-8\"><title>Route not found</title></head><body><h1>404</h1><p>Route not found.</p><p><a href=\"/\">Back to dashboard</a></p></body></html>"
+      );
       return;
     }
 

@@ -7,6 +7,13 @@ const EXCHANGE_LABELS = {
   userinfo: "GET /userinfo"
 };
 
+const STEP_LABELS = {
+  authorize: "Authorize",
+  callback: "Callback",
+  token: "Token",
+  userinfo: "UserInfo"
+};
+
 function formatDate(value) {
   return value ? new Date(value).toLocaleString("fr-FR") : "Not available";
 }
@@ -70,6 +77,31 @@ function renderDataList(data = {}) {
   `;
 }
 
+function encodeRawData(value) {
+  if (!value || (typeof value === "object" && Object.keys(value).length === 0)) {
+    return "";
+  }
+
+  return Buffer.from(JSON.stringify(value, null, 2), "utf8").toString("base64");
+}
+
+function renderRawButton(step, type, rawData) {
+  const label = type === "request" ? "Request" : "Response";
+  const title = `Raw ${STEP_LABELS[step.stepName] || step.stepName} ${label}`;
+
+  return `
+    <button
+      class="panel-action-button"
+      type="button"
+      data-raw-open
+      data-raw-title="${escapeHtml(title)}"
+      data-raw-step="${escapeHtml(step.stepName)}"
+      data-raw-type="${escapeHtml(label)}"
+      data-raw-json="${escapeHtml(encodeRawData(rawData))}"
+    >Raw</button>
+  `;
+}
+
 function renderTimeline(flow, steps, selectedStep) {
   return `
     <nav class="flow-detail-timeline" aria-label="Flow steps">
@@ -95,8 +127,11 @@ function renderSelectedStep(step) {
     <section class="flow-detail-grid" aria-label="${escapeHtml(step.stepName)} details">
       <article class="flow-detail-panel">
         <header>
-          <h2>Request</h2>
-          <span class="muted">Ce qu'on envoie</span>
+          <div>
+            <h2>Request</h2>
+            <span class="muted">Ce qu'on envoie</span>
+          </div>
+          ${renderRawButton(step, "request", step.rawRequestData)}
         </header>
         ${renderDataList(step.requestData)}
       </article>
@@ -132,8 +167,11 @@ function renderSelectedStep(step) {
 
       <article class="flow-detail-panel">
         <header>
-          <h2>Response</h2>
-          <span class="muted">Ce qu'on reçoit</span>
+          <div>
+            <h2>Response</h2>
+            <span class="muted">Ce qu'on reçoit</span>
+          </div>
+          ${renderRawButton(step, "response", step.rawResponseData)}
         </header>
         ${renderDataList(step.responseData)}
       </article>
@@ -190,6 +228,24 @@ export function renderFlowDetailsPage({ flow, serviceProvider, steps = [], selec
 
     ${renderTimeline(flow, steps, selectedStep)}
     ${renderSelectedStep(step)}
+    <div class="modal-backdrop" data-raw-modal hidden>
+      <section class="modal" role="dialog" aria-modal="true" aria-labelledby="raw-modal-title">
+        <header class="modal__header">
+          <div>
+            <h2 id="raw-modal-title">Raw data</h2>
+            <p class="modal__subtitle muted" data-raw-modal-subtitle></p>
+          </div>
+          <button class="panel-action-button" type="button" data-raw-close>Close</button>
+        </header>
+        <div class="modal__body">
+          <pre class="raw-json-block" data-raw-modal-body>No raw data recorded for this step.</pre>
+        </div>
+        <footer class="modal__footer">
+          <button class="button-secondary" type="button" data-raw-copy>Copy</button>
+          <button class="button" type="button" data-raw-close>Close</button>
+        </footer>
+      </section>
+    </div>
   `;
 
   return renderLayout({

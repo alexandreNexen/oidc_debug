@@ -1,24 +1,25 @@
 # oidc_debug
 
-`oidc_debug` est maintenant un outil simple de test d'integration OpenID Connect centre sur un usage reel:
+`oidc_debug` est un outil simple de test d'integration OpenID Connect centre sur un usage reel:
 
-- une configuration provider globale partagee par toute l'application
+- un Dashboard
 - plusieurs configurations de Service Provider reutilisables
-- une redirect URI globale configurable dans l'UI pour tous les tests
+- un choix d'environnement Ez-Access preprod/prod
+- un lancement de flow OIDC depuis un Service Provider
+- un resultat synthetique et un detail etape par etape du flow
 
 Cette URI doit aussi etre ajoutee dans la configuration EZ-ACCESS pour que le callback fonctionne.
 
 ## Modele fonctionnel
 
-### Configuration provider globale
+### Environnements Ez-Access
 
-La configuration provider persiste:
+Les endpoints OIDC sont resolus a l'execution depuis les discovery URLs configurees par environnement:
 
-- nom du provider
-- discovery URL well-known comme source de verite pour resoudre les endpoints
-- redirect URI globale configurable et persistante
+- `EZ_ACCESS_PREPROD_DISCOVERY_URL`
+- `EZ_ACCESS_PROD_DISCOVERY_URL`
 
-Les endpoints sont resolves a l'execution depuis le well-known et ne sont plus saisis dans l'interface.
+La page `/config` et les anciennes routes de configuration provider libre ne font plus partie du parcours utilisateur.
 
 ### Service Providers
 
@@ -77,18 +78,19 @@ Sur Render, le chemin par defaut devient `/app/storage`, qui doit correspondre a
 ## Endpoints principaux
 
 - `GET /`
-- `POST /provider/save`
-- `POST /provider/load-discovery`
-- `POST /service-providers/save`
-- `POST /service-providers/delete`
-- `POST /service-providers/select`
-- `POST /service-providers/test`
-- `GET /oidc/login`
+- `GET /service-providers`
+- `GET /service-providers/new`
+- `GET /service-providers/:id/edit`
+- `POST /service-providers`
+- `POST /service-providers/:id`
+- `POST /service-providers/:id/delete`
+- `POST /flows/start/:spId`
+- `POST /flows/:id/rerun`
+- `GET /flows/:id`
+- `GET /flows/:id/details`
 - `GET /oidc/callback`
 - `POST /oidc/callback`
-- `POST /oidc/token/exchange`
-- `POST /oidc/userinfo`
-- `GET /oidc/session/:id`
+- `GET /health`
 
 ## Notes de securite
 

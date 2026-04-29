@@ -43,6 +43,8 @@ function normalizeStep(step = {}, { createId }) {
     status: ["success", "error", "pending", "skipped"].includes(step.status) ? step.status : "pending",
     requestData: step.requestData || null,
     responseData: step.responseData || null,
+    rawRequestData: step.rawRequestData || null,
+    rawResponseData: step.rawResponseData || null,
     errorData: step.errorData || null,
     httpMethod: step.httpMethod || "",
     endpoint: step.endpoint || "",

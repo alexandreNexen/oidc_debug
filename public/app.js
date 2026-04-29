@@ -48,61 +48,6 @@ function setupCopyButtons() {
   });
 }
 
-function activateTab(tabId) {
-  document.querySelectorAll("[data-tab-link]").forEach((link) => {
-    link.classList.toggle("is-active", link.dataset.tabLink === tabId);
-  });
-
-  document.querySelectorAll("[data-tab-panel]").forEach((panel) => {
-    panel.classList.toggle("is-active", panel.dataset.tabPanel === tabId);
-  });
-}
-
-function setupTabs() {
-  if (!document.querySelector("[data-tab-link]")) {
-    return;
-  }
-
-  const initial = window.location.hash.replace("#", "") || document.body.dataset.activeTab || "configuration";
-  activateTab(initial);
-
-  document.querySelectorAll("[data-tab-link]").forEach((link) => {
-    link.addEventListener("click", (event) => {
-      const tabId = link.dataset.tabLink;
-      if (!tabId) {
-        return;
-      }
-
-      event.preventDefault();
-      history.replaceState(null, "", `#${tabId}`);
-      activateTab(tabId);
-    });
-  });
-}
-
-function setupSecretToggles() {
-  document.querySelectorAll("[data-toggle-secret]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const target = document.getElementById(button.dataset.toggleSecret || "");
-      if (!target) {
-        return;
-      }
-
-      const showingActual = target.dataset.state === "actual";
-      if (showingActual) {
-        target.textContent = decodeBase64(target.dataset.masked || "");
-        target.dataset.state = "masked";
-        button.textContent = "Show";
-        return;
-      }
-
-      target.textContent = decodeBase64(target.dataset.actual || "");
-      target.dataset.state = "actual";
-      button.textContent = "Hide";
-    });
-  });
-}
-
 function setupConfirmForms() {
   document.querySelectorAll("form[data-confirm]").forEach((form) => {
     form.addEventListener("submit", (event) => {
@@ -114,9 +59,71 @@ function setupConfirmForms() {
   });
 }
 
+function setupRawModal() {
+  const modal = document.querySelector("[data-raw-modal]");
+  if (!modal) {
+    return;
+  }
+
+  const title = modal.querySelector("#raw-modal-title");
+  const subtitle = modal.querySelector("[data-raw-modal-subtitle]");
+  const body = modal.querySelector("[data-raw-modal-body]");
+  const copyButton = modal.querySelector("[data-raw-copy]");
+  let currentRawText = "";
+
+  const close = () => {
+    modal.hidden = true;
+    currentRawText = "";
+  };
+
+  document.querySelectorAll("[data-raw-close]").forEach((button) => {
+    button.addEventListener("click", close);
+  });
+
+  modal.addEventListener("click", (event) => {
+    if (event.target === modal) {
+      close();
+    }
+  });
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !modal.hidden) {
+      close();
+    }
+  });
+
+  document.querySelectorAll("[data-raw-open]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const rawText = decodeBase64(button.dataset.rawJson || "");
+      currentRawText = rawText || "No raw data recorded for this step.";
+
+      if (title) {
+        title.textContent = button.dataset.rawTitle || "Raw data";
+      }
+
+      if (subtitle) {
+        const step = button.dataset.rawStep || "";
+        const type = button.dataset.rawType || "";
+        subtitle.textContent = [step, type].filter(Boolean).join(" · ");
+      }
+
+      if (body) {
+        body.textContent = currentRawText;
+      }
+
+      modal.hidden = false;
+    });
+  });
+
+  if (copyButton) {
+    copyButton.addEventListener("click", () => {
+      copyToClipboard(currentRawText, copyButton);
+    });
+  }
+}
+
 window.addEventListener("DOMContentLoaded", () => {
   setupCopyButtons();
-  setupTabs();
-  setupSecretToggles();
   setupConfirmForms();
+  setupRawModal();
 });

@@ -508,6 +508,91 @@ export function redactObject(value, parentKey = "") {
   return value;
 }
 
+function tokenPresence(value) {
+  return value === undefined || value === null || value === "" ? "missing" : "received";
+}
+
+function presence(value) {
+  return value === undefined || value === null || value === "" ? "missing" : "present";
+}
+
+function sanitizeDiagnosticValue(key = "", value) {
+  const normalized = key.toLowerCase();
+
+  if (normalized === "client_secret" || normalized === "clientsecret") {
+    return value ? "********" : "";
+  }
+
+  if (["access_token", "accesstoken", "id_token", "idtoken", "refresh_token", "refreshtoken"].includes(normalized)) {
+    return tokenPresence(value);
+  }
+
+  if (normalized === "authorization") {
+    const text = String(value || "");
+    if (/^basic\s+/i.test(text)) {
+      return "Basic ********";
+    }
+    if (/^bearer\s+/i.test(text)) {
+      return "Bearer ********";
+    }
+    return value ? "********" : "";
+  }
+
+  if (normalized === "cookie" || normalized === "set-cookie") {
+    return value ? "********" : "";
+  }
+
+  if (normalized === "secretrecord") {
+    return value ? "configured" : "missing";
+  }
+
+  if (normalized === "session_secret" || normalized === "sessionsecret") {
+    return value ? "********" : "";
+  }
+
+  if (["discovery", "discoveryurl", "discovery_url"].includes(normalized)) {
+    return value ? "configured" : "missing";
+  }
+
+  if (normalized === "code" || normalized === "code_verifier" || normalized === "codeverifier") {
+    return presence(value);
+  }
+
+  if (typeof value === "string" && normalized.includes("authorization")) {
+    if (/^basic\s+/i.test(value)) {
+      return "Basic ********";
+    }
+    if (/^bearer\s+/i.test(value)) {
+      return "Bearer ********";
+    }
+  }
+
+  return value;
+}
+
+export function sanitizeDiagnosticData(value, parentKey = "") {
+  const sanitized = sanitizeDiagnosticValue(parentKey, value);
+  if (sanitized !== value) {
+    return sanitized;
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeDiagnosticData(item, parentKey));
+  }
+
+  if (value && typeof value === "object") {
+    const clone = {};
+
+    for (const [key, nested] of Object.entries(value)) {
+      clone[key] = sanitizeDiagnosticData(nested, key);
+    }
+
+    return clone;
+  }
+
+  return value;
+}
+
 export function maskSensitiveValue(key, value) {
   if (value === undefined || value === null || value === "") {
     return "";

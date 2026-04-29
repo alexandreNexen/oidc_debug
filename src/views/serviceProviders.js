@@ -105,7 +105,6 @@ export function renderServiceProvidersPage({ serviceProviders = [], flash }) {
     ${renderFlash(flash)}
     ${renderPageHeader({
       title: "Service Providers",
-      description: "Configured Service Providers for OIDC tests on Ez-Access.",
       actions: `<a class="button" href="/service-providers/new">Add Service Provider</a>`
     })}
     ${isEmpty ? renderEmptyState() : renderList(serviceProviders)}
