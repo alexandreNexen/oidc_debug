@@ -101,12 +101,12 @@ export function renderFlowResultPage({ flow, serviceProvider, steps = [], flash,
     </section>
 
     <div class="flow-actions">
-      <a class="button" href="${escapeHtml(detailsHref)}">View flow details</a>
+      <a class="button button-compact" href="${escapeHtml(detailsHref)}">View flow details</a>
       <form method="post" action="/flows/${encodeURIComponent(flow.id)}/rerun">
-        <button type="submit" class="button-secondary">Run again</button>
+        <button type="submit" class="button-secondary button-compact">Run again</button>
       </form>
-      ${failed && serviceProvider?.id ? `<a class="button-secondary" href="/service-providers/${encodeURIComponent(serviceProvider.id)}/edit">Edit Service Provider</a>` : ""}
-      <a class="button-secondary" href="/service-providers">Back to Service Providers</a>
+      ${failed && serviceProvider?.id ? `<a class="button-secondary button-compact" href="/service-providers/${encodeURIComponent(serviceProvider.id)}/edit">Edit Service Provider</a>` : ""}
+      <a class="button-secondary button-compact" href="/service-providers">Back to Service Providers</a>
     </div>
   `;
 

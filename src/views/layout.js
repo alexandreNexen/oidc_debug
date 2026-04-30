@@ -37,7 +37,7 @@ function renderTopbar(activeNav) {
   const navHtml = navItems
     .map(
       (item) =>
-        `<a class="topbar__link${item.id === activeNav ? " topbar__link--active" : ""}" href="${escapeHtml(item.href)}">${escapeHtml(item.label)}</a>`
+        `<a class="topbar__link text-action${item.id === activeNav ? " topbar__link--active" : ""}" href="${escapeHtml(item.href)}">${escapeHtml(item.label)}</a>`
     )
     .join("");
 
@@ -45,8 +45,9 @@ function renderTopbar(activeNav) {
     <header class="topbar">
       <div class="topbar__inner">
         <div class="topbar__brand">
-          <span class="topbar__title">Ez-Access OIDC Debug Console</span>
+          <img class="topbar__logo" src="/assets/brand/logo.svg" alt="Logo Eiffage" />
         </div>
+        <span class="topbar__title">Ez-Access OIDC Debug Console</span>
         <nav class="topbar__nav" aria-label="Navigation principale">${navHtml}</nav>
       </div>
     </header>
@@ -60,6 +61,8 @@ export function renderLayout({ title = "Ez-Access OIDC Debug", activeNav = "dash
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>${escapeHtml(title)}</title>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="shortcut icon" href="/favicon.ico" />
     <link rel="stylesheet" href="/assets/app.css" />
   </head>
   <body class="page">

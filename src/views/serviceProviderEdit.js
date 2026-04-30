@@ -80,7 +80,7 @@ export function renderServiceProviderEditPage({ serviceProvider, flash, form = {
     ${renderPageHeader({
       title: "Edit Service Provider",
       description: "Update the OIDC client metadata used by future test flows.",
-      actions: `<a class="button-secondary" href="/service-providers">Back to list</a>`
+      actions: `<a class="button-secondary button-compact" href="/service-providers">Back to list</a>`
     })}
 
     <section class="card">
@@ -133,8 +133,8 @@ export function renderServiceProviderEditPage({ serviceProvider, flash, form = {
           })}
 
           <div class="sp-form__actions">
-            <button type="submit" class="button">Save changes</button>
-            <a class="button-secondary" href="/service-providers">Cancel</a>
+            <button type="submit" class="button button-compact">Save changes</button>
+            <a class="button-secondary button-compact" href="/service-providers">Cancel</a>
           </div>
         </form>
 

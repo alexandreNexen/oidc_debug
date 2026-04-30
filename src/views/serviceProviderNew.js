@@ -74,7 +74,7 @@ export function renderServiceProviderNewPage({ flash, form = {}, ezAccessEnviron
     ${renderPageHeader({
       title: "Add Service Provider",
       description: "Create an OIDC client configuration for a future Ez-Access test flow.",
-      actions: `<a class="button-secondary" href="/service-providers">Back to list</a>`
+      actions: `<a class="button-secondary button-compact" href="/service-providers">Back to list</a>`
     })}
 
     <section class="card">
@@ -124,8 +124,8 @@ export function renderServiceProviderNewPage({ flash, form = {}, ezAccessEnviron
           })}
 
           <div class="sp-form__actions">
-            <button type="submit" class="button">Save Service Provider</button>
-            <a class="button-secondary" href="/service-providers">Cancel</a>
+            <button type="submit" class="button button-compact">Save Service Provider</button>
+            <a class="button-secondary button-compact" href="/service-providers">Cancel</a>
           </div>
         </form>
       </div>

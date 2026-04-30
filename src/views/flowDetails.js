@@ -108,7 +108,7 @@ function renderTimeline(flow, steps, selectedStep) {
       ${steps
         .map(
           (step, index) => `
-            <a class="flow-detail-timeline__item${step.stepName === selectedStep ? " is-active" : ""}" href="/flows/${encodeURIComponent(flow.id)}/details?step=${encodeURIComponent(step.stepName)}">
+            <a class="flow-detail-timeline__item text-action${step.stepName === selectedStep ? " is-active" : ""}" href="/flows/${encodeURIComponent(flow.id)}/details?step=${encodeURIComponent(step.stepName)}">
               <span>${escapeHtml(step.stepName)}</span>
               <span class="badge badge--${escapeHtml(step.badge.tone)}">${escapeHtml(step.badge.label)}</span>
             </a>
@@ -188,7 +188,7 @@ export function renderFlowDetailsPage({ flow, serviceProvider, steps = [], selec
     ${renderPageHeader({
       title: "Flow Details",
       description: `${serviceProvider.name || flow.serviceProviderName || "Service Provider"} · ${status.label} · ${flow.id}`,
-      actions: `<a class="button-secondary" href="/flows/${encodeURIComponent(flow.id)}">Back to result</a>`
+      actions: `<a class="button-secondary button-compact" href="/flows/${encodeURIComponent(flow.id)}">Back to result</a>`
     })}
 
     <section class="card">
@@ -235,14 +235,14 @@ export function renderFlowDetailsPage({ flow, serviceProvider, steps = [], selec
             <h2 id="raw-modal-title">Raw data</h2>
             <p class="modal__subtitle muted" data-raw-modal-subtitle></p>
           </div>
-          <button class="panel-action-button" type="button" data-raw-close>Close</button>
+          <button class="panel-action-button button-compact" type="button" data-raw-close>Close</button>
         </header>
         <div class="modal__body">
           <pre class="raw-json-block" data-raw-modal-body>No raw data recorded for this step.</pre>
         </div>
         <footer class="modal__footer">
-          <button class="button-secondary" type="button" data-raw-copy>Copy</button>
-          <button class="button" type="button" data-raw-close>Close</button>
+          <button class="button-secondary button-compact" type="button" data-raw-copy>Copy</button>
+          <button class="button button-compact" type="button" data-raw-close>Close</button>
         </footer>
       </section>
     </div>

@@ -47,7 +47,10 @@ const SESSION_SECRET_FILE = path.join(STORAGE_DIR, "session-secret");
 
 const staticFiles = new Map([
   ["/assets/app.css", { filePath: path.join(projectRoot, "public", "app.css"), contentType: "text/css; charset=utf-8" }],
-  ["/assets/app.js", { filePath: path.join(projectRoot, "public", "app.js"), contentType: "application/javascript; charset=utf-8" }]
+  ["/assets/app.js", { filePath: path.join(projectRoot, "public", "app.js"), contentType: "application/javascript; charset=utf-8" }],
+  ["/assets/brand/logo.svg", { filePath: path.join(projectRoot, "public", "assets", "brand", "logo.svg"), contentType: "image/svg+xml" }],
+  ["/favicon.svg", { filePath: path.join(projectRoot, "public", "assets", "favicon.svg"), contentType: "image/svg+xml" }],
+  ["/favicon.ico", { filePath: path.join(projectRoot, "public", "assets", "favicon.ico"), contentType: "image/x-icon" }]
 ]);
 
 const sessions = new Map();

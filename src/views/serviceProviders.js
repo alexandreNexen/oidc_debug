@@ -7,7 +7,7 @@ function renderEmptyState() {
         <div class="empty-state">
           <p class="empty-state__title">No Service Provider configured yet.</p>
           <p class="empty-state__hint muted">Add a Service Provider to prepare an OIDC test against Ez-Access.</p>
-          <a class="button button-secondary" href="/service-providers/new">Add Service Provider</a>
+          <a class="button-secondary button-compact" href="/service-providers/new">Add Service Provider</a>
         </div>
       </div>
     </div>
@@ -105,7 +105,7 @@ export function renderServiceProvidersPage({ serviceProviders = [], flash }) {
     ${renderFlash(flash)}
     ${renderPageHeader({
       title: "Service Providers",
-      actions: `<a class="button" href="/service-providers/new">Add Service Provider</a>`
+      actions: `<a class="button button-compact" href="/service-providers/new">Add Service Provider</a>`
     })}
     ${isEmpty ? renderEmptyState() : renderList(serviceProviders)}
   `;

@@ -6,7 +6,7 @@ function renderEnvironmentStatus(environment) {
   return `
     <div class="environment-status">
       <span>${escapeHtml(environment.shortLabel || environment.label)}</span>
-      <span class="badge badge--${configured ? "success" : "warning"}">${configured ? "Configured" : "Missing"}</span>
+      <span class="badge badge--${configured ? "success" : "warning"}">${configured ? "Discovery URL configured" : "Discovery URL missing"}</span>
     </div>
   `;
 }
@@ -26,7 +26,7 @@ function renderEzAccessCard(environments = [], redirectUri) {
             <dt>Redirect URI</dt>
             <dd class="kv-list__redirect">
               <code class="code-inline">${escapeHtml(redirectUri)}</code>
-              <button type="button" class="copy-button" data-copy="${escapeHtml(redirectUri)}" data-copy-label="Redirect URI">Copy Redirect URI</button>
+              <button type="button" class="copy-button button-compact" data-copy="${escapeHtml(redirectUri)}" data-copy-label="Redirect URI">Copy Redirect URI</button>
             </dd>
           </div>
         </dl>
@@ -54,7 +54,7 @@ function renderServiceProvidersCard(serviceProviders) {
   const populatedBody = `
     <div class="dashboard-sp-summary">
       <p class="muted">${escapeHtml(String(serviceProviders.length))} Service Provider(s) registered.</p>
-      <a href="${escapeHtml(manageHref)}">View all Service Providers</a>
+      <a class="text-action" href="${escapeHtml(manageHref)}">View all Service Providers</a>
     </div>
     <ul class="dashboard-sp-list">${preview}</ul>
   `;
@@ -63,7 +63,7 @@ function renderServiceProvidersCard(serviceProviders) {
     <div class="empty-state">
       <p class="empty-state__title">No Service Provider configured yet.</p>
       <p class="empty-state__hint muted">Add a Service Provider to prepare an OIDC test against Ez-Access.</p>
-      <a class="button button-secondary" href="${escapeHtml(addHref)}">Add Service Provider</a>
+      <a class="button-secondary button-compact" href="${escapeHtml(addHref)}">Add Service Provider</a>
     </div>
   `;
 
@@ -71,7 +71,7 @@ function renderServiceProvidersCard(serviceProviders) {
     <section class="card" aria-labelledby="sp-card-title">
       <header class="card-header">
         <h2 id="sp-card-title" class="card-header__title">Service Providers</h2>
-        <a class="button" href="${escapeHtml(addHref)}">Add Service Provider</a>
+        <a class="button button-compact" href="${escapeHtml(addHref)}">Add Service Provider</a>
       </header>
       <div class="card__body${isEmpty ? " card__body--centered" : ""}">
         ${isEmpty ? emptyBody : populatedBody}
@@ -87,7 +87,7 @@ function renderRecentFlowsCard(recentFlows = []) {
         (flow) => `
           <li class="dashboard-flow-list__item">
             <div>
-              <a href="/flows/${encodeURIComponent(flow.id)}">${escapeHtml(flow.serviceProviderName || flow.clientId || flow.id)}</a>
+              <a class="text-action" href="/flows/${encodeURIComponent(flow.id)}">${escapeHtml(flow.serviceProviderName || flow.clientId || flow.id)}</a>
               <span class="muted">${escapeHtml(new Date(flow.startedAt).toLocaleString("en-US"))}</span>
             </div>
             <span class="badge badge--${escapeHtml(flow.statusBadge.tone)}">${escapeHtml(flow.statusBadge.label)}</span>
@@ -100,7 +100,7 @@ function renderRecentFlowsCard(recentFlows = []) {
       <section class="card" aria-labelledby="flows-card-title">
         <header class="card-header">
           <h2 id="flows-card-title" class="card-header__title">Recent flows</h2>
-          <a href="/service-providers">Start a flow</a>
+          <a class="text-action" href="/service-providers">Start a flow</a>
         </header>
         <div class="card__body">
           <ul class="dashboard-flow-list">${rows}</ul>
