@@ -169,12 +169,16 @@ export function createFlowService({ getFlows, setFlows, getSteps, setSteps, crea
     return normalized;
   }
 
-  function findRunningFlowByState(state) {
+  function findRunningFlowByState(state, maxAgeMs = 0) {
     if (!state) {
       return null;
     }
-
-    return getFlows().find((flow) => flow.status === "running" && flow.runtime?.expectedState === state) || null;
+    const cutoff = maxAgeMs > 0 ? Date.now() - maxAgeMs : 0;
+    return getFlows().find((flow) =>
+      flow.status === "running" &&
+      flow.runtime?.expectedState === state &&
+      (cutoff === 0 || new Date(flow.startedAt).getTime() > cutoff)
+    ) || null;
   }
 
   return {

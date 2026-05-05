@@ -38,9 +38,12 @@ const NODE_ENV = process.env.NODE_ENV || "development";
 const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL || "";
 const IS_RENDER = process.env.RENDER === "true" || Boolean(RENDER_EXTERNAL_URL);
 const BASE_URL = process.env.BASE_URL || RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+const IS_HTTPS_MODE = BASE_URL.startsWith("https://");
 const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 const SESSION_COOKIE = "oidc_debug_sid";
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
+const FLOW_STATE_TTL_MS = 30 * 60 * 1000;
+const MAX_BODY_SIZE = 64 * 1024;
 const STORAGE_DIR = process.env.STORAGE_DIR || (IS_RENDER ? "/app/storage" : path.join(projectRoot, "data"));
 const STATE_FILE = path.join(STORAGE_DIR, "state.json");
 const SESSION_SECRET_FILE = path.join(STORAGE_DIR, "session-secret");
@@ -62,7 +65,8 @@ let persistTimer = null;
 let persistInFlight = Promise.resolve();
 let runtimeSessionSecret = process.env.SESSION_SECRET || "";
 let runtimeSecretSource = process.env.SESSION_SECRET ? "env" : "pending";
-let secretKey = null;
+let sessionSigningKey = null;   // HMAC key for session cookies
+let encryptionKey = null;       // AES-256-GCM key for client secrets
 const serviceProviderService = createServiceProviderService({
   getEntries: () => serviceProviders,
   setEntries: (nextEntries) => {
@@ -91,20 +95,9 @@ const logLevels = {
   error: 40
 };
 
-function getSessionSecret() {
-  if (!runtimeSessionSecret) {
-    throw new Error("SESSION_SECRET non initialise.");
-  }
-
-  return runtimeSessionSecret;
-}
-
-function getSecretKey() {
-  if (!secretKey) {
-    throw new Error("Cle de chiffrement non initialisee.");
-  }
-
-  return secretKey;
+function deriveApplicationKeys(masterSecret) {
+  sessionSigningKey = crypto.createHmac("sha256", masterSecret).update("oidc-debug:session:v1").digest();
+  encryptionKey = crypto.createHmac("sha256", masterSecret).update("oidc-debug:encryption:v1").digest();
 }
 
 function createId(prefix) {
@@ -112,8 +105,9 @@ function createId(prefix) {
 }
 
 function encryptSecret(secret) {
+  if (!encryptionKey) throw new Error("Cle de chiffrement non initialisee.");
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv("aes-256-gcm", getSecretKey(), iv);
+  const cipher = crypto.createCipheriv("aes-256-gcm", encryptionKey, iv);
   const ciphertext = Buffer.concat([cipher.update(String(secret), "utf8"), cipher.final()]);
   const tag = cipher.getAuthTag();
 
@@ -131,19 +125,24 @@ function decryptSecret(record) {
     return "";
   }
 
-  const decipher = crypto.createDecipheriv(
-    record.algorithm || "aes-256-gcm",
-    getSecretKey(),
-    Buffer.from(record.iv, "base64")
-  );
-  decipher.setAuthTag(Buffer.from(record.tag, "base64"));
+  try {
+    const decipher = crypto.createDecipheriv(
+      record.algorithm || "aes-256-gcm",
+      encryptionKey,
+      Buffer.from(record.iv, "base64")
+    );
+    decipher.setAuthTag(Buffer.from(record.tag, "base64"));
 
-  const decrypted = Buffer.concat([
-    decipher.update(Buffer.from(record.ciphertext, "base64")),
-    decipher.final()
-  ]);
+    const decrypted = Buffer.concat([
+      decipher.update(Buffer.from(record.ciphertext, "base64")),
+      decipher.final()
+    ]);
 
-  return decrypted.toString("utf8");
+    return decrypted.toString("utf8");
+  } catch (error) {
+    appLog("warn", "decryptSecret failed (wrong key?)", { error: error.message });
+    return "";
+  }
 }
 
 function sanitizeTokenRequest(request) {
@@ -325,7 +324,7 @@ function buildPersistedState() {
 async function persistStateNow() {
   await mkdir(STORAGE_DIR, { recursive: true });
   const tempFile = `${STATE_FILE}.tmp`;
-  await writeFile(tempFile, JSON.stringify(buildPersistedState(), null, 2), "utf8");
+  await writeFile(tempFile, JSON.stringify(buildPersistedState(), null, 2), { encoding: "utf8", mode: 0o600 });
   await rename(tempFile, STATE_FILE);
 }
 
@@ -469,11 +468,16 @@ async function loadPersistedState() {
   }
 }
 
+const SESSION_SECRET_MIN_LENGTH = 32;
+
 async function ensureRuntimeSecrets() {
   if (process.env.SESSION_SECRET) {
     runtimeSessionSecret = process.env.SESSION_SECRET;
     runtimeSecretSource = "env";
-    secretKey = crypto.createHash("sha256").update(runtimeSessionSecret).digest();
+    if (runtimeSessionSecret.length < SESSION_SECRET_MIN_LENGTH) {
+      appLog("warn", `SESSION_SECRET trop court (${runtimeSessionSecret.length} chars, minimum ${SESSION_SECRET_MIN_LENGTH}). Utilisez une valeur aleatoire robuste en production.`);
+    }
+    deriveApplicationKeys(runtimeSessionSecret);
     return;
   }
 
@@ -495,7 +499,7 @@ async function ensureRuntimeSecrets() {
     });
   }
 
-  secretKey = crypto.createHash("sha256").update(runtimeSessionSecret).digest();
+  deriveApplicationKeys(runtimeSessionSecret);
 }
 
 function cleanupSessions() {
@@ -536,9 +540,10 @@ function parseCookies(cookieHeader = "") {
 }
 
 function setSessionCookie(res, sessionId) {
-  const signature = crypto.createHmac("sha256", getSessionSecret()).update(sessionId).digest("hex").slice(0, 16);
+  const signature = crypto.createHmac("sha256", sessionSigningKey).update(sessionId).digest("hex").slice(0, 16);
   const value = `${sessionId}.${signature}`;
-  res.setHeader("Set-Cookie", `${SESSION_COOKIE}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax`);
+  const secureFlag = IS_HTTPS_MODE ? "; Secure" : "";
+  res.setHeader("Set-Cookie", `${SESSION_COOKIE}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax${secureFlag}`);
 }
 
 function decodeSessionCookie(rawValue = "") {
@@ -551,7 +556,7 @@ function decodeSessionCookie(rawValue = "") {
     return null;
   }
 
-  const expected = crypto.createHmac("sha256", getSessionSecret()).update(sessionId).digest("hex").slice(0, 16);
+  const expected = crypto.createHmac("sha256", sessionSigningKey).update(sessionId).digest("hex").slice(0, 16);
   if (signature.length !== expected.length) {
     return null;
   }
@@ -677,11 +682,17 @@ function appLog(level, message, data) {
 
 async function readBody(req) {
   const chunks = [];
-
+  let totalSize = 0;
   for await (const chunk of req) {
+    totalSize += chunk.length;
+    if (totalSize > MAX_BODY_SIZE) {
+      req.resume();
+      const err = new Error("Request body exceeds size limit.");
+      err.code = "BODY_TOO_LARGE";
+      throw err;
+    }
     chunks.push(chunk);
   }
-
   return Buffer.concat(chunks).toString("utf8");
 }
 
@@ -699,9 +710,41 @@ function parseBody(req, rawBody) {
   return {};
 }
 
+const SECURITY_HEADERS = {
+  "x-content-type-options": "nosniff",
+  "x-frame-options": "DENY",
+  "content-security-policy": "default-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'",
+  "referrer-policy": "strict-origin-when-cross-origin",
+  "permissions-policy": "camera=(), microphone=(), geolocation=(), payment=()",
+  ...(IS_HTTPS_MODE ? { "strict-transport-security": "max-age=63072000; includeSubDomains" } : {})
+};
+
+const rateLimitMap = new Map();
+
+function checkRateLimit(sessionId, action, max, windowMs) {
+  const key = `${action}:${sessionId}`;
+  const now = Date.now();
+  const entry = rateLimitMap.get(key);
+  if (!entry || now >= entry.resetAt) {
+    rateLimitMap.set(key, { count: 1, resetAt: now + windowMs });
+    return true;
+  }
+  if (entry.count >= max) return false;
+  entry.count++;
+  return true;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of rateLimitMap.entries()) {
+    if (now >= entry.resetAt) rateLimitMap.delete(key);
+  }
+}, 10 * 60 * 1000).unref();
+
 function send(res, statusCode, body, contentType) {
   res.writeHead(statusCode, {
-    "content-type": contentType
+    "content-type": contentType,
+    ...SECURITY_HEADERS
   });
   res.end(body);
 }
@@ -720,7 +763,8 @@ function sendJson(res, statusCode, payload) {
 
 function redirect(res, location) {
   res.writeHead(302, {
-    location
+    location,
+    ...SECURITY_HEADERS
   });
   res.end();
 }
@@ -1615,6 +1659,10 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "POST" && url.pathname === "/service-providers") {
       const session = getOrCreateSession(req, res);
+      if (!checkRateLimit(session.id, "sp-create", 20, 5 * 60 * 1000)) {
+        sendJson(res, 429, { error: "Too many requests. Please wait before retrying." });
+        return;
+      }
       const rawBody = await readBody(req);
       const body = parseBody(req, rawBody);
       const result = serviceProviderService.createServiceProvider(body);
@@ -1730,6 +1778,10 @@ const server = http.createServer(async (req, res) => {
     const startFlowServiceProviderId = req.method === "POST" ? matchFlowStartPath(url.pathname) : null;
     if (startFlowServiceProviderId) {
       const session = getOrCreateSession(req, res);
+      if (!checkRateLimit(session.id, "flow-start", 10, 5 * 60 * 1000)) {
+        sendJson(res, 429, { error: "Too many requests. Please wait before retrying." });
+        return;
+      }
       const result = await startNewUiFlow(session, startFlowServiceProviderId);
 
       if (result.notFound) {
@@ -1804,7 +1856,7 @@ const server = http.createServer(async (req, res) => {
       const body = req.method === "POST" ? parseBody(req, rawBody) : {};
       const params = req.method === "POST" ? body : Object.fromEntries(url.searchParams.entries());
 
-      const newUiFlow = flowService.findRunningFlowByState(params.state || "");
+      const newUiFlow = flowService.findRunningFlowByState(params.state || "", FLOW_STATE_TTL_MS);
       if (newUiFlow) {
         const completedFlow = await processNewUiCallback({ req, flow: newUiFlow, params });
         redirect(res, `/flows/${encodeURIComponent(completedFlow.id)}`);
@@ -1842,13 +1894,16 @@ const server = http.createServer(async (req, res) => {
       error: "Route not found."
     });
   } catch (error) {
+    if (error.code === "BODY_TOO_LARGE") {
+      sendJson(res, 413, { error: "Request body too large." });
+      return;
+    }
     appLog("error", "Unhandled error", {
       error: error.message,
       path: url.pathname
     });
     sendJson(res, 500, {
-      error: "Internal error.",
-      detail: error.message
+      error: "Internal error."
     });
   }
 });

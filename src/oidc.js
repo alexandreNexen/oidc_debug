@@ -395,14 +395,12 @@ export function analyzeTokens(tokenResponse = {}) {
 
   return {
     accessToken: {
-      value: accessToken,
       maskedValue: maskSensitiveValue("access_token", accessToken),
       format: tokenFormat(accessToken),
       decoded: decodeJwt(accessToken),
       expiration: computeExpiration(accessToken, tokenResponse.expires_in)
     },
     idToken: {
-      value: idToken,
       maskedValue: maskSensitiveValue("id_token", idToken),
       format: tokenFormat(idToken),
       decoded: decodeJwt(idToken),
@@ -410,10 +408,8 @@ export function analyzeTokens(tokenResponse = {}) {
     },
     refreshToken: {
       present: Boolean(refreshToken),
-      value: refreshToken,
       maskedValue: maskSensitiveValue("refresh_token", refreshToken)
-    },
-    raw: tokenResponse
+    }
   };
 }
 

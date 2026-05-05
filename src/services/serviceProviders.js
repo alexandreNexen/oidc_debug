@@ -1,6 +1,11 @@
 import { normalizeServiceProvider } from "../oidc.js";
 import { getEzAccessEnvironment } from "../config.js";
 
+const MAX_NAME_LENGTH = 255;
+const MAX_CLIENT_ID_LENGTH = 256;
+const MAX_CLIENT_SECRET_LENGTH = 512;
+const MAX_SCOPES_LENGTH = 512;
+
 function clean(value = "") {
   return String(value ?? "").trim();
 }
@@ -30,6 +35,8 @@ export function validateServiceProviderInput(input = {}, { mode = "create" } = {
 
   if (!values.name) {
     errors.name = "Name is required.";
+  } else if (values.name.length > MAX_NAME_LENGTH) {
+    errors.name = `Name must be ${MAX_NAME_LENGTH} characters or fewer.`;
   }
 
   if (!values.environment || !getEzAccessEnvironment(values.environment)) {
@@ -38,14 +45,20 @@ export function validateServiceProviderInput(input = {}, { mode = "create" } = {
 
   if (!values.clientId) {
     errors.client_id = "Client ID is required.";
+  } else if (values.clientId.length > MAX_CLIENT_ID_LENGTH) {
+    errors.client_id = `Client ID must be ${MAX_CLIENT_ID_LENGTH} characters or fewer.`;
   }
 
   if (mode === "create" && !values.clientSecret) {
     errors.client_secret = "Client Secret is required.";
+  } else if (values.clientSecret && values.clientSecret.length > MAX_CLIENT_SECRET_LENGTH) {
+    errors.client_secret = `Client Secret must be ${MAX_CLIENT_SECRET_LENGTH} characters or fewer.`;
   }
 
   if (!values.scopes) {
     errors.scopes = "Scopes are required.";
+  } else if (values.scopes.length > MAX_SCOPES_LENGTH) {
+    errors.scopes = `Scopes must be ${MAX_SCOPES_LENGTH} characters or fewer.`;
   }
 
   if (values.scopes && !values.scopes.split(" ").includes("openid")) {
