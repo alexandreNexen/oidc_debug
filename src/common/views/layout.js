@@ -31,7 +31,8 @@ export function renderPageHeader({ title, description = "", actions = "" }) {
 function renderTopbar(activeNav) {
   const navItems = [
     { id: "dashboard", label: "Dashboard", href: "/" },
-    { id: "service-providers", label: "Service Providers", href: "/service-providers" }
+    { id: "service-providers", label: "OIDC SPs", href: "/service-providers" },
+    { id: "saml-service-providers", label: "SAML SPs", href: "/saml/service-providers" }
   ];
 
   const navHtml = navItems

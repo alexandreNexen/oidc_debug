@@ -29,6 +29,10 @@ import { renderFlowResultPage } from "./protocols/oidc/views/flowResult.js";
 import { renderServiceProvidersPage } from "./protocols/oidc/views/serviceProviders.js";
 import { renderServiceProviderEditPage } from "./protocols/oidc/views/serviceProviderEdit.js";
 import { renderServiceProviderNewPage } from "./protocols/oidc/views/serviceProviderNew.js";
+import { createSamlServiceProviderService, samlServiceProviderStatus } from "./protocols/saml/services/serviceProviders.js";
+import { renderSamlServiceProvidersPage } from "./protocols/saml/views/serviceProviders.js";
+import { renderSamlServiceProviderNewPage } from "./protocols/saml/views/serviceProviderNew.js";
+import { renderSamlServiceProviderEditPage } from "./protocols/saml/views/serviceProviderEdit.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -61,6 +65,9 @@ let providerConfig = createProviderConfig();
 let serviceProviders = [];
 let flows = [];
 let flowSteps = [];
+let samlServiceProviders = [];
+let samlFlows = [];
+let samlFlowSteps = [];
 let persistTimer = null;
 let persistInFlight = Promise.resolve();
 let runtimeSessionSecret = process.env.SESSION_SECRET || "";
@@ -86,6 +93,15 @@ const flowService = createFlowService({
     flowSteps = nextSteps;
   },
   createId,
+  onChange: schedulePersistState
+});
+const samlServiceProviderService = createSamlServiceProviderService({
+  getEntries: () => samlServiceProviders,
+  setEntries: (nextEntries) => {
+    samlServiceProviders = nextEntries;
+  },
+  createId,
+  computeAcsUrl: (id) => `${BASE_URL}/saml/acs/${id}`,
   onChange: schedulePersistState
 });
 const logLevels = {
@@ -247,6 +263,17 @@ function sanitizeServiceProviderForUi(serviceProvider) {
   };
 }
 
+function sanitizeSamlServiceProviderForUi(sp) {
+  if (!sp) return null;
+  const environment = getEzAccessEnvironment(sp.environment || "");
+  return {
+    ...sp,
+    environment: environment?.key || "",
+    environmentLabel: environment?.key === "preprod" ? "Preprod" : environment?.key === "prod" ? "Prod" : "",
+    status: samlServiceProviderStatus(sp)
+  };
+}
+
 function sanitizeEzAccessEnvironmentForUi(environment) {
   return {
     key: environment.key,
@@ -308,13 +335,18 @@ function createSession() {
 
 function buildPersistedState() {
   return {
-    version: 3,
+    version: 4,
     updatedAt: new Date().toISOString(),
-    providerConfig: sanitizeProviderConfig(providerConfig),
     oidc: {
+      providerConfig: sanitizeProviderConfig(providerConfig),
       serviceProviders,
       flows,
       flowSteps
+    },
+    saml: {
+      serviceProviders: samlServiceProviders,
+      flows: samlFlows,
+      flowSteps: samlFlowSteps
     },
     sessions: Array.from(sessions.values()).map((session) => ({
       ...sanitizeSessionArtifacts(session),
@@ -405,11 +437,11 @@ function migrateLegacyToV2(parsed = {}) {
 
 function migrateState(parsed = {}) {
   if (!parsed.version || parsed.version < 2) {
-    return migrateLegacyToV2(parsed);
+    return migrateState(migrateLegacyToV2(parsed));
   }
 
   if (parsed.version === 2) {
-    return {
+    return migrateState({
       version: 3,
       updatedAt: parsed.updatedAt || new Date().toISOString(),
       providerConfig: parsed.providerConfig || {},
@@ -417,6 +449,25 @@ function migrateState(parsed = {}) {
         serviceProviders: parsed.serviceProviders || [],
         flows: parsed.flows || [],
         flowSteps: parsed.flowSteps || []
+      },
+      sessions: parsed.sessions || []
+    });
+  }
+
+  if (parsed.version === 3) {
+    return {
+      version: 4,
+      updatedAt: parsed.updatedAt || new Date().toISOString(),
+      oidc: {
+        providerConfig: parsed.providerConfig || parsed.oidc?.providerConfig || {},
+        serviceProviders: parsed.oidc?.serviceProviders || [],
+        flows: parsed.oidc?.flows || [],
+        flowSteps: parsed.oidc?.flowSteps || []
+      },
+      saml: {
+        serviceProviders: parsed.saml?.serviceProviders || [],
+        flows: parsed.saml?.flows || [],
+        flowSteps: parsed.saml?.flowSteps || []
       },
       sessions: parsed.sessions || []
     };
@@ -431,9 +482,10 @@ async function loadPersistedState() {
     const parsed = JSON.parse(raw);
     const hydrated = migrateState(parsed);
 
-    providerConfig = sanitizeProviderConfig(hydrated.providerConfig);
+    providerConfig = sanitizeProviderConfig(hydrated.oidc?.providerConfig);
     serviceProviderService.hydrateServiceProviders(hydrated.oidc?.serviceProviders || []);
     flowService.hydrateFlows(hydrated.oidc?.flows || [], hydrated.oidc?.flowSteps || []);
+    samlServiceProviderService.hydrateSamlServiceProviders(hydrated.saml?.serviceProviders || []);
 
     for (const candidate of hydrated.sessions || []) {
       if (!candidate?.id) {
@@ -474,8 +526,9 @@ async function loadPersistedState() {
     appLog("info", "Etat applicatif restaure depuis le disque", {
       stateFile: STATE_FILE,
       sessions: sessions.size,
-      serviceProviders: serviceProviders.length,
-      flows: flows.length
+      oidcServiceProviders: serviceProviders.length,
+      oidcFlows: flows.length,
+      samlServiceProviders: samlServiceProviders.length
     });
   } catch (error) {
     if (error.code === "ENOENT") {
@@ -861,6 +914,21 @@ function matchFlowDetailsPath(pathname) {
 
 function matchFlowRerunPath(pathname) {
   const match = pathname.match(/^\/flows\/([^/]+)\/rerun$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function matchSamlServiceProviderEditPath(pathname) {
+  const match = pathname.match(/^\/saml\/service-providers\/([^/]+)\/edit$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function matchSamlServiceProviderUpdatePath(pathname) {
+  const match = pathname.match(/^\/saml\/service-providers\/([^/]+)$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function matchSamlServiceProviderDeletePath(pathname) {
+  const match = pathname.match(/^\/saml\/service-providers\/([^/]+)\/delete$/);
   return match ? decodeURIComponent(match[1]) : null;
 }
 
@@ -1874,6 +1942,133 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "GET" && url.pathname === "/saml/service-providers") {
+      const session = getOrCreateSession(req, res);
+      const flash = consumeFlash(session);
+      const model = {
+        serviceProviders: samlServiceProviderService.listSamlServiceProviders().map(sanitizeSamlServiceProviderForUi),
+        flash
+      };
+      sendHtml(res, renderSamlServiceProvidersPage(model));
+      return;
+    }
+
+    if (req.method === "GET" && url.pathname === "/saml/service-providers/new") {
+      const session = getOrCreateSession(req, res);
+      const flash = consumeFlash(session);
+      const suggestedAcsUrl = `${BASE_URL}/saml/acs/new-sp-id`;
+      sendHtml(res, renderSamlServiceProviderNewPage({
+        flash,
+        ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi),
+        suggestedAcsUrl
+      }));
+      return;
+    }
+
+    if (req.method === "POST" && url.pathname === "/saml/service-providers") {
+      const session = getOrCreateSession(req, res);
+      if (!checkRateLimit(session.id, "saml-sp-create", 20, 5 * 60 * 1000)) {
+        sendJson(res, 429, { error: "Too many requests. Please wait before retrying." });
+        return;
+      }
+      const rawBody = await readBody(req);
+      const body = parseBody(req, rawBody);
+      const result = samlServiceProviderService.createSamlServiceProvider(body);
+
+      if (!result.ok) {
+        sendHtml(res, renderSamlServiceProviderNewPage({
+          flash: consumeFlash(session),
+          form: result.validation,
+          ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi),
+          suggestedAcsUrl: `${BASE_URL}/saml/acs/new-sp-id`
+        }));
+        return;
+      }
+
+      addSessionLog(session, "info", "saml_sp_created", "SAML Service Provider created.", {
+        serviceProviderId: result.serviceProvider.id,
+        name: result.serviceProvider.name
+      });
+      setFlash(
+        session,
+        result.validation.warnings.length ? "warn" : "info",
+        result.validation.warnings.length
+          ? `SAML Service Provider created. ${result.validation.warnings.join(" ")}`
+          : "SAML Service Provider created."
+      );
+      redirect(res, "/saml/service-providers");
+      return;
+    }
+
+    const samlEditId = req.method === "GET" ? matchSamlServiceProviderEditPath(url.pathname) : null;
+    if (samlEditId) {
+      const session = getOrCreateSession(req, res);
+      const sp = samlServiceProviderService.getSamlServiceProvider(samlEditId);
+      if (!sp) {
+        setFlash(session, "warn", "SAML Service Provider not found.");
+        redirect(res, "/saml/service-providers");
+        return;
+      }
+      sendHtml(res, renderSamlServiceProviderEditPage({
+        serviceProvider: sanitizeSamlServiceProviderForUi(sp),
+        flash: consumeFlash(session),
+        ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi)
+      }));
+      return;
+    }
+
+    const samlDeleteId = req.method === "POST" ? matchSamlServiceProviderDeletePath(url.pathname) : null;
+    if (samlDeleteId) {
+      const session = getOrCreateSession(req, res);
+      if (!samlServiceProviderService.deleteSamlServiceProvider(samlDeleteId)) {
+        setFlash(session, "warn", "SAML Service Provider not found.");
+        redirect(res, "/saml/service-providers");
+        return;
+      }
+      addSessionLog(session, "info", "saml_sp_deleted", "SAML Service Provider deleted.", { serviceProviderId: samlDeleteId });
+      setFlash(session, "info", "SAML Service Provider deleted.");
+      redirect(res, "/saml/service-providers");
+      return;
+    }
+
+    const samlUpdateId = req.method === "POST" ? matchSamlServiceProviderUpdatePath(url.pathname) : null;
+    if (samlUpdateId && samlUpdateId.startsWith("saml_sp_")) {
+      const session = getOrCreateSession(req, res);
+      const rawBody = await readBody(req);
+      const body = parseBody(req, rawBody);
+      const result = samlServiceProviderService.updateSamlServiceProvider(samlUpdateId, body);
+
+      if (result.notFound) {
+        setFlash(session, "warn", "SAML Service Provider not found.");
+        redirect(res, "/saml/service-providers");
+        return;
+      }
+
+      if (!result.ok) {
+        sendHtml(res, renderSamlServiceProviderEditPage({
+          serviceProvider: sanitizeSamlServiceProviderForUi(result.serviceProvider),
+          flash: consumeFlash(session),
+          form: result.validation,
+          ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi)
+        }));
+        return;
+      }
+
+      addSessionLog(session, "info", "saml_sp_updated", "SAML Service Provider updated.", {
+        serviceProviderId: result.serviceProvider.id,
+        name: result.serviceProvider.name
+      });
+      setFlash(
+        session,
+        result.validation.warnings.length ? "warn" : "info",
+        result.validation.warnings.length
+          ? `SAML Service Provider updated. ${result.validation.warnings.join(" ")}`
+          : "SAML Service Provider updated."
+      );
+      redirect(res, "/saml/service-providers");
+      return;
+    }
+
     if ((req.method === "GET" || req.method === "POST") && url.pathname === "/oidc/callback") {
       const session = getOrCreateSession(req, res);
       const rawBody = req.method === "POST" ? await readBody(req) : "";
@@ -1899,8 +2094,8 @@ const server = http.createServer(async (req, res) => {
         status: "ok",
         nodeEnv: NODE_ENV,
         redirectUri: currentProviderConfig.redirectUri,
-        serviceProviders: serviceProviders.length,
-        flows: flows.length
+        oidc: { serviceProviders: serviceProviders.length, flows: flows.length },
+        saml: { serviceProviders: samlServiceProviders.length }
       });
       return;
     }
@@ -1978,8 +2173,9 @@ async function start() {
       sessionSecretSource: runtimeSecretSource,
       sessionSecretFile: process.env.SESSION_SECRET ? null : SESSION_SECRET_FILE,
       redirectUri: sanitizeProviderConfig(providerConfig).redirectUri,
-      serviceProviders: serviceProviders.length,
-      flows: flows.length
+      oidcServiceProviders: serviceProviders.length,
+      oidcFlows: flows.length,
+      samlServiceProviders: samlServiceProviders.length
     });
   });
 }
