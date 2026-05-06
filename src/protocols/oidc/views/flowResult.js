@@ -1,4 +1,4 @@
-import { escapeHtml, renderFlash, renderLayout, renderPageHeader } from "./layout.js";
+import { escapeHtml, renderFlash, renderLayout, renderPageHeader } from "../../../common/views/layout.js";
 
 function formatDate(value) {
   return value ? new Date(value).toLocaleString("fr-FR") : "Not available";

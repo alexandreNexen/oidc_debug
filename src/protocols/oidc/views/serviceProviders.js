@@ -1,4 +1,4 @@
-import { escapeHtml, renderFlash, renderLayout, renderPageHeader } from "./layout.js";
+import { escapeHtml, renderFlash, renderLayout, renderPageHeader } from "../../../common/views/layout.js";
 
 function renderEmptyState() {
   return `

@@ -3,7 +3,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getEzAccessEnvironment, listEzAccessEnvironments } from "./config.js";
+import { getEzAccessEnvironment, listEzAccessEnvironments } from "./protocols/oidc/config.js";
 import {
   decodeJwt,
   buildCurlCommand,
@@ -20,15 +20,15 @@ import {
   redactObject,
   safeJsonParse,
   sanitizeDiagnosticData
-} from "./oidc.js";
-import { createFlowService, STEP_ORDER } from "./services/flows.js";
-import { createServiceProviderService, isServiceProviderReady, serviceProviderStatus } from "./services/serviceProviders.js";
-import { renderDashboard } from "./views/dashboard.js";
-import { renderFlowDetailsPage } from "./views/flowDetails.js";
-import { renderFlowResultPage } from "./views/flowResult.js";
-import { renderServiceProvidersPage } from "./views/serviceProviders.js";
-import { renderServiceProviderEditPage } from "./views/serviceProviderEdit.js";
-import { renderServiceProviderNewPage } from "./views/serviceProviderNew.js";
+} from "./protocols/oidc/oidc.js";
+import { createFlowService, STEP_ORDER } from "./protocols/oidc/services/flows.js";
+import { createServiceProviderService, isServiceProviderReady, serviceProviderStatus } from "./protocols/oidc/services/serviceProviders.js";
+import { renderDashboard } from "./protocols/oidc/views/dashboard.js";
+import { renderFlowDetailsPage } from "./protocols/oidc/views/flowDetails.js";
+import { renderFlowResultPage } from "./protocols/oidc/views/flowResult.js";
+import { renderServiceProvidersPage } from "./protocols/oidc/views/serviceProviders.js";
+import { renderServiceProviderEditPage } from "./protocols/oidc/views/serviceProviderEdit.js";
+import { renderServiceProviderNewPage } from "./protocols/oidc/views/serviceProviderNew.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -308,12 +308,14 @@ function createSession() {
 
 function buildPersistedState() {
   return {
-    version: 2,
+    version: 3,
     updatedAt: new Date().toISOString(),
     providerConfig: sanitizeProviderConfig(providerConfig),
-    serviceProviders,
-    flows,
-    flowSteps,
+    oidc: {
+      serviceProviders,
+      flows,
+      flowSteps
+    },
     sessions: Array.from(sessions.values()).map((session) => ({
       ...sanitizeSessionArtifacts(session),
       flash: null
@@ -364,7 +366,7 @@ async function flushPersistState() {
   await persistInFlight;
 }
 
-function migrateLegacyState(parsed = {}) {
+function migrateLegacyToV2(parsed = {}) {
   const legacyProvider = parsed?.defaultConfig || {};
   const nextProviderConfig = normalizeProviderConfig({
     providerName: legacyProvider.providerName,
@@ -401,15 +403,37 @@ function migrateLegacyState(parsed = {}) {
   };
 }
 
+function migrateState(parsed = {}) {
+  if (!parsed.version || parsed.version < 2) {
+    return migrateLegacyToV2(parsed);
+  }
+
+  if (parsed.version === 2) {
+    return {
+      version: 3,
+      updatedAt: parsed.updatedAt || new Date().toISOString(),
+      providerConfig: parsed.providerConfig || {},
+      oidc: {
+        serviceProviders: parsed.serviceProviders || [],
+        flows: parsed.flows || [],
+        flowSteps: parsed.flowSteps || []
+      },
+      sessions: parsed.sessions || []
+    };
+  }
+
+  return parsed;
+}
+
 async function loadPersistedState() {
   try {
     const raw = await readFile(STATE_FILE, "utf8");
     const parsed = JSON.parse(raw);
-    const hydrated = parsed?.version === 2 ? parsed : migrateLegacyState(parsed);
+    const hydrated = migrateState(parsed);
 
     providerConfig = sanitizeProviderConfig(hydrated.providerConfig);
-    serviceProviderService.hydrateServiceProviders(hydrated.serviceProviders || []);
-    flowService.hydrateFlows(hydrated.flows || [], hydrated.flowSteps || []);
+    serviceProviderService.hydrateServiceProviders(hydrated.oidc?.serviceProviders || []);
+    flowService.hydrateFlows(hydrated.oidc?.flows || [], hydrated.oidc?.flowSteps || []);
 
     for (const candidate of hydrated.sessions || []) {
       if (!candidate?.id) {

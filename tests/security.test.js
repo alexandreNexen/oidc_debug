@@ -22,9 +22,9 @@ import {
   buildUserInfoRequest,
   buildEffectiveConfig,
   normalizeProviderConfig
-} from "../src/oidc.js";
+} from "../src/protocols/oidc/oidc.js";
 
-import { validateServiceProviderInput } from "../src/services/serviceProviders.js";
+import { validateServiceProviderInput } from "../src/protocols/oidc/services/serviceProviders.js";
 
 // ---------------------------------------------------------------------------
 // Helper
@@ -369,7 +369,7 @@ describe("XSS prevention in output", () => {
   const XSS_PAYLOAD = '<script>alert("xss")</script>';
 
   it("escapeHtml neutralizes script tags", async () => {
-    const { escapeHtml } = await import("../src/views/layout.js");
+    const { escapeHtml } = await import("../src/common/views/layout.js");
     const result = escapeHtml(XSS_PAYLOAD);
     assert.ok(!result.includes("<script>"), "XSS: <script> tag found after escapeHtml");
     assert.ok(result.includes("&lt;script&gt;"), "escapeHtml did not encode <script> to &lt;script&gt;");

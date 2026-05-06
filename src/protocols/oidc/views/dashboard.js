@@ -1,4 +1,4 @@
-import { escapeHtml, renderFlash, renderLayout } from "./layout.js";
+import { escapeHtml, renderFlash, renderLayout } from "../../../common/views/layout.js";
 
 function renderEnvironmentStatus(environment) {
   const configured = Boolean(environment.discoveryConfigured);

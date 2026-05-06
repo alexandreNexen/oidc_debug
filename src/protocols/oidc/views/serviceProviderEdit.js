@@ -1,4 +1,4 @@
-import { escapeHtml, renderFlash, renderLayout, renderPageHeader } from "./layout.js";
+import { escapeHtml, renderFlash, renderLayout, renderPageHeader } from "../../../common/views/layout.js";
 
 function renderField({ label, name, type = "text", value = "", placeholder = "", help = "", error = "", required = false }) {
   const fieldId = `field-${name}`;
