@@ -33,6 +33,20 @@ import { createSamlServiceProviderService, samlServiceProviderStatus } from "./p
 import { renderSamlServiceProvidersPage } from "./protocols/saml/views/serviceProviders.js";
 import { renderSamlServiceProviderNewPage } from "./protocols/saml/views/serviceProviderNew.js";
 import { renderSamlServiceProviderEditPage } from "./protocols/saml/views/serviceProviderEdit.js";
+import {
+  generateAuthnRequestId,
+  generateRelayState,
+  buildAuthnRequestXml,
+  encodeAuthnRequestForRedirect,
+  buildSsoRedirectUrl,
+  parseIdpMetadata,
+  fetchIdpMetadataFromUrl,
+  decodeSamlResponse,
+  parseSamlResponse
+} from "./protocols/saml/saml.js";
+import { createSamlFlowService, SAML_STEP_ORDER } from "./protocols/saml/services/flows.js";
+import { renderSamlFlowResultPage } from "./protocols/saml/views/flowResult.js";
+import { renderSamlFlowDetailsPage } from "./protocols/saml/views/flowDetails.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -47,6 +61,7 @@ const LOG_LEVEL = process.env.LOG_LEVEL || "info";
 const SESSION_COOKIE = "oidc_debug_sid";
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000;
 const FLOW_STATE_TTL_MS = 30 * 60 * 1000;
+const SAML_FLOW_TTL_MS = 30 * 60 * 1000;
 const MAX_BODY_SIZE = 64 * 1024;
 const STORAGE_DIR = process.env.STORAGE_DIR || (IS_RENDER ? "/app/storage" : path.join(projectRoot, "data"));
 const STATE_FILE = path.join(STORAGE_DIR, "state.json");
@@ -101,7 +116,18 @@ const samlServiceProviderService = createSamlServiceProviderService({
     samlServiceProviders = nextEntries;
   },
   createId,
-  computeAcsUrl: (id) => `${BASE_URL}/saml/acs/${id}`,
+  onChange: schedulePersistState
+});
+const samlFlowService = createSamlFlowService({
+  getFlows: () => samlFlows,
+  setFlows: (nextFlows) => {
+    samlFlows = nextFlows;
+  },
+  getSteps: () => samlFlowSteps,
+  setSteps: (nextSteps) => {
+    samlFlowSteps = nextSteps;
+  },
+  createId,
   onChange: schedulePersistState
 });
 const logLevels = {
@@ -270,6 +296,7 @@ function sanitizeSamlServiceProviderForUi(sp) {
     ...sp,
     environment: environment?.key || "",
     environmentLabel: environment?.key === "preprod" ? "Preprod" : environment?.key === "prod" ? "Prod" : "",
+    acsUrl: `${BASE_URL}/saml/acs/${sp.id}`,
     status: samlServiceProviderStatus(sp)
   };
 }
@@ -486,6 +513,7 @@ async function loadPersistedState() {
     serviceProviderService.hydrateServiceProviders(hydrated.oidc?.serviceProviders || []);
     flowService.hydrateFlows(hydrated.oidc?.flows || [], hydrated.oidc?.flowSteps || []);
     samlServiceProviderService.hydrateSamlServiceProviders(hydrated.saml?.serviceProviders || []);
+    samlFlowService.hydrateSamlFlows(hydrated.saml?.flows || [], hydrated.saml?.flowSteps || []);
 
     for (const candidate of hydrated.sessions || []) {
       if (!candidate?.id) {
@@ -932,6 +960,26 @@ function matchSamlServiceProviderDeletePath(pathname) {
   return match ? decodeURIComponent(match[1]) : null;
 }
 
+function matchSamlFlowStartPath(pathname) {
+  const match = pathname.match(/^\/saml\/flows\/start\/([^/]+)$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function matchSamlAcsPath(pathname) {
+  const match = pathname.match(/^\/saml\/acs\/([^/]+)$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function matchSamlFlowResultPath(pathname) {
+  const match = pathname.match(/^\/saml\/flows\/([^/]+)$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function matchSamlFlowDetailsPath(pathname) {
+  const match = pathname.match(/^\/saml\/flows\/([^/]+)\/details$/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
 async function serveStatic(res, asset) {
   const content = await readFile(asset.filePath, "utf8");
   send(res, 200, content, asset.contentType);
@@ -1144,6 +1192,65 @@ function stepStatusLabel(status = "pending") {
   }
 
   return { label: "Pending", tone: "neutral" };
+}
+
+function samlFlowSummary(flow) {
+  if (!flow) return null;
+  return {
+    id: flow.id,
+    serviceProviderId: flow.serviceProviderId,
+    status: flow.status,
+    statusBadge: flowStatusLabel(flow.status),
+    startedAt: flow.startedAt,
+    completedAt: flow.completedAt,
+    failedStep: flow.failedStep,
+    errorCode: flow.errorCode,
+    errorDescription: flow.errorDescription,
+    durationMs: flow.durationMs,
+    runtime: flow.runtime || null,
+    environmentLabel: flow.runtime?.environmentLabel || environmentLabel(flow.runtime?.environment)
+  };
+}
+
+function samlStepSummary(stepName, step) {
+  return {
+    stepName,
+    status: step?.status || "pending",
+    badge: stepStatusLabel(step?.status || "pending"),
+    httpMethod: step?.httpMethod || "",
+    endpoint: step?.endpoint || "",
+    httpStatus: step?.httpStatus ?? null,
+    requestData: step?.requestData || null,
+    responseData: step?.responseData || null,
+    rawRequestData: step?.rawRequestData || null,
+    rawResponseData: step?.rawResponseData || null,
+    errorData: step?.errorData || null,
+    createdAt: step?.createdAt || null,
+    completedAt: step?.completedAt || null
+  };
+}
+
+function buildSamlFlowViewModel(session, flowId, url) {
+  const flow = samlFlowService.getFlow(flowId);
+  if (!flow) return null;
+
+  const sp = samlServiceProviderService.getSamlServiceProvider(flow.serviceProviderId);
+  const steps = samlFlowService.getFlowSteps(flow.id);
+  const stepsByName = new Map(steps.map((step) => [step.stepName, step]));
+  const selectedStep = SAML_STEP_ORDER.includes(url.searchParams.get("step"))
+    ? url.searchParams.get("step")
+    : steps.find((step) => step.status === "error")?.stepName || SAML_STEP_ORDER[0];
+
+  return {
+    flash: consumeFlash(session),
+    flow: samlFlowSummary(flow),
+    serviceProvider: sp ? sanitizeSamlServiceProviderForUi(sp) : {
+      id: flow.serviceProviderId,
+      name: flow.runtime?.serviceProviderName || "Service Provider"
+    },
+    steps: SAML_STEP_ORDER.map((stepName) => samlStepSummary(stepName, stepsByName.get(stepName))),
+    selectedStep
+  };
 }
 
 function recommendedAction(failedStep = "") {
@@ -1728,6 +1835,20 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === "GET" && url.pathname.startsWith("/assets/icons/") && url.pathname.endsWith(".svg")) {
+      const iconName = path.basename(url.pathname);
+      if (/^[a-z-]+\.svg$/.test(iconName)) {
+        try {
+          const iconPath = path.join(projectRoot, "public", "assets", "icons", iconName);
+          const content = await readFile(iconPath, "utf8");
+          send(res, 200, content, "image/svg+xml");
+          return;
+        } catch {
+          // fall through to 404
+        }
+      }
+    }
+
     if (req.method === "GET" && url.pathname === "/") {
       const session = getOrCreateSession(req, res);
       const model = buildPageModel(session, routeTab(url) || "dashboard", url);
@@ -1867,7 +1988,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const startFlowServiceProviderId = req.method === "POST" ? matchFlowStartPath(url.pathname) : null;
+    const startFlowServiceProviderId = (req.method === "POST" || req.method === "GET") ? matchFlowStartPath(url.pathname) : null;
     if (startFlowServiceProviderId) {
       const session = getOrCreateSession(req, res);
       if (!checkRateLimit(session.id, "flow-start", 10, 5 * 60 * 1000)) {
@@ -1955,12 +2076,9 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/saml/service-providers/new") {
       const session = getOrCreateSession(req, res);
-      const flash = consumeFlash(session);
-      const suggestedAcsUrl = `${BASE_URL}/saml/acs/new-sp-id`;
       sendHtml(res, renderSamlServiceProviderNewPage({
-        flash,
-        ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi),
-        suggestedAcsUrl
+        flash: consumeFlash(session),
+        ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi)
       }));
       return;
     }
@@ -1979,8 +2097,7 @@ const server = http.createServer(async (req, res) => {
         sendHtml(res, renderSamlServiceProviderNewPage({
           flash: consumeFlash(session),
           form: result.validation,
-          ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi),
-          suggestedAcsUrl: `${BASE_URL}/saml/acs/new-sp-id`
+          ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi)
         }));
         return;
       }
@@ -2009,10 +2126,12 @@ const server = http.createServer(async (req, res) => {
         redirect(res, "/saml/service-providers");
         return;
       }
+      const sanitizedSp = sanitizeSamlServiceProviderForUi(sp);
       sendHtml(res, renderSamlServiceProviderEditPage({
-        serviceProvider: sanitizeSamlServiceProviderForUi(sp),
+        serviceProvider: sanitizedSp,
         flash: consumeFlash(session),
-        ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi)
+        ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi),
+        acsUrl: sanitizedSp.acsUrl
       }));
       return;
     }
@@ -2049,7 +2168,8 @@ const server = http.createServer(async (req, res) => {
           serviceProvider: sanitizeSamlServiceProviderForUi(result.serviceProvider),
           flash: consumeFlash(session),
           form: result.validation,
-          ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi)
+          ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi),
+          acsUrl: `${BASE_URL}/saml/acs/${samlUpdateId}`
         }));
         return;
       }
@@ -2066,6 +2186,315 @@ const server = http.createServer(async (req, res) => {
           : "SAML Service Provider updated."
       );
       redirect(res, "/saml/service-providers");
+      return;
+    }
+
+    const samlFlowStartId = (req.method === "POST" || req.method === "GET") ? matchSamlFlowStartPath(url.pathname) : null;
+    if (samlFlowStartId) {
+      const session = getOrCreateSession(req, res);
+
+      if (!checkRateLimit(session.id, "saml-flow-start", 10, 5 * 60 * 1000)) {
+        sendJson(res, 429, { error: "Too many requests. Please wait before retrying." });
+        return;
+      }
+
+      const sp = samlServiceProviderService.getSamlServiceProvider(samlFlowStartId);
+      if (!sp) {
+        setFlash(session, "warn", "SAML Service Provider not found.");
+        redirect(res, "/saml/service-providers");
+        return;
+      }
+
+      if (sp.requestSigned) {
+        setFlash(session, "error", "Signed AuthnRequest is not implemented yet.");
+        redirect(res, `/saml/service-providers/${encodeURIComponent(sp.id)}/edit`);
+        return;
+      }
+
+      // Resolve IdP metadata
+      let idpMetadata;
+      try {
+        let metadataXml = sp.idpMetadataXml;
+        if (!metadataXml && sp.idpMetadataUrl) {
+          metadataXml = await fetchIdpMetadataFromUrl(sp.idpMetadataUrl);
+        }
+        if (!metadataXml) {
+          throw new Error("No IdP metadata configured. Provide an URL or paste XML in the Service Provider settings.");
+        }
+        idpMetadata = parseIdpMetadata(metadataXml);
+        if (!idpMetadata.ssoUrl) {
+          throw new Error("IdP SSO URL not found in metadata. Check the XML or the metadata URL.");
+        }
+      } catch (error) {
+        appLog("warn", "saml_flow_start: metadata error", { spId: sp.id, error: error.message });
+        setFlash(session, "error", `IdP metadata error: ${error.message}`);
+        redirect(res, `/saml/service-providers/${encodeURIComponent(sp.id)}/edit`);
+        return;
+      }
+
+      const requestId = generateAuthnRequestId();
+      const relayState = generateRelayState();
+      const acsUrl = `${BASE_URL}/saml/acs/${sp.id}`;
+      const issueInstant = new Date().toISOString();
+
+      const authnRequestXml = buildAuthnRequestXml({
+        requestId,
+        issueInstant,
+        destination: idpMetadata.ssoUrl,
+        acsUrl,
+        spEntityId: sp.spEntityId,
+        nameIdFormat: sp.nameIdFormat || ""
+      });
+
+      let samlRequestParam;
+      try {
+        samlRequestParam = encodeAuthnRequestForRedirect(authnRequestXml);
+      } catch (error) {
+        appLog("warn", "saml_flow_start: encode error", { spId: sp.id, error: error.message });
+        setFlash(session, "error", "Failed to encode AuthnRequest.");
+        redirect(res, `/saml/service-providers/${encodeURIComponent(sp.id)}/edit`);
+        return;
+      }
+
+      const authorizationUrl = buildSsoRedirectUrl(idpMetadata.ssoUrl, samlRequestParam, relayState);
+      const env = getEzAccessEnvironment(sp.environment || "");
+      const envLabel = env?.key === "preprod" ? "Preprod" : env?.key === "prod" ? "Prod" : "";
+
+      const flow = samlFlowService.createFlow(sp.id, {
+        relayState,
+        requestId,
+        ssoUrl: idpMetadata.ssoUrl,
+        idpEntityId: idpMetadata.entityId,
+        spEntityId: sp.spEntityId,
+        acsUrl,
+        nameIdFormat: sp.nameIdFormat || "",
+        authorizationUrl,
+        serviceProviderName: sp.name,
+        environment: sp.environment || "",
+        environmentLabel: envLabel
+      });
+
+      const startHttpMethod = req.method || "POST";
+
+      samlFlowService.addFlowStep(flow.id, {
+        stepName: "authn_request_created",
+        status: "success",
+        httpMethod: startHttpMethod,
+        endpoint: `/saml/flows/start/${sp.id}`,
+        completedAt: new Date().toISOString(),
+        requestData: {
+          request_id: requestId,
+          sp_entity_id: sp.spEntityId,
+          acs_url: acsUrl,
+          destination: idpMetadata.ssoUrl,
+          name_id_format: sp.nameIdFormat || "(unspecified)",
+          issue_instant: issueInstant,
+          idp_entity_id: idpMetadata.entityId || "(not found in metadata)",
+          idp_has_certificate: idpMetadata.hasCertificate ? "yes" : "not found"
+        },
+        responseData: {
+          authn_request: "generated",
+          encoding: "HTTP-Redirect (deflate + base64)"
+        },
+        rawRequestData: { xml: "[AuthnRequest XML — redacted by default]" },
+        rawResponseData: null
+      });
+
+      samlFlowService.addFlowStep(flow.id, {
+        stepName: "redirect_to_idp",
+        status: "success",
+        httpMethod: "GET",
+        endpoint: idpMetadata.ssoUrl,
+        httpStatus: 302,
+        completedAt: new Date().toISOString(),
+        requestData: {
+          sso_url: idpMetadata.ssoUrl,
+          relay_state: "present",
+          saml_request: "present",
+          binding: idpMetadata.ssoBinding || "HTTP-Redirect"
+        },
+        responseData: {
+          redirect_to: "IdP SSO endpoint",
+          awaiting: "SAMLResponse on ACS"
+        },
+        rawRequestData: null,
+        rawResponseData: null
+      });
+
+      addSessionLog(session, "info", "saml_flow_started", "SAML flow started.", {
+        flowId: flow.id,
+        serviceProviderId: sp.id
+      });
+
+      redirect(res, authorizationUrl);
+      return;
+    }
+
+    const samlAcsId = req.method === "POST" ? matchSamlAcsPath(url.pathname) : null;
+    if (samlAcsId) {
+      const session = getOrCreateSession(req, res);
+      const rawBody = await readBody(req);
+      const body = parseBody(req, rawBody);
+
+      const samlResponseParam = body.SAMLResponse || "";
+      const relayState = body.RelayState || "";
+
+      const runningFlow = samlFlowService.findRunningFlowByRelayState(relayState, SAML_FLOW_TTL_MS);
+      if (!runningFlow) {
+        appLog("warn", "SAML ACS: no matching running flow", { hasRelayState: Boolean(relayState) });
+        sendJson(res, 400, { error: "No running SAML flow matches this RelayState. The flow may have expired or the RelayState is invalid." });
+        return;
+      }
+
+      samlFlowService.addFlowStep(runningFlow.id, {
+        stepName: "acs_callback_received",
+        status: "success",
+        httpMethod: "POST",
+        endpoint: url.pathname,
+        completedAt: new Date().toISOString(),
+        requestData: {
+          relay_state: relayState ? "present" : "missing",
+          saml_response: samlResponseParam ? "present" : "missing"
+        },
+        responseData: null,
+        rawRequestData: null,
+        rawResponseData: null
+      });
+
+      if (!samlResponseParam) {
+        samlFlowService.addFlowStep(runningFlow.id, {
+          stepName: "saml_response_received",
+          status: "error",
+          completedAt: new Date().toISOString(),
+          errorData: { error: "SAMLResponse parameter is missing from the ACS POST body." }
+        });
+        samlFlowService.completeFlow(runningFlow.id, {
+          status: "failed",
+          failedStep: "saml_response_received",
+          errorCode: "saml_response_missing",
+          errorDescription: "No SAMLResponse in ACS callback."
+        });
+        redirect(res, `/saml/flows/${encodeURIComponent(runningFlow.id)}`);
+        return;
+      }
+
+      let responseXml;
+      try {
+        responseXml = decodeSamlResponse(samlResponseParam);
+      } catch {
+        samlFlowService.addFlowStep(runningFlow.id, {
+          stepName: "saml_response_received",
+          status: "error",
+          completedAt: new Date().toISOString(),
+          errorData: { error: "Failed to base64-decode SAMLResponse." }
+        });
+        samlFlowService.completeFlow(runningFlow.id, {
+          status: "failed",
+          failedStep: "saml_response_received",
+          errorCode: "saml_response_decode_error",
+          errorDescription: "SAMLResponse is not valid base64."
+        });
+        redirect(res, `/saml/flows/${encodeURIComponent(runningFlow.id)}`);
+        return;
+      }
+
+      samlFlowService.addFlowStep(runningFlow.id, {
+        stepName: "saml_response_received",
+        status: "success",
+        httpMethod: "POST",
+        endpoint: url.pathname,
+        completedAt: new Date().toISOString(),
+        requestData: {
+          saml_response: "received",
+          relay_state: relayState ? "present" : "missing",
+          size_bytes: samlResponseParam.length
+        },
+        responseData: { decoded: "success" },
+        rawRequestData: { xml: "[SAMLResponse XML — redacted by default]" },
+        rawResponseData: null
+      });
+
+      let parsed;
+      try {
+        parsed = parseSamlResponse(responseXml);
+      } catch {
+        samlFlowService.addFlowStep(runningFlow.id, {
+          stepName: "saml_response_decoded",
+          status: "error",
+          completedAt: new Date().toISOString(),
+          errorData: { error: "Failed to parse SAMLResponse XML." }
+        });
+        samlFlowService.completeFlow(runningFlow.id, {
+          status: "failed",
+          failedStep: "saml_response_decoded",
+          errorCode: "saml_response_parse_error",
+          errorDescription: "SAMLResponse XML could not be parsed."
+        });
+        redirect(res, `/saml/flows/${encodeURIComponent(runningFlow.id)}`);
+        return;
+      }
+
+      const attrCount = Object.keys(parsed.attributes || {}).length;
+      samlFlowService.addFlowStep(runningFlow.id, {
+        stepName: "saml_response_decoded",
+        status: parsed.isSuccess ? "success" : "error",
+        completedAt: new Date().toISOString(),
+        requestData: {
+          issuer: parsed.issuer || "(not found)",
+          in_response_to: parsed.inResponseTo || "(not found)",
+          destination: parsed.destination || "(not found)"
+        },
+        responseData: {
+          status_code: parsed.statusCode || "(not found)",
+          saml_status: parsed.isSuccess ? "Success" : "Failure",
+          name_id: parsed.nameId || "(not present)",
+          name_id_format: parsed.nameIdFormat || "(not present)",
+          attributes_count: attrCount,
+          ...(attrCount > 0 ? { attributes: parsed.attributes } : {})
+        },
+        rawResponseData: { xml: "[SAMLResponse XML — redacted by default]" },
+        errorData: parsed.isSuccess ? null : { saml_status: parsed.statusCode }
+      });
+
+      samlFlowService.completeFlow(runningFlow.id, {
+        status: parsed.isSuccess ? "success" : "failed",
+        failedStep: parsed.isSuccess ? "" : "saml_response_decoded",
+        errorCode: parsed.isSuccess ? "" : "saml_status_not_success",
+        errorDescription: parsed.isSuccess ? "" : `IdP returned status: ${parsed.statusCode}`
+      });
+
+      addSessionLog(session, parsed.isSuccess ? "info" : "warn", "saml_acs_callback", "SAML ACS callback processed.", {
+        flowId: runningFlow.id,
+        success: parsed.isSuccess
+      });
+
+      redirect(res, `/saml/flows/${encodeURIComponent(runningFlow.id)}`);
+      return;
+    }
+
+    const samlFlowResultId = req.method === "GET" ? matchSamlFlowResultPath(url.pathname) : null;
+    if (samlFlowResultId) {
+      const session = getOrCreateSession(req, res);
+      const model = buildSamlFlowViewModel(session, samlFlowResultId, url);
+      if (!model) {
+        setFlash(session, "warn", "SAML flow not found.");
+        redirect(res, "/saml/service-providers");
+        return;
+      }
+      sendHtml(res, renderSamlFlowResultPage(model));
+      return;
+    }
+
+    const samlFlowDetailsId = req.method === "GET" ? matchSamlFlowDetailsPath(url.pathname) : null;
+    if (samlFlowDetailsId) {
+      const session = getOrCreateSession(req, res);
+      const model = buildSamlFlowViewModel(session, samlFlowDetailsId, url);
+      if (!model) {
+        setFlash(session, "warn", "SAML flow not found.");
+        redirect(res, "/saml/service-providers");
+        return;
+      }
+      sendHtml(res, renderSamlFlowDetailsPage(model));
       return;
     }
 
@@ -2095,7 +2524,7 @@ const server = http.createServer(async (req, res) => {
         nodeEnv: NODE_ENV,
         redirectUri: currentProviderConfig.redirectUri,
         oidc: { serviceProviders: serviceProviders.length, flows: flows.length },
-        saml: { serviceProviders: samlServiceProviders.length }
+        saml: { serviceProviders: samlServiceProviders.length, flows: samlFlows.length }
       });
       return;
     }

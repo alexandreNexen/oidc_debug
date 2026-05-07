@@ -4,42 +4,18 @@ const MAX_NAME_LENGTH = 255;
 const MAX_ENTITY_ID_LENGTH = 512;
 const MAX_METADATA_URL_LENGTH = 2048;
 const MAX_METADATA_XML_LENGTH = 65536;
-const MAX_ACS_URL_LENGTH = 2048;
-const MAX_LOGOUT_URL_LENGTH = 2048;
-const MAX_ATTRIBUTES_LENGTH = 4096;
-const MAX_NOTES_LENGTH = 4096;
-
-const VALID_NAME_ID_FORMATS = [
-  "",
-  "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified",
-  "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
-  "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent",
-  "urn:oasis:names:tc:SAML:2.0:nameid-format:transient"
-];
 
 function clean(value = "") {
   return String(value ?? "").trim();
-}
-
-function parseBool(value) {
-  return value === true || value === "on" || value === "true";
 }
 
 export function validateSamlServiceProviderInput(input = {}) {
   const values = {
     name: clean(input.name),
     environment: clean(input.environment),
-    idpMetadataUrl: clean(input.idpMetadataUrl),
-    idpMetadataXml: clean(input.idpMetadataXml),
     spEntityId: clean(input.spEntityId),
-    debugAcsUrl: clean(input.debugAcsUrl),
-    nameIdFormat: clean(input.nameIdFormat),
-    requestSigned: parseBool(input.requestSigned),
-    wantResponseSigned: parseBool(input.wantResponseSigned),
-    wantAssertionSigned: parseBool(input.wantAssertionSigned),
-    requiredAttributes: clean(input.requiredAttributes),
-    accessControlNotes: clean(input.accessControlNotes),
-    logoutUrl: clean(input.logoutUrl)
+    idpMetadataUrl: clean(input.idpMetadataUrl),
+    idpMetadataXml: clean(input.idpMetadataXml)
   };
 
   const errors = {};
@@ -67,26 +43,6 @@ export function validateSamlServiceProviderInput(input = {}) {
 
   if (values.idpMetadataXml.length > MAX_METADATA_XML_LENGTH) {
     errors.idpMetadataXml = `IdP Metadata XML must be ${MAX_METADATA_XML_LENGTH} characters or fewer.`;
-  }
-
-  if (values.debugAcsUrl.length > MAX_ACS_URL_LENGTH) {
-    errors.debugAcsUrl = `ACS URL must be ${MAX_ACS_URL_LENGTH} characters or fewer.`;
-  }
-
-  if (values.logoutUrl.length > MAX_LOGOUT_URL_LENGTH) {
-    errors.logoutUrl = `Logout URL must be ${MAX_LOGOUT_URL_LENGTH} characters or fewer.`;
-  }
-
-  if (values.requiredAttributes.length > MAX_ATTRIBUTES_LENGTH) {
-    errors.requiredAttributes = `Required attributes must be ${MAX_ATTRIBUTES_LENGTH} characters or fewer.`;
-  }
-
-  if (values.accessControlNotes.length > MAX_NOTES_LENGTH) {
-    errors.accessControlNotes = `Access control notes must be ${MAX_NOTES_LENGTH} characters or fewer.`;
-  }
-
-  if (values.nameIdFormat && !VALID_NAME_ID_FORMATS.includes(values.nameIdFormat)) {
-    errors.nameIdFormat = "Unknown NameID format.";
   }
 
   if (!values.idpMetadataUrl && !values.idpMetadataXml) {
@@ -120,17 +76,9 @@ function normalizePersistedSamlSp(entry, { createId }) {
     id: clean(entry.id) || createId("saml_sp"),
     name: clean(entry.name),
     environment: getEzAccessEnvironment(entry.environment)?.key || "",
+    spEntityId: clean(entry.spEntityId),
     idpMetadataUrl: clean(entry.idpMetadataUrl),
     idpMetadataXml: clean(entry.idpMetadataXml),
-    spEntityId: clean(entry.spEntityId),
-    debugAcsUrl: clean(entry.debugAcsUrl),
-    nameIdFormat: VALID_NAME_ID_FORMATS.includes(clean(entry.nameIdFormat)) ? clean(entry.nameIdFormat) : "",
-    requestSigned: Boolean(entry.requestSigned),
-    wantResponseSigned: Boolean(entry.wantResponseSigned),
-    wantAssertionSigned: Boolean(entry.wantAssertionSigned),
-    requiredAttributes: clean(entry.requiredAttributes),
-    accessControlNotes: clean(entry.accessControlNotes),
-    logoutUrl: clean(entry.logoutUrl),
     createdAt: entry.createdAt || now,
     updatedAt: entry.updatedAt || now
   };
@@ -144,7 +92,7 @@ function sortSamlServiceProviders(entries = []) {
   });
 }
 
-export function createSamlServiceProviderService({ getEntries, setEntries, createId, computeAcsUrl, onChange = () => {} }) {
+export function createSamlServiceProviderService({ getEntries, setEntries, createId, onChange = () => {} }) {
   function listSamlServiceProviders() {
     return sortSamlServiceProviders(getEntries());
   }
@@ -173,17 +121,9 @@ export function createSamlServiceProviderService({ getEntries, setEntries, creat
       id,
       name: validation.values.name,
       environment: validation.values.environment,
+      spEntityId: validation.values.spEntityId,
       idpMetadataUrl: validation.values.idpMetadataUrl,
       idpMetadataXml: validation.values.idpMetadataXml,
-      spEntityId: validation.values.spEntityId,
-      debugAcsUrl: validation.values.debugAcsUrl || (computeAcsUrl ? computeAcsUrl(id) : ""),
-      nameIdFormat: validation.values.nameIdFormat,
-      requestSigned: validation.values.requestSigned,
-      wantResponseSigned: validation.values.wantResponseSigned,
-      wantAssertionSigned: validation.values.wantAssertionSigned,
-      requiredAttributes: validation.values.requiredAttributes,
-      accessControlNotes: validation.values.accessControlNotes,
-      logoutUrl: validation.values.logoutUrl,
       createdAt: now,
       updatedAt: now
     };
@@ -208,17 +148,9 @@ export function createSamlServiceProviderService({ getEntries, setEntries, creat
       ...existing,
       name: validation.values.name,
       environment: validation.values.environment,
+      spEntityId: validation.values.spEntityId,
       idpMetadataUrl: validation.values.idpMetadataUrl,
       idpMetadataXml: validation.values.idpMetadataXml,
-      spEntityId: validation.values.spEntityId,
-      debugAcsUrl: validation.values.debugAcsUrl || existing.debugAcsUrl || (computeAcsUrl ? computeAcsUrl(id) : ""),
-      nameIdFormat: validation.values.nameIdFormat,
-      requestSigned: validation.values.requestSigned,
-      wantResponseSigned: validation.values.wantResponseSigned,
-      wantAssertionSigned: validation.values.wantAssertionSigned,
-      requiredAttributes: validation.values.requiredAttributes,
-      accessControlNotes: validation.values.accessControlNotes,
-      logoutUrl: validation.values.logoutUrl,
       updatedAt: new Date().toISOString()
     };
 

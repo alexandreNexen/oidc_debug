@@ -1,4 +1,4 @@
-import { escapeHtml, renderFlash, renderLayout, renderPageHeader } from "../../../common/views/layout.js";
+import { escapeHtml, renderFlash, renderIconBtn, renderLayout, renderPageHeader } from "../../../common/views/layout.js";
 
 function renderField({ label, name, type = "text", value = "", placeholder = "", help = "", error = "", required = false }) {
   const fieldId = `field-${name}`;
@@ -80,7 +80,7 @@ export function renderServiceProviderEditPage({ serviceProvider, flash, form = {
     ${renderPageHeader({
       title: "Edit Service Provider",
       description: "Update the OIDC client metadata used by future test flows.",
-      actions: `<a class="button-secondary button-compact" href="/service-providers">Back to list</a>`
+      actions: renderIconBtn({ icon: "return", label: "Back to list", href: "/service-providers", variant: "neutral", showLabel: true })
     })}
 
     <section class="card">
@@ -133,13 +133,13 @@ export function renderServiceProviderEditPage({ serviceProvider, flash, form = {
           })}
 
           <div class="sp-form__actions">
-            <button type="submit" class="button button-compact">Save changes</button>
-            <a class="button-secondary button-compact" href="/service-providers">Cancel</a>
+            ${renderIconBtn({ icon: "save", label: "Save changes", type: "submit", variant: "success", showLabel: true })}
+            ${renderIconBtn({ icon: "return", label: "Cancel", href: "/service-providers", variant: "neutral", showLabel: true })}
           </div>
         </form>
 
         <form class="sp-form__delete" method="post" action="/service-providers/${encodeURIComponent(serviceProvider.id)}/delete" data-confirm="Delete this Service Provider?">
-          <button type="submit" class="danger-button">Delete</button>
+          ${renderIconBtn({ icon: "delete", label: "Delete", type: "submit", variant: "danger", showLabel: true })}
         </form>
       </div>
     </section>

@@ -1,4 +1,4 @@
-import { escapeHtml, renderFlash, renderLayout, renderPageHeader } from "../../../common/views/layout.js";
+import { escapeHtml, renderFlash, renderIconBtn, renderLayout, renderPageHeader, renderStatusIcon } from "../../../common/views/layout.js";
 
 function renderEnvironment(sp) {
   if (!sp.environment) {
@@ -24,7 +24,7 @@ function renderEmptyState() {
         <div class="empty-state">
           <p class="empty-state__title">No SAML Service Provider configured yet.</p>
           <p class="empty-state__hint muted">Add a Service Provider to configure a SAML connection to Ez-Access.</p>
-          <a class="button-secondary button-compact" href="/saml/service-providers/new">Add SAML Service Provider</a>
+          ${renderIconBtn({ icon: "add", href: "/saml/service-providers/new", variant: "success", showLabel: true })}
         </div>
       </div>
     </div>
@@ -41,11 +41,13 @@ function renderList(serviceProviders) {
           <td>${renderEnvironment(sp)}</td>
           <td><code class="code-inline">${escapeHtml(sp.spEntityId || "Missing")}</code></td>
           <td>${renderIdpMetadata(sp)}</td>
-          <td><span class="badge badge--${escapeHtml(status.tone)}">${escapeHtml(status.label)}</span></td>
+          <td>${renderStatusIcon(status)}</td>
           <td class="table__actions">
-            <a class="button-secondary" href="/saml/service-providers/${encodeURIComponent(sp.id)}/edit">Edit</a>
+            ${renderIconBtn({ icon: "start", label: "Run SAML Flow", href: `/saml/flows/start/${encodeURIComponent(sp.id)}`, variant: "success" })}
+            ${renderIconBtn({ icon: "copy", label: "Copy ACS URL", variant: "neutral", attr: `data-copy="${escapeHtml(sp.acsUrl || "")}"` })}
+            ${renderIconBtn({ icon: "edit", label: "Edit", href: `/saml/service-providers/${encodeURIComponent(sp.id)}/edit`, variant: "neutral" })}
             <form method="post" action="/saml/service-providers/${encodeURIComponent(sp.id)}/delete" data-confirm="Delete this SAML Service Provider?">
-              <button type="submit" class="danger-button danger-button--compact">Delete</button>
+              ${renderIconBtn({ icon: "delete", label: "Delete", type: "submit", variant: "danger" })}
             </form>
           </td>
         </tr>
@@ -56,7 +58,6 @@ function renderList(serviceProviders) {
   return `
     <div class="card">
       <header class="card-header">
-        <h2 class="card-header__title">All SAML Service Providers</h2>
         <span class="muted">${escapeHtml(String(serviceProviders.length))} configured</span>
       </header>
       <div class="card__body card__body--flush table-scroll">
@@ -85,8 +86,7 @@ export function renderSamlServiceProvidersPage({ serviceProviders = [], flash })
     ${renderFlash(flash)}
     ${renderPageHeader({
       title: "SAML Service Providers",
-      description: "Manage SAML Service Providers connected to Ez-Access.",
-      actions: `<a class="button button-compact" href="/saml/service-providers/new">Add SAML Service Provider</a>`
+      actions: renderIconBtn({ icon: "add", href: "/saml/service-providers/new", variant: "success", showLabel: true })
     })}
     ${isEmpty ? renderEmptyState() : renderList(serviceProviders)}
   `;

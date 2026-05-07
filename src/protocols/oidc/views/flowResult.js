@@ -1,4 +1,4 @@
-import { escapeHtml, renderFlash, renderLayout, renderPageHeader } from "../../../common/views/layout.js";
+import { escapeHtml, renderFlash, renderIconBtn, renderLayout, renderPageHeader, renderStatusIcon } from "../../../common/views/layout.js";
 
 function formatDate(value) {
   return value ? new Date(value).toLocaleString("fr-FR") : "Not available";
@@ -50,7 +50,7 @@ function renderTimeline(steps = []) {
             <li class="flow-timeline__item flow-timeline__item--${escapeHtml(step.badge.tone)}">
               <span class="flow-timeline__dot"></span>
               <span class="flow-timeline__label">${escapeHtml(step.stepName)}</span>
-              <span class="badge badge--${escapeHtml(step.badge.tone)}">${escapeHtml(step.badge.label)}</span>
+              ${renderStatusIcon(step.badge)}
             </li>
           `
         )
@@ -101,12 +101,12 @@ export function renderFlowResultPage({ flow, serviceProvider, steps = [], flash,
     </section>
 
     <div class="flow-actions">
-      <a class="button button-compact" href="${escapeHtml(detailsHref)}">View flow details</a>
+      ${renderIconBtn({ icon: "details", label: "View flow details", href: detailsHref, variant: "neutral", showLabel: true })}
       <form method="post" action="/flows/${encodeURIComponent(flow.id)}/rerun">
-        <button type="submit" class="button-secondary button-compact">Run again</button>
+        ${renderIconBtn({ icon: "replay", label: "Run again", type: "submit", variant: "neutral", showLabel: true })}
       </form>
-      ${failed && serviceProvider?.id ? `<a class="button-secondary button-compact" href="/service-providers/${encodeURIComponent(serviceProvider.id)}/edit">Edit Service Provider</a>` : ""}
-      <a class="button-secondary button-compact" href="/service-providers">Back to Service Providers</a>
+      ${failed && serviceProvider?.id ? renderIconBtn({ icon: "edit", label: "Edit Service Provider", href: `/service-providers/${encodeURIComponent(serviceProvider.id)}/edit`, variant: "neutral", showLabel: true }) : ""}
+      ${renderIconBtn({ icon: "return", label: "Back to Service Providers", href: "/service-providers", variant: "neutral", showLabel: true })}
     </div>
   `;
 

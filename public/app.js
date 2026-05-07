@@ -19,11 +19,11 @@ async function copyToClipboard(text, button) {
       return;
     }
 
-    const previous = button.textContent;
+    const previousContent = button.innerHTML;
     button.textContent = "Copied";
     button.classList.add("is-copied");
     setTimeout(() => {
-      button.textContent = previous;
+      button.innerHTML = previousContent;
       button.classList.remove("is-copied");
     }, 1200);
   } catch {

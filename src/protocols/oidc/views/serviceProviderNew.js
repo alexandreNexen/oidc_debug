@@ -1,4 +1,4 @@
-import { escapeHtml, renderFlash, renderLayout, renderPageHeader } from "../../../common/views/layout.js";
+import { escapeHtml, renderFlash, renderIconBtn, renderLayout, renderPageHeader } from "../../../common/views/layout.js";
 
 function renderField({ label, name, type = "text", value = "", placeholder = "", help = "", error = "", required = false }) {
   const fieldId = `field-${name}`;
@@ -74,7 +74,7 @@ export function renderServiceProviderNewPage({ flash, form = {}, ezAccessEnviron
     ${renderPageHeader({
       title: "Add Service Provider",
       description: "Create an OIDC client configuration for a future Ez-Access test flow.",
-      actions: `<a class="button-secondary button-compact" href="/service-providers">Back to list</a>`
+      actions: renderIconBtn({ icon: "return", label: "Back to list", href: "/service-providers", variant: "neutral", showLabel: true })
     })}
 
     <section class="card">
@@ -124,8 +124,8 @@ export function renderServiceProviderNewPage({ flash, form = {}, ezAccessEnviron
           })}
 
           <div class="sp-form__actions">
-            <button type="submit" class="button button-compact">Save Service Provider</button>
-            <a class="button-secondary button-compact" href="/service-providers">Cancel</a>
+            ${renderIconBtn({ icon: "save", label: "Save Service Provider", type: "submit", variant: "success", showLabel: true })}
+            ${renderIconBtn({ icon: "return", label: "Cancel", href: "/service-providers", variant: "neutral", showLabel: true })}
           </div>
         </form>
       </div>

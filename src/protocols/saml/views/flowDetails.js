@@ -1,64 +1,51 @@
 import { escapeHtml, renderFlash, renderIconBtn, renderLayout, renderPageHeader, renderStatusIcon } from "../../../common/views/layout.js";
 
-const EXCHANGE_LABELS = {
-  authorize: "GET /authorize",
-  callback: "GET /oidc/callback",
-  token: "POST /token",
-  userinfo: "GET /userinfo"
+const STEP_LABELS = {
+  authn_request_created: "AuthnRequest",
+  redirect_to_idp: "Redirect IdP",
+  acs_callback_received: "ACS Callback",
+  saml_response_received: "SAMLResponse",
+  saml_response_decoded: "Décodage"
 };
 
-const STEP_LABELS = {
-  authorize: "Authorize",
-  callback: "Callback",
-  token: "Token",
-  userinfo: "UserInfo"
-};
+const SAML_STEP_ORDER = [
+  "authn_request_created",
+  "redirect_to_idp",
+  "acs_callback_received",
+  "saml_response_received",
+  "saml_response_decoded"
+];
 
 function formatDate(value) {
-  return value ? new Date(value).toLocaleString("fr-FR") : "Not available";
+  return value ? new Date(value).toLocaleString("fr-FR") : "Non disponible";
 }
 
-function formatDuration(durationMs) {
-  if (durationMs === null || durationMs === undefined) {
-    return "Running";
-  }
-
-  if (durationMs < 1000) {
-    return `${durationMs} ms`;
-  }
-
-  return `${(durationMs / 1000).toFixed(1)} s`;
+function formatDuration(ms) {
+  if (ms === null || ms === undefined) return "En cours";
+  if (ms < 1000) return `${ms} ms`;
+  return `${(ms / 1000).toFixed(1)} s`;
 }
 
 function renderDataValue(key, value) {
   if (value === null || value === undefined || value === "") {
-    return `<span class="muted">Not available</span>`;
-  }
-
-  if (key === "authorization_url_full") {
-    return `
-      <details class="inline-details">
-        <summary>Show authorization URL</summary>
-        <code class="code-block">${escapeHtml(value)}</code>
-      </details>
-    `;
+    return `<span class="muted">Non disponible</span>`;
   }
 
   if (typeof value === "object") {
     return `
       <details class="inline-details" open>
-        <summary>View data</summary>
+        <summary>Voir les données</summary>
         <pre>${escapeHtml(JSON.stringify(value, null, 2))}</pre>
       </details>
     `;
   }
 
-  return `<span>${escapeHtml(value)}</span>`;
+  return `<span>${escapeHtml(String(value))}</span>`;
 }
 
 function renderDataList(data = {}) {
   if (!data || Object.keys(data).length === 0) {
-    return `<p class="muted">No data recorded.</p>`;
+    return `<p class="muted">Aucune donnée enregistrée.</p>`;
   }
 
   return `
@@ -78,17 +65,13 @@ function renderDataList(data = {}) {
 }
 
 function encodeRawData(value) {
-  if (!value || (typeof value === "object" && Object.keys(value).length === 0)) {
-    return "";
-  }
-
+  if (!value || (typeof value === "object" && Object.keys(value).length === 0)) return "";
   return Buffer.from(JSON.stringify(value, null, 2), "utf8").toString("base64");
 }
 
 function renderRawButton(step, type, rawData) {
   const label = type === "request" ? "Request" : "Response";
   const title = `Raw ${STEP_LABELS[step.stepName] || step.stepName} ${label}`;
-
   return `
     <button
       class="panel-action-button"
@@ -104,12 +87,12 @@ function renderRawButton(step, type, rawData) {
 
 function renderTimeline(flow, steps, selectedStep) {
   return `
-    <nav class="flow-detail-timeline" aria-label="Flow steps">
+    <nav class="flow-detail-timeline" aria-label="Étapes du flow SAML">
       ${steps
         .map(
           (step, index) => `
-            <a class="flow-detail-timeline__item text-action${step.stepName === selectedStep ? " is-active" : ""}" href="/flows/${encodeURIComponent(flow.id)}/details?step=${encodeURIComponent(step.stepName)}">
-              <span>${escapeHtml(step.stepName)}</span>
+            <a class="flow-detail-timeline__item text-action${step.stepName === selectedStep ? " is-active" : ""}" href="/saml/flows/${encodeURIComponent(flow.id)}/details?step=${encodeURIComponent(step.stepName)}">
+              <span>${escapeHtml(STEP_LABELS[step.stepName] || step.stepName)}</span>
               ${renderStatusIcon(step.badge)}
             </a>
             ${index < steps.length - 1 ? `<span class="flow-detail-timeline__separator">→</span>` : ""}
@@ -121,44 +104,44 @@ function renderTimeline(flow, steps, selectedStep) {
 }
 
 function renderSelectedStep(step) {
-  const exchange = EXCHANGE_LABELS[step.stepName] || step.stepName;
+  const label = STEP_LABELS[step.stepName] || step.stepName;
 
   return `
-    <section class="flow-detail-grid" aria-label="${escapeHtml(step.stepName)} details">
+    <section class="flow-detail-grid" aria-label="${escapeHtml(label)} — détails">
       <article class="flow-detail-panel">
         <header>
           <div>
-            <h2>Request</h2>
+            <h2>Requête</h2>
             <span class="muted">Ce qu'on envoie</span>
           </div>
-          ${renderRawButton(step, "request", step.rawRequestData)}
+          ${step.rawRequestData ? renderRawButton(step, "request", step.rawRequestData) : ""}
         </header>
         ${renderDataList(step.requestData)}
       </article>
 
       <article class="flow-detail-panel flow-detail-panel--center">
         <header>
-          <h2>OIDC Exchange</h2>
+          <h2>Échange SAML</h2>
         </header>
         <dl class="flow-data-list">
           <div class="flow-data-list__row">
-            <dt>Exchange</dt>
-            <dd>${escapeHtml(exchange)}</dd>
+            <dt>Étape</dt>
+            <dd>${escapeHtml(label)}</dd>
           </div>
           <div class="flow-data-list__row">
-            <dt>Method</dt>
-            <dd>${escapeHtml(step.httpMethod || "Not available")}</dd>
+            <dt>Méthode</dt>
+            <dd>${escapeHtml(step.httpMethod || "Non disponible")}</dd>
           </div>
           <div class="flow-data-list__row">
             <dt>Endpoint</dt>
-            <dd>${step.endpoint ? `<code class="code-inline">${escapeHtml(step.endpoint)}</code>` : `<span class="muted">Not available</span>`}</dd>
+            <dd>${step.endpoint ? `<code class="code-inline">${escapeHtml(step.endpoint)}</code>` : `<span class="muted">Non disponible</span>`}</dd>
           </div>
           <div class="flow-data-list__row">
             <dt>HTTP status</dt>
-            <dd>${step.httpStatus !== null && step.httpStatus !== undefined ? escapeHtml(String(step.httpStatus)) : `<span class="muted">Not available</span>`}</dd>
+            <dd>${step.httpStatus !== null && step.httpStatus !== undefined ? escapeHtml(String(step.httpStatus)) : `<span class="muted">Non disponible</span>`}</dd>
           </div>
           <div class="flow-data-list__row">
-            <dt>Status</dt>
+            <dt>Statut</dt>
             <dd>${renderStatusIcon(step.badge)}</dd>
           </div>
         </dl>
@@ -168,10 +151,10 @@ function renderSelectedStep(step) {
       <article class="flow-detail-panel">
         <header>
           <div>
-            <h2>Response</h2>
+            <h2>Réponse</h2>
             <span class="muted">Ce qu'on reçoit</span>
           </div>
-          ${renderRawButton(step, "response", step.rawResponseData)}
+          ${step.rawResponseData ? renderRawButton(step, "response", step.rawResponseData) : ""}
         </header>
         ${renderDataList(step.responseData)}
       </article>
@@ -179,16 +162,16 @@ function renderSelectedStep(step) {
   `;
 }
 
-export function renderFlowDetailsPage({ flow, serviceProvider, steps = [], selectedStep, flash }) {
-  const status = flow.statusBadge || { label: "Running", tone: "neutral" };
-  const step = steps.find((entry) => entry.stepName === selectedStep) || steps[0];
+export function renderSamlFlowDetailsPage({ flow, serviceProvider, steps = [], selectedStep, flash }) {
+  const status = flow.statusBadge || { label: "En cours", tone: "neutral" };
+  const step = steps.find((s) => s.stepName === selectedStep) || steps[0];
 
   const body = `
     ${renderFlash(flash)}
     ${renderPageHeader({
-      title: "Flow Details",
-      description: `${serviceProvider.name || flow.serviceProviderName || "Service Provider"} · ${status.label} · ${flow.id}`,
-      actions: renderIconBtn({ icon: "return", label: "Back to result", href: `/flows/${encodeURIComponent(flow.id)}`, variant: "neutral", showLabel: true })
+      title: "Détails du flow SAML",
+      description: `${serviceProvider.name || "Service Provider"} · ${status.label} · ${flow.id}`,
+      actions: renderIconBtn({ icon: "return", label: "Retour au résultat", href: `/saml/flows/${encodeURIComponent(flow.id)}`, variant: "neutral", showLabel: true })
     })}
 
     <section class="card">
@@ -196,14 +179,20 @@ export function renderFlowDetailsPage({ flow, serviceProvider, steps = [], selec
         <dl class="flow-meta">
           <div>
             <dt>Service Provider</dt>
-            <dd>${escapeHtml(serviceProvider.name || flow.serviceProviderName || "Unknown")}</dd>
+            <dd>${escapeHtml(serviceProvider.name || "Inconnu")}</dd>
           </div>
           <div>
             <dt>Environment</dt>
-            <dd>${flow.environmentLabel ? `<span class="badge badge--neutral">${escapeHtml(flow.environmentLabel)}</span>` : `<span class="badge badge--warning">Environment missing</span>`}</dd>
+            <dd>${flow.environmentLabel
+              ? `<span class="badge badge--neutral">${escapeHtml(flow.environmentLabel)}</span>`
+              : `<span class="badge badge--warning">Environment manquant</span>`}</dd>
           </div>
           <div>
-            <dt>Result</dt>
+            <dt>SP Entity ID</dt>
+            <dd><code class="code-inline">${escapeHtml(flow.runtime?.spEntityId || "")}</code></dd>
+          </div>
+          <div>
+            <dt>Résultat</dt>
             <dd><span class="badge badge--${escapeHtml(status.tone)}">${escapeHtml(status.label)}</span></dd>
           </div>
           <div>
@@ -211,46 +200,49 @@ export function renderFlowDetailsPage({ flow, serviceProvider, steps = [], selec
             <dd><code class="code-inline">${escapeHtml(flow.id)}</code></dd>
           </div>
           <div>
-            <dt>Started</dt>
+            <dt>Démarré</dt>
             <dd>${escapeHtml(formatDate(flow.startedAt))}</dd>
           </div>
           <div>
-            <dt>Duration</dt>
+            <dt>Durée</dt>
             <dd>${escapeHtml(formatDuration(flow.durationMs))}</dd>
           </div>
           <div>
-            <dt>Failed step</dt>
-            <dd>${flow.failedStep ? escapeHtml(flow.failedStep) : `<span class="muted">None</span>`}</dd>
+            <dt>Étape en échec</dt>
+            <dd>${flow.failedStep ? escapeHtml(flow.failedStep) : `<span class="muted">Aucune</span>`}</dd>
           </div>
         </dl>
       </div>
     </section>
 
-    ${renderTimeline(flow, steps, selectedStep)}
-    ${renderSelectedStep(step)}
+    ${step ? renderTimeline(flow, steps, selectedStep) : ""}
+    ${step ? renderSelectedStep(step) : `<p class="muted">Aucune étape enregistrée.</p>`}
+
     <div class="modal-backdrop" data-raw-modal hidden>
       <section class="modal" role="dialog" aria-modal="true" aria-labelledby="raw-modal-title">
         <header class="modal__header">
           <div>
-            <h2 id="raw-modal-title">Raw data</h2>
+            <h2 id="raw-modal-title">Données brutes</h2>
             <p class="modal__subtitle muted" data-raw-modal-subtitle></p>
           </div>
-          <button class="panel-action-button button-compact" type="button" data-raw-close>Close</button>
+          <button class="panel-action-button button-compact" type="button" data-raw-close>Fermer</button>
         </header>
         <div class="modal__body">
-          <pre class="raw-json-block" data-raw-modal-body>No raw data recorded for this step.</pre>
+          <pre class="raw-json-block" data-raw-modal-body>Aucune donnée brute enregistrée pour cette étape.</pre>
         </div>
         <footer class="modal__footer">
-          <button class="button-secondary button-compact" type="button" data-raw-copy>Copy</button>
-          <button class="button button-compact" type="button" data-raw-close>Close</button>
+          <button class="button-secondary button-compact" type="button" data-raw-copy>Copier</button>
+          <button class="button button-compact" type="button" data-raw-close>Fermer</button>
         </footer>
       </section>
     </div>
   `;
 
   return renderLayout({
-    title: "Flow details — Ez-Access OIDC Debug",
-    activeNav: "service-providers",
+    title: "Détails flow SAML — Ez-Access Debug",
+    activeNav: "saml-service-providers",
     body
   });
 }
+
+export { SAML_STEP_ORDER };

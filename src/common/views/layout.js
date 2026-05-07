@@ -1,4 +1,4 @@
-export function escapeHtml(value = "") {
+export function escapeHtml(value = "Add Service Provider") {
   return String(value)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -31,8 +31,8 @@ export function renderPageHeader({ title, description = "", actions = "" }) {
 function renderTopbar(activeNav) {
   const navItems = [
     { id: "dashboard", label: "Dashboard", href: "/" },
-    { id: "service-providers", label: "OIDC SPs", href: "/service-providers" },
-    { id: "saml-service-providers", label: "SAML SPs", href: "/saml/service-providers" }
+    { id: "service-providers", label: "OIDC", href: "/service-providers" },
+    { id: "saml-service-providers", label: "SAML", href: "/saml/service-providers" }
   ];
 
   const navHtml = navItems
@@ -53,6 +53,26 @@ function renderTopbar(activeNav) {
       </div>
     </header>
   `;
+}
+
+export function renderStatusIcon({ tone, label }) {
+  if (tone === "success") {
+    return `<span class="status-icon status-icon--success" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}" role="img"></span>`;
+  }
+  if (tone === "error") {
+    return `<span class="status-icon status-icon--error" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}" role="img"></span>`;
+  }
+  return `<span class="badge badge--${escapeHtml(tone)}">${escapeHtml(label)}</span>`;
+}
+
+export function renderIconBtn({ icon, label, href, type = "button", variant = "neutral", showLabel = false, attr = "" }) {
+  const cls = `btn-icon btn-icon--${escapeHtml(variant)}${showLabel ? " btn-icon--labeled" : ""}`;
+  const img = `<img src="/assets/icons/${escapeHtml(icon)}.svg" width="16" height="16" alt="" aria-hidden="true">`;
+  const inner = img;
+  if (href) {
+    return `<a class="${cls}" href="${escapeHtml(href)}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}">${inner}</a>`;
+  }
+  return `<button class="${cls}" type="${escapeHtml(type)}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"${attr ? ` ${attr}` : ""}>${inner}</button>`;
 }
 
 export function renderLayout({ title = "Ez-Access OIDC Debug", activeNav = "dashboard", body = "" }) {

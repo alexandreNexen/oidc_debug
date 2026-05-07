@@ -1,19 +1,11 @@
-import { escapeHtml, renderFlash, renderLayout, renderPageHeader } from "../../../common/views/layout.js";
-
-const NAME_ID_FORMAT_OPTIONS = [
-  { value: "", label: "Not specified" },
-  { value: "urn:oasis:names:tc:SAML:1.1:nameid-format:unspecified", label: "Unspecified (SAML 1.1)" },
-  { value: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress", label: "Email Address (SAML 1.1)" },
-  { value: "urn:oasis:names:tc:SAML:2.0:nameid-format:persistent", label: "Persistent (SAML 2.0)" },
-  { value: "urn:oasis:names:tc:SAML:2.0:nameid-format:transient", label: "Transient (SAML 2.0)" }
-];
+import { escapeHtml, renderFlash, renderIconBtn, renderLayout, renderPageHeader } from "../../../common/views/layout.js";
 
 function renderField({ label, name, type = "text", value = "", placeholder = "", error = "", required = false, hint = "" }) {
   const fieldId = `field-${name}`;
   const errorId = `${fieldId}-error`;
   return `
     <div class="sp-form__field">
-      <label class="sp-form__label" for="${escapeHtml(fieldId)}">${escapeHtml(label)}${required ? "" : " <span class=\"muted\">(optionnel)</span>"}</label>
+      <label class="sp-form__label" for="${escapeHtml(fieldId)}">${escapeHtml(label)}${required ? "" : ` <span class="muted">(optionnel)</span>`}</label>
       <input
         id="${escapeHtml(fieldId)}"
         name="${escapeHtml(name)}"
@@ -34,7 +26,7 @@ function renderTextareaField({ label, name, value = "", placeholder = "", error 
   const errorId = `${fieldId}-error`;
   return `
     <div class="sp-form__field">
-      <label class="sp-form__label" for="${escapeHtml(fieldId)}">${escapeHtml(label)}${required ? "" : " <span class=\"muted\">(optionnel)</span>"}</label>
+      <label class="sp-form__label" for="${escapeHtml(fieldId)}">${escapeHtml(label)}${required ? "" : ` <span class="muted">(optionnel)</span>`}</label>
       <textarea
         id="${escapeHtml(fieldId)}"
         name="${escapeHtml(name)}"
@@ -46,23 +38,6 @@ function renderTextareaField({ label, name, value = "", placeholder = "", error 
       >${escapeHtml(value)}</textarea>
       ${hint ? `<p class="muted" style="font-size:.85em;margin:.2rem 0 0">${escapeHtml(hint)}</p>` : ""}
       ${error ? `<p id="${escapeHtml(errorId)}" class="field-error">${escapeHtml(error)}</p>` : ""}
-    </div>
-  `;
-}
-
-function renderCheckboxField({ label, name, checked = false, hint = "" }) {
-  return `
-    <div class="sp-form__field" style="flex-direction:row;align-items:center;gap:.5rem">
-      <input
-        id="field-${escapeHtml(name)}"
-        name="${escapeHtml(name)}"
-        type="checkbox"
-        value="on"
-        ${checked ? "checked" : ""}
-        style="width:1rem;height:1rem;flex-shrink:0"
-      />
-      <label class="sp-form__label" for="field-${escapeHtml(name)}" style="margin:0">${escapeHtml(label)}</label>
-      ${hint ? `<span class="muted" style="font-size:.85em">${escapeHtml(hint)}</span>` : ""}
     </div>
   `;
 }
@@ -82,20 +57,6 @@ function renderEnvironmentField({ environments = [], value = "", error = "" }) {
   `;
 }
 
-function renderNameIdFormatField({ value = "", error = "" }) {
-  const fieldId = "field-nameIdFormat";
-  const errorId = `${fieldId}-error`;
-  return `
-    <div class="sp-form__field">
-      <label class="sp-form__label" for="${fieldId}">NameID Format <span class="muted">(optionnel)</span></label>
-      <select id="${fieldId}" name="nameIdFormat" ${error ? `aria-invalid="true" aria-describedby="${escapeHtml(errorId)}"` : ""}>
-        ${NAME_ID_FORMAT_OPTIONS.map((opt) => `<option value="${escapeHtml(opt.value)}"${opt.value === value ? " selected" : ""}>${escapeHtml(opt.label)}</option>`).join("")}
-      </select>
-      ${error ? `<p id="${escapeHtml(errorId)}" class="field-error">${escapeHtml(error)}</p>` : ""}
-    </div>
-  `;
-}
-
 function renderWarnings(warnings = []) {
   if (!warnings.length) return "";
   return `<div class="form-banner form-banner--warning">${warnings.map((w) => escapeHtml(w)).join("<br />")}</div>`;
@@ -106,22 +67,24 @@ function renderErrorSummary(errors = {}) {
   return `<div class="form-banner form-banner--error">Please fix the highlighted fields.</div>`;
 }
 
-export function renderSamlServiceProviderEditPage({ serviceProvider, flash, form = {}, ezAccessEnvironments = [] } = {}) {
+function renderAcsUrlBanner(acsUrl) {
+  return `
+    <div class="redirect-uri-block" style="margin-bottom:1.25rem">
+      <span class="redirect-uri-block__label">ACS URL</span>
+      <code class="code-inline redirect-uri-block__uri">${escapeHtml(acsUrl)}</code>
+      ${renderIconBtn({ icon: "copy", label: "Copy ACS URL", variant: "neutral", attr: `data-copy="${escapeHtml(acsUrl)}"` })}
+    </div>
+  `;
+}
+
+export function renderSamlServiceProviderEditPage({ serviceProvider, flash, form = {}, ezAccessEnvironments = [], acsUrl = "" } = {}) {
   const sp = serviceProvider || {};
   const values = {
     name: sp.name || "",
     environment: sp.environment || "",
+    spEntityId: sp.spEntityId || "",
     idpMetadataUrl: sp.idpMetadataUrl || "",
     idpMetadataXml: sp.idpMetadataXml || "",
-    spEntityId: sp.spEntityId || "",
-    debugAcsUrl: sp.debugAcsUrl || "",
-    nameIdFormat: sp.nameIdFormat || "",
-    requestSigned: sp.requestSigned || false,
-    wantResponseSigned: sp.wantResponseSigned || false,
-    wantAssertionSigned: sp.wantAssertionSigned || false,
-    requiredAttributes: sp.requiredAttributes || "",
-    accessControlNotes: sp.accessControlNotes || "",
-    logoutUrl: sp.logoutUrl || "",
     ...(form.values || {})
   };
   const errors = form.errors || {};
@@ -132,7 +95,7 @@ export function renderSamlServiceProviderEditPage({ serviceProvider, flash, form
     ${renderPageHeader({
       title: "Edit SAML Service Provider",
       description: "Update the SAML configuration for this Service Provider.",
-      actions: `<a class="button-secondary button-compact" href="/saml/service-providers">Back to list</a>`
+      actions: renderIconBtn({ icon: "return", label: "Back to list", href: "/saml/service-providers", variant: "neutral", showLabel: true })
     })}
 
     <section class="card">
@@ -144,45 +107,48 @@ export function renderSamlServiceProviderEditPage({ serviceProvider, flash, form
         <span class="badge badge--${escapeHtml(sp.status?.tone || "neutral")}">${escapeHtml(sp.status?.label || "Incomplete")}</span>
       </header>
       <div class="card__body">
+        ${acsUrl ? renderAcsUrlBanner(acsUrl) : ""}
         ${renderErrorSummary(errors)}
         ${renderWarnings(warnings)}
         <form class="sp-form" method="post" action="/saml/service-providers/${encodeURIComponent(sp.id)}" novalidate>
 
           ${renderField({ label: "Name", name: "name", value: values.name, error: errors.name, required: true })}
           ${renderEnvironmentField({ environments: ezAccessEnvironments, value: values.environment, error: errors.environment })}
-          ${renderField({ label: "SP Entity ID", name: "spEntityId", value: values.spEntityId, error: errors.spEntityId, required: true, placeholder: "https://your-app.example.com/saml/metadata", hint: "Unique identifier for this Service Provider in SAML metadata." })}
-          ${renderField({ label: "Debug ACS URL", name: "debugAcsUrl", value: values.debugAcsUrl, error: errors.debugAcsUrl, hint: "Assertion Consumer Service URL used for SAML tests." })}
-
-          <hr style="border:none;border-top:1px solid var(--color-border,#e5e7eb);margin:1.5rem 0" />
-          <h3 style="font-size:1rem;font-weight:600;margin:0 0 1rem">IdP Configuration</h3>
-
-          ${renderField({ label: "IdP Metadata URL", name: "idpMetadataUrl", value: values.idpMetadataUrl, error: errors.idpMetadataUrl, placeholder: "https://idp.example.com/metadata" })}
-          ${renderTextareaField({ label: "IdP Metadata XML", name: "idpMetadataXml", value: values.idpMetadataXml, error: errors.idpMetadataXml, placeholder: "<?xml version=\"1.0\"?>...", rows: 5, hint: "Paste raw SAML metadata XML if URL is unavailable." })}
-
-          <hr style="border:none;border-top:1px solid var(--color-border,#e5e7eb);margin:1.5rem 0" />
-          <h3 style="font-size:1rem;font-weight:600;margin:0 0 1rem">Security &amp; Protocol</h3>
-
-          ${renderNameIdFormatField({ value: values.nameIdFormat, error: errors.nameIdFormat })}
-          ${renderCheckboxField({ label: "Request Signed", name: "requestSigned", checked: Boolean(values.requestSigned), hint: "SP signs authentication requests" })}
-          ${renderCheckboxField({ label: "Want Response Signed", name: "wantResponseSigned", checked: Boolean(values.wantResponseSigned), hint: "SP expects the SAML response to be signed" })}
-          ${renderCheckboxField({ label: "Want Assertion Signed", name: "wantAssertionSigned", checked: Boolean(values.wantAssertionSigned), hint: "SP expects the SAML assertion to be signed" })}
-          ${renderField({ label: "Logout URL (SLO)", name: "logoutUrl", value: values.logoutUrl, error: errors.logoutUrl, placeholder: "https://your-app.example.com/logout" })}
-
-          <hr style="border:none;border-top:1px solid var(--color-border,#e5e7eb);margin:1.5rem 0" />
-          <h3 style="font-size:1rem;font-weight:600;margin:0 0 1rem">Attributes &amp; Notes</h3>
-
-          ${renderTextareaField({ label: "Required Attributes", name: "requiredAttributes", value: values.requiredAttributes, error: errors.requiredAttributes, placeholder: "mail\ngivenName\nsn", rows: 4, hint: "One attribute name per line." })}
-          ${renderTextareaField({ label: "Access Control Notes", name: "accessControlNotes", value: values.accessControlNotes, error: errors.accessControlNotes, placeholder: "e.g. Restricted to group X, requires MFA...", rows: 3 })}
+          ${renderField({
+            label: "SP Entity ID",
+            name: "spEntityId",
+            value: values.spEntityId,
+            error: errors.spEntityId,
+            required: true,
+          })}
+          ${renderField({
+            label: "IdP Metadata URL",
+            name: "idpMetadataUrl",
+            value: values.idpMetadataUrl,
+            error: errors.idpMetadataUrl,
+            placeholder: "https://idp.example.com/metadata",
+          })}
+          ${renderTextareaField({
+            label: "IdP Metadata XML",
+            name: "idpMetadataXml",
+            value: values.idpMetadataXml,
+            error: errors.idpMetadataXml,
+            placeholder: "<?xml version=\"1.0\"?>\n<EntityDescriptor ...>",
+            rows: 6,
+          })}
 
           <div class="sp-form__actions">
-            <button type="submit" class="button button-compact">Save changes</button>
-            <a class="button-secondary button-compact" href="/saml/service-providers">Cancel</a>
+            ${renderIconBtn({ icon: "save", label: "Save changes", type: "submit", variant: "success", showLabel: true })}
+            ${renderIconBtn({ icon: "return", label: "Cancel", href: "/saml/service-providers", variant: "neutral", showLabel: true })}
           </div>
         </form>
 
-        <form class="sp-form__delete" method="post" action="/saml/service-providers/${encodeURIComponent(sp.id)}/delete" data-confirm="Delete this SAML Service Provider?">
-          <button type="submit" class="danger-button">Delete</button>
-        </form>
+        <div class="sp-form__delete" style="display:flex;gap:.75rem">
+          ${renderIconBtn({ icon: "start", label: "Run SAML Flow", href: `/saml/flows/start/${encodeURIComponent(sp.id)}`, variant: "success", showLabel: true })}
+          <form method="post" action="/saml/service-providers/${encodeURIComponent(sp.id)}/delete" data-confirm="Delete this SAML Service Provider?">
+            ${renderIconBtn({ icon: "delete", label: "Delete", type: "submit", variant: "danger", showLabel: true })}
+          </form>
+        </div>
       </div>
     </section>
   `;
