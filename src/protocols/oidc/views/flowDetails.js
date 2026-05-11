@@ -235,14 +235,13 @@ export function renderFlowDetailsPage({ flow, serviceProvider, steps = [], selec
             <h2 id="raw-modal-title">Raw data</h2>
             <p class="modal__subtitle muted" data-raw-modal-subtitle></p>
           </div>
-          <button class="panel-action-button button-compact" type="button" data-raw-close>Close</button>
         </header>
         <div class="modal__body">
           <pre class="raw-json-block" data-raw-modal-body>No raw data recorded for this step.</pre>
         </div>
         <footer class="modal__footer">
-          <button class="button-secondary button-compact" type="button" data-raw-copy>Copy</button>
-          <button class="button button-compact" type="button" data-raw-close>Close</button>
+          ${renderIconBtn({ icon: "copy", label: "Copy", variant: "neutral", attr: "data-raw-copy" })}
+          ${renderIconBtn({ icon: "return", label: "Close", variant: "neutral", attr: "data-raw-close" })}
         </footer>
       </section>
     </div>

@@ -29,17 +29,31 @@ function renderEzAccessCard(environments = []) {
 }
 
 
-function renderRecentFlowsCard(recentFlows = []) {
-  if (recentFlows.length) {
-    const rows = recentFlows
-          .map(
+const startButtons = `
+  <div style="display:flex;gap:.5rem">
+    ${renderIconBtn({ icon: "start", label: "OIDC flow", href: "/service-providers", variant: "success", showLabel: true })}
+    ${renderIconBtn({ icon: "start", label: "SAML flow", href: "/saml/service-providers", variant: "success", showLabel: true })}
+  </div>
+`;
+
+function renderRecentFlowsCard(recentFlows = [], samlRecentFlows = []) {
+  const allFlows = [...recentFlows, ...samlRecentFlows]
+    .sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime())
+    .slice(0, 5);
+
+  if (allFlows.length) {
+    const rows = allFlows
+      .map(
         (flow) => `
           <li class="dashboard-flow-list__item">
             <div>
-              <a class="text-action" href="/flows/${encodeURIComponent(flow.id)}">${escapeHtml(flow.serviceProviderName || flow.clientId || flow.id)}</a>
-              <span class="muted">${escapeHtml(new Date(flow.startedAt).toLocaleString("en-US"))}</span>
+              <a class="text-action" href="${escapeHtml(flow.href || `/flows/${encodeURIComponent(flow.id)}`)}">${escapeHtml(flow.serviceProviderName || flow.clientId || flow.id)}</a>
+              <span class="muted">${escapeHtml(new Date(flow.startedAt).toLocaleString("fr-FR"))}</span>
             </div>
-            ${renderStatusIcon(flow.statusBadge)}
+            <div style="display:flex;align-items:center;gap:.5rem">
+              <span class="badge badge--neutral" style="font-size:.7rem">${escapeHtml(flow.protocol || "OIDC")}</span>
+              ${renderStatusIcon(flow.statusBadge)}
+            </div>
           </li>
         `
       )
@@ -49,7 +63,7 @@ function renderRecentFlowsCard(recentFlows = []) {
       <section class="card" aria-labelledby="flows-card-title">
         <header class="card-header">
           <h2 id="flows-card-title" class="card-header__title">Recent flows</h2>
-          ${renderIconBtn({ icon: "start", label: "Start a flow", href: "/service-providers", variant: "success" })}
+          ${startButtons}
         </header>
         <div class="card__body">
           <ul class="dashboard-flow-list">${rows}</ul>
@@ -60,26 +74,26 @@ function renderRecentFlowsCard(recentFlows = []) {
 
   return `
     <section class="card" aria-labelledby="flows-card-title">
-        <header class="card-header">
-          <h2 id="flows-card-title" class="card-header__title">Recent flows</h2>
-          <span class="muted">Recent OIDC test history</span>
-        </header>
+      <header class="card-header">
+        <h2 id="flows-card-title" class="card-header__title">Recent flows</h2>
+        ${startButtons}
+      </header>
       <div class="card__body card__body--centered">
         <div class="empty-state">
           <p class="empty-state__title">No flow executed yet.</p>
-          <p class="empty-state__hint muted">Flow history will be available after implementing persisted flows.</p>
+          <p class="empty-state__hint muted">Run an OIDC or SAML flow to see history here.</p>
         </div>
       </div>
     </section>
   `;
 }
 
-export function renderDashboard({ recentFlows = [], ezAccessEnvironments = [], flash }) {
+export function renderDashboard({ recentFlows = [], samlRecentFlows = [], ezAccessEnvironments = [], flash }) {
   const body = `
     ${renderFlash(flash)}
     <div class="dashboard">
       ${renderEzAccessCard(ezAccessEnvironments)}
-      ${renderRecentFlowsCard(recentFlows)}
+      ${renderRecentFlowsCard(recentFlows, samlRecentFlows)}
     </div>
   `;
 

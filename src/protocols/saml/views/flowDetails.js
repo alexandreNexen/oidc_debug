@@ -225,14 +225,13 @@ export function renderSamlFlowDetailsPage({ flow, serviceProvider, steps = [], s
             <h2 id="raw-modal-title">Données brutes</h2>
             <p class="modal__subtitle muted" data-raw-modal-subtitle></p>
           </div>
-          <button class="panel-action-button button-compact" type="button" data-raw-close>Fermer</button>
         </header>
         <div class="modal__body">
           <pre class="raw-json-block" data-raw-modal-body>Aucune donnée brute enregistrée pour cette étape.</pre>
         </div>
         <footer class="modal__footer">
-          <button class="button-secondary button-compact" type="button" data-raw-copy>Copier</button>
-          <button class="button button-compact" type="button" data-raw-close>Fermer</button>
+          ${renderIconBtn({ icon: "copy", label: "Copier", variant: "neutral", attr: "data-raw-copy" })}
+          ${renderIconBtn({ icon: "return", label: "Fermer", variant: "neutral", attr: "data-raw-close" })}
         </footer>
       </section>
     </div>

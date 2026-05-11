@@ -20,7 +20,7 @@ async function copyToClipboard(text, button) {
     }
 
     const previousContent = button.innerHTML;
-    button.textContent = "Copied";
+    button.innerHTML = '<img src="/assets/icons/true.svg" width="16" height="16" alt="Copied" style="display:block">';
     button.classList.add("is-copied");
     setTimeout(() => {
       button.innerHTML = previousContent;

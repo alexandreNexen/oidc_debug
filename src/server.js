@@ -1194,7 +1194,7 @@ function stepStatusLabel(status = "pending") {
   return { label: "Pending", tone: "neutral" };
 }
 
-function samlFlowSummary(flow) {
+function samlFlowDetailSummary(flow) {
   if (!flow) return null;
   return {
     id: flow.id,
@@ -1243,7 +1243,7 @@ function buildSamlFlowViewModel(session, flowId, url) {
 
   return {
     flash: consumeFlash(session),
-    flow: samlFlowSummary(flow),
+    flow: samlFlowDetailSummary(flow),
     serviceProvider: sp ? sanitizeSamlServiceProviderForUi(sp) : {
       id: flow.serviceProviderId,
       name: flow.runtime?.serviceProviderName || "Service Provider"
@@ -1280,6 +1280,8 @@ function flowSummary(flow) {
 
   return {
     id: flow.id,
+    protocol: "OIDC",
+    href: `/flows/${flow.id}`,
     serviceProviderId: flow.serviceProviderId,
     status: flow.status,
     statusBadge: flowStatusLabel(flow.status),
@@ -1293,6 +1295,26 @@ function flowSummary(flow) {
     clientId: flow.runtime?.clientId || "",
     environment: flow.runtime?.environment || "",
     environmentLabel: flow.runtime?.environmentLabel || environmentLabel(flow.runtime?.environment)
+  };
+}
+
+function samlFlowSummary(flow) {
+  if (!flow) {
+    return null;
+  }
+
+  return {
+    id: flow.id,
+    protocol: "SAML",
+    href: `/saml/flows/${flow.id}`,
+    serviceProviderId: flow.serviceProviderId,
+    status: flow.status,
+    statusBadge: flowStatusLabel(flow.status),
+    startedAt: flow.startedAt,
+    completedAt: flow.completedAt,
+    serviceProviderName: flow.runtime?.serviceProviderName || "",
+    environment: flow.runtime?.environment || "",
+    environmentLabel: flow.runtime?.environmentLabel || ""
   };
 }
 
@@ -1819,6 +1841,7 @@ function buildPageModel(session, activeTab, url) {
     providerConfig: sanitizedProviderConfig,
     serviceProviders: attachFlowsToServiceProviders(serviceProviderService.listServiceProviders().map(sanitizeServiceProviderForUi)),
     recentFlows: flowService.listRecentFlows(5).map(flowSummary),
+    samlRecentFlows: samlFlowService.listRecentFlows(5).map(samlFlowSummary),
     ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi),
     editingServiceProvider,
     selectedServiceProvider,

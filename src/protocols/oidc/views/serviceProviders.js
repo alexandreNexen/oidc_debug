@@ -18,7 +18,7 @@ function renderEmptyState() {
         <div class="empty-state">
           <p class="empty-state__title">No Service Provider configured yet.</p>
           <p class="empty-state__hint muted">Add a Service Provider to prepare an OIDC test against Ez-Access.</p>
-          ${renderIconBtn({ icon: "add", label: "Add Service Provider", href: "/service-providers/new", variant: "success", showLabel: true })}
+          ${renderIconBtn({ icon: "add",href: "/service-providers/new", variant: "success", showLabel: true })}
         </div>
       </div>
     </div>
@@ -114,7 +114,7 @@ export function renderServiceProvidersPage({ serviceProviders = [], flash, fixed
     ${renderFlash(flash)}
     ${renderPageHeader({
       title: "OIDC Service Providers",
-      actions: renderIconBtn({ icon: "add", label: "Add Service Provider", href: "/service-providers/new", variant: "success", showLabel: true })
+      actions: renderIconBtn({ icon: "add", href: "/service-providers/new", variant: "success", showLabel: true })
     })}
     ${renderRedirectUriBlock(fixedRedirectUri)}
     ${isEmpty ? renderEmptyState() : renderList(serviceProviders)}

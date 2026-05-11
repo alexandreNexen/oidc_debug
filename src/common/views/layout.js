@@ -1,4 +1,4 @@
-export function escapeHtml(value = "Add Service Provider") {
+export function escapeHtml(value = "") {
   return String(value)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
@@ -68,11 +68,10 @@ export function renderStatusIcon({ tone, label }) {
 export function renderIconBtn({ icon, label, href, type = "button", variant = "neutral", showLabel = false, attr = "" }) {
   const cls = `btn-icon btn-icon--${escapeHtml(variant)}${showLabel ? " btn-icon--labeled" : ""}`;
   const img = `<img src="/assets/icons/${escapeHtml(icon)}.svg" width="16" height="16" alt="" aria-hidden="true">`;
-  const inner = img;
   if (href) {
-    return `<a class="${cls}" href="${escapeHtml(href)}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}">${inner}</a>`;
+    return `<a class="${cls}" href="${escapeHtml(href)}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}">${img}</a>`;
   }
-  return `<button class="${cls}" type="${escapeHtml(type)}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"${attr ? ` ${attr}` : ""}>${inner}</button>`;
+  return `<button class="${cls}" type="${escapeHtml(type)}" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}"${attr ? ` ${attr}` : ""}>${img}</button>`;
 }
 
 export function renderLayout({ title = "Ez-Access OIDC Debug", activeNav = "dashboard", body = "" }) {
