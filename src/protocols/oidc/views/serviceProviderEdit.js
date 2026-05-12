@@ -79,22 +79,14 @@ export function renderServiceProviderEditPage({ serviceProvider, flash, form = {
     ${renderFlash(flash)}
     ${renderPageHeader({
       title: "Edit Service Provider",
-      description: "Update the OIDC client metadata used by future test flows.",
-      actions: renderIconBtn({ icon: "return", label: "Back to list", href: "/service-providers", variant: "neutral", showLabel: true })
+      actions: renderIconBtn({ icon: "return", label: "Back to list", href: "/oidc/service-providers", variant: "neutral", showLabel: true })
     })}
 
     <section class="card">
-      <header class="card-header">
-        <div class="card-header__main">
-          <h2 class="card-header__title">${escapeHtml(serviceProvider?.name || "Service Provider")}</h2>
-          <span class="muted code-inline">${escapeHtml(serviceProvider?.clientId || "client_id missing")}</span>
-        </div>
-        <span class="badge badge--${escapeHtml(serviceProvider?.status?.tone || "neutral")}">${escapeHtml(serviceProvider?.status?.label || "Missing")}</span>
-      </header>
       <div class="card__body">
         ${renderErrorSummary(errors)}
         ${renderWarnings(warnings)}
-        <form class="sp-form" method="post" action="/service-providers/${encodeURIComponent(serviceProvider.id)}" novalidate>
+        <form class="sp-form" method="post" action="/oidc/service-providers/${encodeURIComponent(serviceProvider.id)}" novalidate>
           ${renderField({
             label: "Name",
             name: "name",
@@ -134,11 +126,11 @@ export function renderServiceProviderEditPage({ serviceProvider, flash, form = {
 
           <div class="sp-form__actions">
             ${renderIconBtn({ icon: "save", label: "Save changes", type: "submit", variant: "success", showLabel: true })}
-            ${renderIconBtn({ icon: "return", label: "Cancel", href: "/service-providers", variant: "neutral", showLabel: true })}
+            ${renderIconBtn({ icon: "return", label: "Cancel", href: "/oidc/service-providers", variant: "neutral", showLabel: true })}
           </div>
         </form>
 
-        <form class="sp-form__delete" method="post" action="/service-providers/${encodeURIComponent(serviceProvider.id)}/delete" data-confirm="Delete this Service Provider?">
+        <form class="sp-form__delete" method="post" action="/oidc/service-providers/${encodeURIComponent(serviceProvider.id)}/delete" data-confirm="Delete this Service Provider?">
           ${renderIconBtn({ icon: "delete", label: "Delete", type: "submit", variant: "danger", showLabel: true })}
         </form>
       </div>

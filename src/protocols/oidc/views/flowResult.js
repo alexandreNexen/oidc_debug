@@ -5,30 +5,15 @@ function formatDate(value) {
 }
 
 function formatDuration(durationMs) {
-  if (durationMs === null || durationMs === undefined) {
-    return "Running";
-  }
-
-  if (durationMs < 1000) {
-    return `${durationMs} ms`;
-  }
-
+  if (durationMs === null || durationMs === undefined) return "Running";
+  if (durationMs < 1000) return `${durationMs} ms`;
   return `${(durationMs / 1000).toFixed(1)} s`;
 }
 
 function resultTitle(status) {
-  if (status === "success") {
-    return "Flow completed successfully";
-  }
-
-  if (status === "failed") {
-    return "Flow failed";
-  }
-
-  if (status === "partial_success") {
-    return "Flow partially completed";
-  }
-
+  if (status === "success") return "Flow completed successfully";
+  if (status === "failed") return "Flow failed";
+  if (status === "partial_success") return "Flow partially completed";
   return "Flow running";
 }
 
@@ -41,20 +26,68 @@ function renderSummaryRow(label, value) {
   `;
 }
 
-function renderTimeline(steps = []) {
+// ---- Functional section mapping ----
+
+const STEP_TO_SECTION = {
+  authorize: "Authorization",
+  callback: "Authorization",
+  token: "Token exchange",
+  userinfo: "UserInfo"
+};
+
+function sectionBadge(status) {
+  if (status === "success") return { tone: "success", label: "Done" };
+  if (status === "error") return { tone: "error", label: "Error" };
+  if (status === "running") return { tone: "warning", label: "Running" };
+  if (status === "skipped") return { tone: "neutral", label: "Skipped" };
+  return { tone: "neutral", label: "Pending" };
+}
+
+function computeSections(steps) {
+  const byName = new Map(steps.map((s) => [s.stepName, s]));
+  const auth = byName.get("authorize");
+  const cb = byName.get("callback");
+  const token = byName.get("token");
+  const ui = byName.get("userinfo");
+
+  let authStatus = "pending";
+  if (auth?.status === "error" || cb?.status === "error") authStatus = "error";
+  else if (cb?.status === "success") authStatus = "success";
+  else if (auth?.status === "success") authStatus = "running";
+
+  const tokenStatus = token?.status || "pending";
+
+  let uiStatus = ui?.status || "pending";
+  if (uiStatus === "pending" && tokenStatus === "success") uiStatus = "pending";
+
+  const diag = token?.responseData?.id_token_diagnostics;
+  let idTokenStatus = "pending";
+  if (token && token.status !== "pending") {
+    idTokenStatus = diag?.id_token_received === "yes" ? "success" : "pending";
+  }
+
+  return [
+    { label: "Authorization", status: authStatus },
+    { label: "Token exchange", status: tokenStatus },
+    { label: "UserInfo", status: uiStatus },
+    { label: "ID Token analysis", status: idTokenStatus }
+  ];
+}
+
+function renderFunctionalTimeline(steps) {
+  const sections = computeSections(steps);
   return `
     <ol class="flow-timeline">
-      ${steps
-        .map(
-          (step) => `
-            <li class="flow-timeline__item flow-timeline__item--${escapeHtml(step.badge.tone)}">
-              <span class="flow-timeline__dot"></span>
-              <span class="flow-timeline__label">${escapeHtml(step.stepName)}</span>
-              ${renderStatusIcon(step.badge)}
-            </li>
-          `
-        )
-        .join("")}
+      ${sections.map((s) => {
+        const badge = sectionBadge(s.status);
+        return `
+          <li class="flow-timeline__item flow-timeline__item--${escapeHtml(badge.tone)}">
+            <span class="flow-timeline__dot"></span>
+            <span class="flow-timeline__label">${escapeHtml(s.label)}</span>
+            ${renderStatusIcon(badge)}
+          </li>
+        `;
+      }).join("")}
     </ol>
   `;
 }
@@ -62,7 +95,8 @@ function renderTimeline(steps = []) {
 export function renderFlowResultPage({ flow, serviceProvider, steps = [], flash, recommendedAction = "" }) {
   const status = flow.statusBadge || { label: "Running", tone: "neutral" };
   const failed = flow.status === "failed" || flow.status === "partial_success";
-  const detailsHref = `/flows/${encodeURIComponent(flow.id)}/details`;
+  const detailsHref = `/oidc/flows/${encodeURIComponent(flow.id)}/details`;
+  const failedSectionLabel = flow.failedStep ? (STEP_TO_SECTION[flow.failedStep] || flow.failedStep) : "";
 
   const body = `
     ${renderFlash(flash)}
@@ -83,7 +117,7 @@ export function renderFlowResultPage({ flow, serviceProvider, steps = [], flash,
           ${renderSummaryRow("Client ID", `<code class="code-inline">${escapeHtml(serviceProvider.clientId || flow.clientId || "")}</code>`)}
           ${renderSummaryRow("Started at", escapeHtml(formatDate(flow.startedAt)))}
           ${renderSummaryRow("Duration", escapeHtml(formatDuration(flow.durationMs)))}
-          ${failed && flow.failedStep ? renderSummaryRow("Failed step", `<span class="badge badge--warning">${escapeHtml(flow.failedStep)}</span>`) : ""}
+          ${failed && failedSectionLabel ? renderSummaryRow("Failed at", `<span class="badge badge--warning">${escapeHtml(failedSectionLabel)}</span>`) : ""}
           ${failed && flow.errorCode ? renderSummaryRow("Error code", `<code class="code-inline">${escapeHtml(flow.errorCode)}</code>`) : ""}
           ${failed && flow.errorDescription ? renderSummaryRow("Error", escapeHtml(flow.errorDescription)) : ""}
           ${failed && recommendedAction ? renderSummaryRow("Recommended action", escapeHtml(recommendedAction)) : ""}
@@ -93,20 +127,20 @@ export function renderFlowResultPage({ flow, serviceProvider, steps = [], flash,
 
     <section class="card flow-section">
       <header class="card-header">
-        <h2 class="card-header__title">Completed steps</h2>
+        <h2 class="card-header__title">Steps</h2>
       </header>
       <div class="card__body">
-        ${renderTimeline(steps)}
+        ${renderFunctionalTimeline(steps)}
       </div>
     </section>
 
     <div class="flow-actions">
       ${renderIconBtn({ icon: "details", label: "View flow details", href: detailsHref, variant: "neutral", showLabel: true })}
-      <form method="post" action="/flows/${encodeURIComponent(flow.id)}/rerun">
+      <form method="post" action="/oidc/flows/${encodeURIComponent(flow.id)}/rerun">
         ${renderIconBtn({ icon: "replay", label: "Run again", type: "submit", variant: "neutral", showLabel: true })}
       </form>
-      ${failed && serviceProvider?.id ? renderIconBtn({ icon: "edit", label: "Edit Service Provider", href: `/service-providers/${encodeURIComponent(serviceProvider.id)}/edit`, variant: "neutral", showLabel: true }) : ""}
-      ${renderIconBtn({ icon: "return", label: "Back to Service Providers", href: "/service-providers", variant: "neutral", showLabel: true })}
+      ${failed && serviceProvider?.id ? renderIconBtn({ icon: "edit", label: "Edit Service Provider", href: `/oidc/service-providers/${encodeURIComponent(serviceProvider.id)}/edit`, variant: "neutral", showLabel: true }) : ""}
+      ${renderIconBtn({ icon: "return", label: "Back to Service Providers", href: "/oidc/service-providers", variant: "neutral", showLabel: true })}
     </div>
   `;
 

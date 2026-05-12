@@ -31,7 +31,7 @@ export function renderPageHeader({ title, description = "", actions = "" }) {
 function renderTopbar(activeNav) {
   const navItems = [
     { id: "dashboard", label: "Dashboard", href: "/" },
-    { id: "service-providers", label: "OIDC", href: "/service-providers" },
+    { id: "service-providers", label: "OIDC", href: "/oidc/service-providers" },
     { id: "saml-service-providers", label: "SAML", href: "/saml/service-providers" }
   ];
 
@@ -48,7 +48,7 @@ function renderTopbar(activeNav) {
         <div class="topbar__brand">
           <img class="topbar__logo" src="/assets/brand/logo.svg" alt="Logo Eiffage" />
         </div>
-        <span class="topbar__title">Ez-Access OIDC Debug Console</span>
+        <span class="topbar__title">Ez-Access Debug Console</span>
         <nav class="topbar__nav" aria-label="Navigation principale">${navHtml}</nav>
       </div>
     </header>

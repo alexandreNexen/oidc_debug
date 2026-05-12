@@ -38,6 +38,14 @@ function clean(value, fallback = "") {
   return String(value).trim();
 }
 
+function cleanList(value = []) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value.map((entry) => clean(entry)).filter(Boolean);
+}
+
 export function createProviderConfig() {
   return {
     providerName: "",
@@ -47,7 +55,10 @@ export function createProviderConfig() {
     tokenEndpoint: "",
     userInfoEndpoint: "",
     jwksUri: "",
-    redirectUri: FIXED_REDIRECT_URI
+    redirectUri: FIXED_REDIRECT_URI,
+    scopesSupported: [],
+    responseTypesSupported: [],
+    tokenEndpointAuthMethodsSupported: []
   };
 }
 
@@ -62,7 +73,10 @@ export function normalizeProviderConfig(input = {}) {
     tokenEndpoint: clean(input.tokenEndpoint, defaults.tokenEndpoint),
     userInfoEndpoint: clean(input.userInfoEndpoint, defaults.userInfoEndpoint),
     jwksUri: clean(input.jwksUri, defaults.jwksUri),
-    redirectUri: clean(input.redirectUri, defaults.redirectUri)
+    redirectUri: clean(input.redirectUri, defaults.redirectUri),
+    scopesSupported: cleanList(input.scopesSupported ?? input.scopes_supported),
+    responseTypesSupported: cleanList(input.responseTypesSupported ?? input.response_types_supported),
+    tokenEndpointAuthMethodsSupported: cleanList(input.tokenEndpointAuthMethodsSupported ?? input.token_endpoint_auth_methods_supported)
   };
 }
 
@@ -85,7 +99,10 @@ export function mergeDiscoveryIntoProviderConfig(config, discovery = {}) {
     authorizationEndpoint: clean(discovery.authorization_endpoint, config.authorizationEndpoint),
     tokenEndpoint: clean(discovery.token_endpoint, config.tokenEndpoint),
     userInfoEndpoint: clean(discovery.userinfo_endpoint, config.userInfoEndpoint),
-    jwksUri: clean(discovery.jwks_uri, config.jwksUri)
+    jwksUri: clean(discovery.jwks_uri, config.jwksUri),
+    scopesSupported: cleanList(discovery.scopes_supported),
+    responseTypesSupported: cleanList(discovery.response_types_supported),
+    tokenEndpointAuthMethodsSupported: cleanList(discovery.token_endpoint_auth_methods_supported)
   });
 }
 
@@ -102,6 +119,9 @@ export function buildEffectiveConfig({ providerConfig, serviceProvider, clientSe
     tokenEndpoint: normalizedProvider.tokenEndpoint,
     userInfoEndpoint: normalizedProvider.userInfoEndpoint,
     jwksUri: normalizedProvider.jwksUri,
+    scopesSupported: normalizedProvider.scopesSupported,
+    responseTypesSupported: normalizedProvider.responseTypesSupported,
+    tokenEndpointAuthMethodsSupported: normalizedProvider.tokenEndpointAuthMethodsSupported,
     clientId: normalizedSp.clientId,
     clientSecret: confidential ? clean(clientSecret) : "",
     clientType: normalizedSp.clientType,

@@ -3,7 +3,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getEzAccessEnvironment, listEzAccessEnvironments } from "./protocols/oidc/config.js";
+import { getEzAccessEnvironment, listEzAccessEnvironments } from "./common/views/config.js";
 import {
   decodeJwt,
   buildCurlCommand,
@@ -23,7 +23,7 @@ import {
 } from "./protocols/oidc/oidc.js";
 import { createFlowService, STEP_ORDER } from "./protocols/oidc/services/flows.js";
 import { createServiceProviderService, isServiceProviderReady, serviceProviderStatus } from "./protocols/oidc/services/serviceProviders.js";
-import { renderDashboard } from "./protocols/oidc/views/dashboard.js";
+import { renderDashboard } from "./common/views/dashboard.js";
 import { renderFlowDetailsPage } from "./protocols/oidc/views/flowDetails.js";
 import { renderFlowResultPage } from "./protocols/oidc/views/flowResult.js";
 import { renderServiceProvidersPage } from "./protocols/oidc/views/serviceProviders.js";
@@ -42,7 +42,16 @@ import {
   parseIdpMetadata,
   fetchIdpMetadataFromUrl,
   decodeSamlResponse,
-  parseSamlResponse
+  parseSamlResponse,
+  maskSamlValue,
+  redactSamlRedirectUrl,
+  redactSamlXml,
+  shortHash,
+  summarizeEncodedSamlParam,
+  summarizeRelayState,
+  summarizeSensitiveValue,
+  extractIdpSigningCertificates,
+  verifySamlXmlSignatures
 } from "./protocols/saml/saml.js";
 import { createSamlFlowService, SAML_STEP_ORDER } from "./protocols/saml/services/flows.js";
 import { renderSamlFlowResultPage } from "./protocols/saml/views/flowResult.js";
@@ -83,6 +92,7 @@ let flowSteps = [];
 let samlServiceProviders = [];
 let samlFlows = [];
 let samlFlowSteps = [];
+let oidcEnvironmentConfig = {};
 let persistTimer = null;
 let persistInFlight = Promise.resolve();
 let runtimeSessionSecret = process.env.SESSION_SECRET || "";
@@ -229,6 +239,57 @@ function parseSnapshotBody(body = "", contentType = "") {
   return body;
 }
 
+function diagnosticPresence(value) {
+  return value === undefined || value === null || value === "" ? "missing" : "present";
+}
+
+function diagnosticReceived(value) {
+  return value === undefined || value === null || value === "" ? "missing" : "received";
+}
+
+function redactProtocolParam(key, value) {
+  const normalized = String(key || "").toLowerCase();
+
+  if (["state", "nonce", "code_challenge", "code_challenge_method"].includes(normalized)) {
+    return diagnosticPresence(value);
+  }
+
+  if (["code", "code_verifier"].includes(normalized)) {
+    return diagnosticPresence(value);
+  }
+
+  return sanitizeDiagnosticData(value, key);
+}
+
+function redactProtocolParams(params = {}) {
+  return Object.entries(params || {}).reduce((acc, [key, value]) => {
+    acc[key] = redactProtocolParam(key, value);
+    return acc;
+  }, {});
+}
+
+function redactDiagnosticUrl(rawUrl = "") {
+  if (!rawUrl || typeof rawUrl !== "string") {
+    return rawUrl || "";
+  }
+
+  try {
+    const parsed = new URL(rawUrl, BASE_URL);
+    for (const key of Array.from(parsed.searchParams.keys())) {
+      const redacted = redactProtocolParam(key, parsed.searchParams.get(key));
+      if (redacted !== parsed.searchParams.get(key)) {
+        parsed.searchParams.set(key, redacted);
+      }
+    }
+
+    return rawUrl.startsWith("http://") || rawUrl.startsWith("https://")
+      ? parsed.toString()
+      : `${parsed.pathname}${parsed.search}${parsed.hash}`;
+  } catch {
+    return rawUrl;
+  }
+}
+
 function sanitizeRawRequest(request = null) {
   if (!request) {
     return null;
@@ -240,26 +301,42 @@ function sanitizeRawRequest(request = null) {
 
   return sanitizeDiagnosticData({
     method: request.method || "",
-    url: request.url || "",
+    url: redactDiagnosticUrl(request.url || ""),
     headers,
-    params: request.params || {},
-    body: parsedBody || undefined
+    params: redactProtocolParams(request.params || {}),
+    body: parsedBody && typeof parsedBody === "object" ? redactProtocolParams(parsedBody) : parsedBody || undefined
   });
 }
 
-function sanitizeRawResponse(response = null) {
+function summarizeUserInfoClaims(claims = {}) {
+  const keys = Object.keys(claims || {});
+
+  return {
+    sub: claims.sub || "",
+    email: diagnosticReceived(claims.email),
+    name: diagnosticReceived(claims.name),
+    raw_claims_available: keys.length > 0 ? "yes" : "no",
+    claim_count: keys.length,
+    body_redaction: keys.length > 0 ? "PII claims limited for display" : ""
+  };
+}
+
+function sanitizeRawResponse(response = null, { bodyMode = "default" } = {}) {
   if (!response) {
     return null;
   }
 
   const contentType = response.headers?.["content-type"] || response.headers?.["Content-Type"] || "";
   const parsedBody = response.parsed || parseSnapshotBody(response.body || "", contentType);
+  const body = bodyMode === "userinfo" && parsedBody && typeof parsedBody === "object"
+    ? summarizeUserInfoClaims(parsedBody)
+    : parsedBody || response.redactedBody || response.error || "";
 
   return sanitizeDiagnosticData({
     status: response.status ?? 0,
     ok: Boolean(response.ok),
     headers: response.headers || {},
-    body: parsedBody || response.redactedBody || response.error || "",
+    body,
     error: response.error || "",
     diagnostics: response.diagnostics || null
   });
@@ -360,15 +437,74 @@ function createSession() {
   };
 }
 
+function sanitizeTerminalOidcFlow(flow) {
+  if (!flow || flow.status === "running" || !flow.runtime) {
+    return flow;
+  }
+
+  const {
+    expectedState,
+    expectedNonce,
+    codeVerifier,
+    codeChallenge,
+    ...runtime
+  } = flow.runtime;
+
+  return {
+    ...flow,
+    runtime: {
+      ...runtime,
+      pkceMethod: codeChallenge ? "S256" : runtime.pkceMethod || "",
+      codeChallengePresent: codeChallenge ? "yes" : runtime.codeChallengePresent || "no",
+      codeVerifierPresent: codeVerifier ? "yes" : runtime.codeVerifierPresent || "no",
+      stateGenerated: expectedState ? "yes" : runtime.stateGenerated || "no",
+      stateSent: expectedState ? "yes" : runtime.stateSent || "no",
+      nonceGenerated: expectedNonce ? "yes" : runtime.nonceGenerated || "no",
+      nonceSent: expectedNonce ? "yes" : runtime.nonceSent || "no"
+    }
+  };
+}
+
+function sanitizeOidcStepForPersistence(step = {}) {
+  const responseData = step.responseData?.authorization_url_full
+    ? {
+        ...step.responseData,
+        authorization_url_full: redactDiagnosticUrl(step.responseData.authorization_url_full)
+      }
+    : step.responseData;
+  const rawResponseData = step.rawResponseData
+    ? sanitizeDiagnosticData({
+        ...step.rawResponseData,
+        body: step.stepName === "userinfo" && step.rawResponseData.body && typeof step.rawResponseData.body === "object"
+          ? summarizeUserInfoClaims(step.rawResponseData.body)
+          : step.rawResponseData.body
+      })
+    : step.rawResponseData;
+
+  return {
+    ...step,
+    responseData,
+    rawRequestData: step.rawRequestData
+      ? {
+          ...step.rawRequestData,
+          url: redactDiagnosticUrl(step.rawRequestData.url || ""),
+          params: redactProtocolParams(step.rawRequestData.params || {})
+        }
+      : step.rawRequestData,
+    rawResponseData
+  };
+}
+
 function buildPersistedState() {
   return {
     version: 4,
     updatedAt: new Date().toISOString(),
     oidc: {
       providerConfig: sanitizeProviderConfig(providerConfig),
+      environmentConfig: oidcEnvironmentConfig,
       serviceProviders,
-      flows,
-      flowSteps
+      flows: flows.map(sanitizeTerminalOidcFlow),
+      flowSteps: flowSteps.map(sanitizeOidcStepForPersistence)
     },
     saml: {
       serviceProviders: samlServiceProviders,
@@ -510,6 +646,7 @@ async function loadPersistedState() {
     const hydrated = migrateState(parsed);
 
     providerConfig = sanitizeProviderConfig(hydrated.oidc?.providerConfig);
+    oidcEnvironmentConfig = hydrated.oidc?.environmentConfig || {};
     serviceProviderService.hydrateServiceProviders(hydrated.oidc?.serviceProviders || []);
     flowService.hydrateFlows(hydrated.oidc?.flows || [], hydrated.oidc?.flowSteps || []);
     samlServiceProviderService.hydrateSamlServiceProviders(hydrated.saml?.serviceProviders || []);
@@ -815,6 +952,228 @@ function parseBody(req, rawBody) {
   return {};
 }
 
+function pickSamlDiagnosticHeaders(headers = {}) {
+  const allowed = [
+    "accept",
+    "content-type",
+    "origin",
+    "referer",
+    "user-agent",
+    "host",
+    "x-forwarded-host",
+    "x-forwarded-proto"
+  ];
+  const result = {};
+  for (const name of allowed) {
+    const value = headers[name];
+    if (value) {
+      result[name] = String(value);
+    }
+  }
+  return result;
+}
+
+function samlParamPresence(searchParams, name) {
+  const value = searchParams.get(name) || "";
+  return value ? summarizeSensitiveValue(value) : { present: false };
+}
+
+function compareDiagnostic(actual, expected) {
+  if (!actual) return "missing";
+  if (!expected) return "not checked";
+  return actual === expected ? "match" : "mismatch";
+}
+
+function buildSamlAuthnRequestRaw({ authnRequestXml, requestId, issueInstant, idpMetadata, sp, acsUrl, samlRequestParam, relayState }) {
+  return {
+    raw_type: "Prepared SAML AuthnRequest",
+    is_real_http_exchange: false,
+    source: "local generation before browser redirect",
+    timestamp: new Date().toISOString(),
+    binding: idpMetadata.ssoBinding === "HTTP-Redirect" ? "HTTP-Redirect" : "not implemented",
+    metadata_selected_binding: idpMetadata.ssoBinding || "not found",
+    request_id: requestId,
+    sp_entity_id: sp.spEntityId,
+    acs_url: acsUrl,
+    destination_idp: idpMetadata.ssoUrl,
+    issue_instant: issueInstant,
+    name_id_format: sp.nameIdFormat || "(unspecified)",
+    expected_response_protocol_binding: "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+    xml_redacted: redactSamlXml(authnRequestXml),
+    xml_size_bytes: Buffer.byteLength(authnRequestXml || "", "utf8"),
+    xml_sha256_12: shortHash(authnRequestXml),
+    encoded_saml_request: {
+      ...summarizeEncodedSamlParam(samlRequestParam),
+      encoding: samlRequestParam ? "deflate+base64" : "not encoded"
+    },
+    relay_state: summarizeRelayState(relayState),
+    signature: {
+      authn_request_signature: "not implemented",
+      sig_alg_param: "missing",
+      signature_param: "missing"
+    }
+  };
+}
+
+function buildSamlRedirectRaw({ authorizationUrl, idpMetadata, samlRequestParam, relayState }) {
+  const searchParams = authorizationUrl ? new URL(authorizationUrl).searchParams : new URLSearchParams();
+  return {
+    raw_type: "Prepared browser redirect",
+    is_real_http_exchange: false,
+    source: "synthetic local 302 response prepared by this app",
+    timestamp: new Date().toISOString(),
+    method: "GET",
+    local_status: 302,
+    binding: "HTTP-Redirect",
+    sso_url: idpMetadata.ssoUrl,
+    redirect_url_redacted: authorizationUrl ? redactSamlRedirectUrl(authorizationUrl) : "",
+    query_params: {
+      SAMLRequest: samlParamPresence(searchParams, "SAMLRequest"),
+      RelayState: searchParams.get("RelayState") ? summarizeRelayState(searchParams.get("RelayState")) : { present: "missing" },
+      SigAlg: samlParamPresence(searchParams, "SigAlg"),
+      Signature: samlParamPresence(searchParams, "Signature")
+    },
+    note: "Prepared local browser redirect, not an IdP response."
+  };
+}
+
+function buildSamlSyntheticResponseRaw({ rawType = "Synthetic local response", status = 302, note = "" } = {}) {
+  return {
+    raw_type: rawType,
+    is_real_http_exchange: false,
+    timestamp: new Date().toISOString(),
+    local_status: status,
+    note
+  };
+}
+
+function buildUnsupportedSamlBindingRaw(idpMetadata) {
+  return {
+    raw_type: "Not implemented",
+    is_real_http_exchange: false,
+    source: "metadata binding selection",
+    timestamp: new Date().toISOString(),
+    selected_metadata_binding: idpMetadata.ssoBinding || "not found",
+    supported_request_binding: "HTTP-Redirect",
+    diagnostic_warning: "HTTP-POST AuthnRequest binding not implemented",
+    action: "Flow stopped before building an incoherent Redirect URL."
+  };
+}
+
+function buildSamlAcsRequestRaw({ req, url, body, samlResponseParam, relayState }) {
+  return {
+    raw_type: "Reconstructed inbound ACS request",
+    is_real_http_exchange: true,
+    source: "parsed inbound HTTP request with sensitive fields summarized",
+    timestamp: new Date().toISOString(),
+    method: req.method || "POST",
+    path: url.pathname,
+    content_type: req.headers["content-type"] || "",
+    headers: pickSamlDiagnosticHeaders(req.headers),
+    body_fields: {
+      SAMLResponse: summarizeEncodedSamlParam(samlResponseParam || body.SAMLResponse || ""),
+      RelayState: relayState ? summarizeRelayState(relayState) : { present: "missing" }
+    }
+  };
+}
+
+function buildDecodedSamlResponseRaw({ responseXml, samlResponseParam, relayState, path }) {
+  return {
+    raw_type: "Decoded SAMLResponse redacted",
+    is_real_http_exchange: false,
+    source: "SAMLResponse form field from ACS POST",
+    timestamp: new Date().toISOString(),
+    method: "POST",
+    path,
+    base64: summarizeEncodedSamlParam(samlResponseParam),
+    xml: {
+      decoded: Boolean(responseXml),
+      size_bytes: responseXml ? Buffer.byteLength(responseXml, "utf8") : 0,
+      sha256_12: responseXml ? shortHash(responseXml) : "",
+      redacted: responseXml ? redactSamlXml(responseXml) : ""
+    }
+  };
+}
+
+function buildEncodedSamlResponseRaw({ samlResponseParam, relayState, path }) {
+  return {
+    raw_type: "SAMLResponse form field summary",
+    is_real_http_exchange: false,
+    source: "SAMLResponse form field from ACS POST",
+    timestamp: new Date().toISOString(),
+    method: "POST",
+    path,
+    base64: summarizeEncodedSamlParam(samlResponseParam),
+    relay_state: relayState ? summarizeRelayState(relayState) : { present: false }
+  };
+}
+
+function buildSamlDecodeErrorRaw({ samlResponseParam, relayState, path }) {
+  return {
+    raw_type: "Decoded SAMLResponse redacted",
+    is_real_http_exchange: false,
+    source: "SAMLResponse form field from ACS POST",
+    timestamp: new Date().toISOString(),
+    method: "POST",
+    path,
+    decode_status: "error",
+    base64: summarizeEncodedSamlParam(samlResponseParam),
+    xml: {
+      decoded: false
+    },
+    relay_state: relayState ? summarizeRelayState(relayState) : { present: false }
+  };
+}
+
+function buildParsedSamlSummaryRaw({ parsed, diagnostics, attrCount, sigVerification, idpCertFingerprints }) {
+  const statusMessage = sanitizeSamlDiagnosticValue(parsed.statusMessage || "(not extracted)", "status_message");
+  const sv = sigVerification || {};
+  return {
+    raw_type: "Parsed SAMLResponse summary redacted",
+    is_real_http_exchange: false,
+    timestamp: new Date().toISOString(),
+    response: {
+      issuer: parsed.issuer || "(not found)",
+      in_response_to: parsed.inResponseTo || "(not found)",
+      destination: parsed.destination || "(not found)",
+      status_code: parsed.statusCode || "(not found)",
+      status_message: statusMessage,
+      status_detail: parsed.statusDetailPresent ? "present" : "missing"
+    },
+    assertion: {
+      present: parsed.assertionPresent ? "yes" : "no",
+      issuer: parsed.assertionIssuer || "(not extracted)",
+      subject_present: parsed.subjectPresent ? "yes" : "no",
+      name_id_present: parsed.nameIdPresent ? "yes" : "no",
+      name_id_preview: parsed.nameIdPreview || "(not present)",
+      name_id_hash: parsed.nameIdHash || "",
+      name_id_format: parsed.nameIdFormat || "(not present)",
+      attributes_count: attrCount,
+      attribute_names: parsed.attributeNames || [],
+      attributes_redacted: parsed.attributes || {},
+      conditions_present: parsed.conditionsPresent ? "yes" : "no",
+      audience_restriction_present: parsed.audienceRestrictionPresent ? "yes" : "no",
+      audience: parsed.audience || "(not extracted)",
+      subject_confirmation_present: parsed.subjectConfirmationPresent ? "yes" : "no",
+      recipient: parsed.recipient || "(not extracted)",
+      not_before: parsed.notBefore || "(not extracted)",
+      not_on_or_after: parsed.notOnOrAfter || "(not extracted)"
+    },
+    signature: {
+      response_signature: sv.response_signature_present || "not extracted",
+      response_verification: sv.response_signature_verification || "not checked",
+      assertion_signature: sv.assertion_signature_present || "not extracted",
+      assertion_verification: sv.assertion_signature_verification || "not checked",
+      verification_result: sv.signature_verification_result || "not checked",
+      idp_certificates_used: idpCertFingerprints?.length || 0,
+      ...(idpCertFingerprints?.length > 0 ? { idp_cert_fingerprints: idpCertFingerprints } : {}),
+      ...(sv.response_verification_error ? { response_error: sv.response_verification_error } : {}),
+      ...(sv.assertion_verification_error ? { assertion_error: sv.assertion_verification_error } : {})
+    },
+    diagnostic_comparisons: diagnostics
+  };
+}
+
 const SECURITY_HEADERS = {
   "x-content-type-options": "nosniff",
   "x-frame-options": "DENY",
@@ -911,37 +1270,37 @@ function currentPath(req) {
 }
 
 function matchServiceProviderEditPath(pathname) {
-  const match = pathname.match(/^\/service-providers\/([^/]+)\/edit$/);
+  const match = pathname.match(/^\/oidc\/service-providers\/([^/]+)\/edit$/);
   return match ? decodeURIComponent(match[1]) : null;
 }
 
 function matchServiceProviderUpdatePath(pathname) {
-  const match = pathname.match(/^\/service-providers\/([^/]+)$/);
+  const match = pathname.match(/^\/oidc\/service-providers\/([^/]+)$/);
   return match ? decodeURIComponent(match[1]) : null;
 }
 
 function matchServiceProviderDeletePath(pathname) {
-  const match = pathname.match(/^\/service-providers\/([^/]+)\/delete$/);
+  const match = pathname.match(/^\/oidc\/service-providers\/([^/]+)\/delete$/);
   return match ? decodeURIComponent(match[1]) : null;
 }
 
 function matchFlowStartPath(pathname) {
-  const match = pathname.match(/^\/flows\/start\/([^/]+)$/);
+  const match = pathname.match(/^\/oidc\/flows\/start\/([^/]+)$/);
   return match ? decodeURIComponent(match[1]) : null;
 }
 
 function matchFlowResultPath(pathname) {
-  const match = pathname.match(/^\/flows\/([^/]+)$/);
+  const match = pathname.match(/^\/oidc\/flows\/([^/]+)$/);
   return match ? decodeURIComponent(match[1]) : null;
 }
 
 function matchFlowDetailsPath(pathname) {
-  const match = pathname.match(/^\/flows\/([^/]+)\/details$/);
+  const match = pathname.match(/^\/oidc\/flows\/([^/]+)\/details$/);
   return match ? decodeURIComponent(match[1]) : null;
 }
 
 function matchFlowRerunPath(pathname) {
-  const match = pathname.match(/^\/flows\/([^/]+)\/rerun$/);
+  const match = pathname.match(/^\/oidc\/flows\/([^/]+)\/rerun$/);
   return match ? decodeURIComponent(match[1]) : null;
 }
 
@@ -1137,7 +1496,7 @@ function ensureHtmlSessionRoute(req) {
 }
 
 function selectedClaims(claims = {}) {
-  const allowed = ["iss", "sub", "aud", "exp", "iat", "email", "name", "groups", "roles"];
+  const allowed = ["iss", "sub", "aud", "exp", "iat"];
   return allowed.reduce((acc, key) => {
     if (claims?.[key] !== undefined) {
       acc[key] = claims[key];
@@ -1148,6 +1507,57 @@ function selectedClaims(claims = {}) {
 
 function tokenReceived(value) {
   return value ? "received" : "missing";
+}
+
+function yesNo(value) {
+  return value ? "yes" : "no";
+}
+
+function epochToIso(value) {
+  const numberValue = Number(value);
+  if (!Number.isFinite(numberValue)) {
+    return "";
+  }
+
+  return new Date(numberValue * 1000).toISOString();
+}
+
+function buildIdTokenDiagnostics(idToken = "", expectedNonce = "") {
+  const decoded = decodeJwt(idToken || "");
+  if (!idToken) {
+    return {
+      id_token_received: "no"
+    };
+  }
+
+  if (!decoded.isJwt) {
+    return {
+      id_token_received: "yes",
+      format: "not JWT",
+      decode_error: decoded.error || "JWT could not be decoded.",
+      nonce_validation: "not implemented",
+      signature_validation: "not implemented"
+    };
+  }
+
+  const nonceClaim = decoded.payload?.nonce || "";
+  const nonceValidation = nonceClaim && expectedNonce
+    ? (nonceClaim === expectedNonce ? "valid" : "failed")
+    : "not implemented";
+
+  return {
+    id_token_received: "yes",
+    jwt_header_alg: decoded.header?.alg || "",
+    jwt_header_kid: decoded.header?.kid || "",
+    issuer: decoded.payload?.iss || "",
+    audience: Array.isArray(decoded.payload?.aud) ? decoded.payload.aud.join(", ") : decoded.payload?.aud || "",
+    subject: decoded.payload?.sub || "",
+    expiration: epochToIso(decoded.payload?.exp),
+    issued_at: epochToIso(decoded.payload?.iat),
+    nonce_claim_present: yesNo(nonceClaim),
+    nonce_validation: nonceValidation,
+    signature_validation: "not implemented"
+  };
 }
 
 function flowStatusLabel(status = "running") {
@@ -1212,6 +1622,107 @@ function samlFlowDetailSummary(flow) {
   };
 }
 
+function isLegacySamlPlaceholder(value = "") {
+  return /\[(AuthnRequest|SAMLResponse) XML — redacted by default\]/.test(String(value || ""));
+}
+
+function redactSamlScalarForUi(key = "", value = "") {
+  const text = String(value ?? "");
+  const normalizedKey = String(key || "").toLowerCase();
+  const isNameIdValue =
+    (normalizedKey === "name_id" || normalizedKey === "nameid" || normalizedKey.endsWith("_name_id")) &&
+    !normalizedKey.includes("format") &&
+    !normalizedKey.includes("hash") &&
+    !normalizedKey.includes("preview") &&
+    !normalizedKey.includes("present") &&
+    !normalizedKey.includes("masked");
+
+  if (isNameIdValue && text) {
+    return {
+      present: "yes",
+      preview: maskSamlValue(text),
+      sha256_12: shortHash(text)
+    };
+  }
+
+  if (isLegacySamlPlaceholder(text)) {
+    return "[legacy placeholder: raw XML was not persisted]";
+  }
+
+  if (normalizedKey.includes("xml") && text.includes("<")) {
+    return redactSamlXml(text);
+  }
+
+  if (/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i.test(text)) {
+    return text.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, (match) => `${maskSamlValue(match)} [sha256:${shortHash(match)}]`);
+  }
+
+  return value;
+}
+
+function sanitizeLegacySamlAttributes(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return sanitizeSamlDiagnosticValue(value, "attribute_value");
+  }
+
+  return Object.fromEntries(
+    Object.entries(value).map(([attributeName, attributeValue]) => {
+      const values = Array.isArray(attributeValue) ? attributeValue : [attributeValue];
+      return [
+        attributeName,
+        {
+          values_count: values.length,
+          values: values.map((entry) => ({
+            present: entry !== null && entry !== undefined && entry !== "",
+            sha256_12: entry ? shortHash(entry) : "",
+            redacted: "[redacted]"
+          }))
+        }
+      ];
+    })
+  );
+}
+
+function sanitizeSamlDiagnosticValue(value, key = "") {
+  const normalizedKey = String(key || "").toLowerCase();
+
+  if (value === null || value === undefined) {
+    return value;
+  }
+
+  if (normalizedKey === "attributes") {
+    return sanitizeLegacySamlAttributes(value);
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => sanitizeSamlDiagnosticValue(entry, key));
+  }
+
+  if (typeof value === "object") {
+    if (Object.keys(value).length === 1 && typeof value.xml === "string" && isLegacySamlPlaceholder(value.xml)) {
+      return {
+        raw_type: "Legacy placeholder",
+        is_real_http_exchange: false,
+        note: "This flow was recorded before structured SAML raw diagnostics were persisted.",
+        xml: "[not persisted]"
+      };
+    }
+
+    return Object.fromEntries(
+      Object.entries(value).map(([entryKey, entryValue]) => [
+        entryKey,
+        sanitizeSamlDiagnosticValue(entryValue, entryKey)
+      ])
+    );
+  }
+
+  if (typeof value === "string") {
+    return redactSamlScalarForUi(key, value);
+  }
+
+  return value;
+}
+
 function samlStepSummary(stepName, step) {
   return {
     stepName,
@@ -1220,11 +1731,11 @@ function samlStepSummary(stepName, step) {
     httpMethod: step?.httpMethod || "",
     endpoint: step?.endpoint || "",
     httpStatus: step?.httpStatus ?? null,
-    requestData: step?.requestData || null,
-    responseData: step?.responseData || null,
-    rawRequestData: step?.rawRequestData || null,
-    rawResponseData: step?.rawResponseData || null,
-    errorData: step?.errorData || null,
+    requestData: sanitizeSamlDiagnosticValue(step?.requestData || null),
+    responseData: sanitizeSamlDiagnosticValue(step?.responseData || null),
+    rawRequestData: sanitizeSamlDiagnosticValue(step?.rawRequestData || null),
+    rawResponseData: sanitizeSamlDiagnosticValue(step?.rawResponseData || null),
+    errorData: sanitizeSamlDiagnosticValue(step?.errorData || null),
     createdAt: step?.createdAt || null,
     completedAt: step?.completedAt || null
   };
@@ -1281,7 +1792,7 @@ function flowSummary(flow) {
   return {
     id: flow.id,
     protocol: "OIDC",
-    href: `/flows/${flow.id}`,
+    href: `/oidc/flows/${flow.id}`,
     serviceProviderId: flow.serviceProviderId,
     status: flow.status,
     statusBadge: flowStatusLabel(flow.status),
@@ -1294,7 +1805,8 @@ function flowSummary(flow) {
     serviceProviderName: flow.runtime?.serviceProviderName || "",
     clientId: flow.runtime?.clientId || "",
     environment: flow.runtime?.environment || "",
-    environmentLabel: flow.runtime?.environmentLabel || environmentLabel(flow.runtime?.environment)
+    environmentLabel: flow.runtime?.environmentLabel || environmentLabel(flow.runtime?.environment),
+    runtime: flow.runtime || null
   };
 }
 
@@ -1319,6 +1831,17 @@ function samlFlowSummary(flow) {
 }
 
 function flowStepSummary(stepName, step) {
+  const rawRequestData = step?.rawRequestData ? sanitizeRawRequest(step.rawRequestData) : null;
+  const rawResponseData = step?.rawResponseData
+    ? sanitizeRawResponse(step.rawResponseData, { bodyMode: stepName === "userinfo" ? "userinfo" : "default" })
+    : null;
+  const responseData = step?.responseData?.authorization_url_full
+    ? {
+        ...step.responseData,
+        authorization_url_full: redactDiagnosticUrl(step.responseData.authorization_url_full)
+      }
+    : step?.responseData || null;
+
   return {
     stepName,
     status: step?.status || "pending",
@@ -1327,12 +1850,71 @@ function flowStepSummary(stepName, step) {
     endpoint: step?.endpoint || "",
     httpStatus: step?.httpStatus ?? null,
     requestData: step?.requestData || null,
-    responseData: step?.responseData || null,
-    rawRequestData: step?.rawRequestData || null,
-    rawResponseData: step?.rawResponseData || null,
+    responseData,
+    rawRequestData,
+    rawResponseData,
+    rawRequestNature: step?.rawRequestNature || "",
+    rawResponseNature: step?.rawResponseNature || "",
     errorData: step?.errorData || null,
     createdAt: step?.createdAt || null,
     completedAt: step?.completedAt || null
+  };
+}
+
+function listValue(values = []) {
+  return Array.isArray(values) && values.length > 0 ? values.join(", ") : "";
+}
+
+function tokenAuthMethodForServiceProviders(serviceProviders = [], environmentKey = "", fallback = "") {
+  const matching = serviceProviders.filter((serviceProvider) => serviceProvider.environment === environmentKey);
+  const source = matching.length > 0 ? matching : serviceProviders;
+  const methods = new Set(
+    source
+      .map((serviceProvider) => (serviceProvider.clientType === "confidential" ? "client_secret_basic" : "none"))
+      .filter(Boolean)
+  );
+
+  if (methods.size === 1) {
+    return Array.from(methods)[0];
+  }
+
+  if (methods.size > 1) {
+    return "Depends on Service Provider";
+  }
+
+  return fallback || "";
+}
+
+function buildOidcPageConfiguration() {
+  return {
+    redirectUri: sanitizeProviderConfig(providerConfig).redirectUri,
+    environments: listEzAccessEnvironments().map((environment) => {
+      const envConfig = oidcEnvironmentConfig[environment.key] || {};
+      const metadataAvailable = Boolean(
+        envConfig.issuer || envConfig.authorizationEndpoint || envConfig.tokenEndpoint || envConfig.jwksUri
+      );
+
+      return {
+        key: environment.key,
+        label: environmentLabel(environment.key) || environment.label || environment.key,
+        discoveryUrl: envConfig.discoveryUrl || environment.discoveryUrl || "",
+        discoveredAt: envConfig.discoveredAt || null,
+        metadataAvailable,
+        issuer: envConfig.issuer || "",
+        authorizationEndpoint: envConfig.authorizationEndpoint || "",
+        tokenEndpoint: envConfig.tokenEndpoint || "",
+        userInfoEndpoint: envConfig.userInfoEndpoint || "",
+        jwksUri: envConfig.jwksUri || "",
+        scopesSupported: Array.isArray(envConfig.scopesSupported) ? envConfig.scopesSupported : [],
+        responseTypesSupported: Array.isArray(envConfig.responseTypesSupported) ? envConfig.responseTypesSupported : [],
+        tokenEndpointAuthMethodsSupported: Array.isArray(envConfig.tokenEndpointAuthMethodsSupported) ? envConfig.tokenEndpointAuthMethodsSupported : [],
+        pkceEnabled: "yes",
+        pkceMethod: "S256",
+        responseType: "code",
+        grantType: "authorization_code",
+        userInfoEnabled: "yes"
+      };
+    })
   };
 }
 
@@ -1368,13 +1950,26 @@ function buildFlowViewModel(session, flowId, url) {
 }
 
 function attachFlowsToServiceProviders(entries) {
+  return entries.map((serviceProvider) => {
+    const lastFlow = flowSummary(flowService.getLastFlowForServiceProvider(serviceProvider.id));
+
+    return {
+      ...serviceProvider,
+      lastFlow
+    };
+  });
+}
+
+function attachSamlFlowsToServiceProviders(entries) {
   return entries.map((serviceProvider) => ({
     ...serviceProvider,
-    lastFlow: flowSummary(flowService.getLastFlowForServiceProvider(serviceProvider.id))
+    lastFlow: samlFlowSummary(samlFlowService.getLastFlowForServiceProvider(serviceProvider.id))
   }));
 }
 
 function buildAuthorizeStep({ flow, runConfig, prepared }) {
+  const rawRequestData = sanitizeRawRequest(prepared.request);
+
   return {
     stepName: "authorize",
     status: "success",
@@ -1383,23 +1978,25 @@ function buildAuthorizeStep({ flow, runConfig, prepared }) {
     httpStatus: 302,
     requestData: {
       method: "GET",
+      http_mode: "browser redirect",
       endpoint: runConfig.config.authorizationEndpoint,
       environment: flow.runtime?.environmentLabel || "",
       client_id: runConfig.config.clientId,
       redirect_uri: runConfig.config.redirectUri,
-      scopes: runConfig.config.scopes,
+      scope: runConfig.config.scopes,
       response_type: runConfig.config.responseType,
-      state: "present",
-      nonce: prepared.runtime.nonce ? "present" : "missing",
-      pkce: prepared.runtime.codeChallenge ? prepared.config.codeChallengeMethod || "S256" : "disabled"
+      state: prepared.runtime.state ? "generated + sent" : "missing",
+      nonce: prepared.runtime.nonce ? "generated + sent" : "missing",
+      pkce: prepared.runtime.codeChallenge ? `${prepared.config.codeChallengeMethod || "S256"} challenge sent` : "disabled",
+      code_challenge: prepared.runtime.codeChallenge ? "sent" : "missing"
     },
     responseData: {
       redirect_to: "Ez-Access",
-      authorization_url: "present",
-      authorization_url_full: prepared.request.url,
+      authorization_url: "prepared + redacted in raw",
+      authorization_url_redacted: rawRequestData?.url || "",
       flow_id: flow.id
     },
-    rawRequestData: sanitizeRawRequest(prepared.request),
+    rawRequestData,
     rawResponseData: sanitizeRawResponse({
       status: 302,
       ok: true,
@@ -1411,8 +2008,104 @@ function buildAuthorizeStep({ flow, runConfig, prepared }) {
         authorization_url: "present"
       }
     }),
+    rawRequestNature: "Prepared browser redirect",
+    rawResponseNature: "Synthetic local response",
     completedAt: new Date().toISOString()
   };
+}
+
+function validateDiscoveryUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== "string") {
+    return "Discovery URL is required.";
+  }
+
+  let parsed;
+  try {
+    parsed = new URL(rawUrl.trim());
+  } catch {
+    return "Discovery URL is not a valid URL.";
+  }
+
+  if (parsed.protocol === "https:") {
+    return null;
+  }
+
+  if (parsed.protocol === "http:") {
+    const host = parsed.hostname.toLowerCase();
+    if (NODE_ENV === "development" && (host === "localhost" || host === "127.0.0.1")) {
+      return null;
+    }
+    return "Discovery URL must use HTTPS.";
+  }
+
+  return `Unsupported protocol: ${parsed.protocol} Only https:// is accepted.`;
+}
+
+async function importDiscoveryMetadata(discoveryUrl) {
+  const MAX_RESPONSE_BYTES = 256 * 1024;
+  const TIMEOUT_MS = 6000;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+  try {
+    const response = await fetch(discoveryUrl, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      signal: controller.signal,
+      redirect: "follow"
+    });
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      return { ok: false, error: `Discovery endpoint returned HTTP ${response.status}.` };
+    }
+
+    const contentLength = Number(response.headers.get("content-length") || 0);
+    if (contentLength > MAX_RESPONSE_BYTES) {
+      return { ok: false, error: "Discovery response is too large." };
+    }
+
+    const text = await response.text();
+    if (text.length > MAX_RESPONSE_BYTES) {
+      return { ok: false, error: "Discovery response is too large." };
+    }
+
+    let doc;
+    try {
+      doc = JSON.parse(text);
+    } catch {
+      return { ok: false, error: "Discovery endpoint did not return valid JSON." };
+    }
+
+    if (!doc || typeof doc !== "object" || Array.isArray(doc)) {
+      return { ok: false, error: "Discovery document has an unexpected structure." };
+    }
+
+    const metadata = {
+      issuer: typeof doc.issuer === "string" ? doc.issuer : "",
+      authorizationEndpoint: typeof doc.authorization_endpoint === "string" ? doc.authorization_endpoint : "",
+      tokenEndpoint: typeof doc.token_endpoint === "string" ? doc.token_endpoint : "",
+      userInfoEndpoint: typeof doc.userinfo_endpoint === "string" ? doc.userinfo_endpoint : "",
+      jwksUri: typeof doc.jwks_uri === "string" ? doc.jwks_uri : "",
+      scopesSupported: Array.isArray(doc.scopes_supported) ? doc.scopes_supported.filter((s) => typeof s === "string") : [],
+      responseTypesSupported: Array.isArray(doc.response_types_supported) ? doc.response_types_supported.filter((s) => typeof s === "string") : [],
+      tokenEndpointAuthMethodsSupported: Array.isArray(doc.token_endpoint_auth_methods_supported) ? doc.token_endpoint_auth_methods_supported.filter((s) => typeof s === "string") : []
+    };
+
+    if (!metadata.issuer && !metadata.authorizationEndpoint && !metadata.tokenEndpoint) {
+      return { ok: false, error: "Discovery document is missing required fields (issuer, authorization_endpoint, token_endpoint)." };
+    }
+
+    return { ok: true, metadata };
+  } catch (error) {
+    clearTimeout(timeoutId);
+
+    if (error.name === "AbortError") {
+      return { ok: false, error: "Discovery request timed out." };
+    }
+
+    return { ok: false, error: "Could not reach the Discovery endpoint." };
+  }
 }
 
 async function resolveEzAccessProviderConfig(environmentKey) {
@@ -1459,30 +2152,36 @@ function buildCallbackStep({ flow, req, params, stateCheck }) {
     status: success ? "success" : "error",
     httpMethod: req.method,
     endpoint: "/oidc/callback",
-    httpStatus: 200,
+    httpStatus: 302,
     requestData: {
       redirect_uri: flow.runtime?.redirectUri || "",
+      callback_method: req.method,
+      callback_path: "/oidc/callback",
       expected_parameters: "code, state",
       expected_state: "present"
     },
     responseData: {
-      code: params.code ? "present" : "missing",
-      state: stateCheck === "match" ? "valid" : stateCheck,
+      authorization_code: params.code ? "received" : "missing",
+      state: params.state ? "received" : "missing",
+      state_validation: stateCheck === "match" ? "valid" : stateCheck,
+      provider_error: params.error ? "received" : "none",
       error: params.error || "",
       error_description: params.error_description || ""
     },
     rawRequestData: sanitizeDiagnosticData({
       method: req.method,
       url: "/oidc/callback",
-      params
+      params: redactProtocolParams(params)
     }),
     rawResponseData: sanitizeDiagnosticData({
-      status: 200,
-      state: stateCheck === "match" ? "valid" : stateCheck,
-      code: params.code ? "present" : "missing",
+      status: 302,
+      state_validation: stateCheck === "match" ? "valid" : stateCheck,
+      authorization_code: params.code ? "received" : "missing",
       error: params.error || "",
       error_description: params.error_description || ""
     }),
+    rawRequestNature: "Reconstructed inbound request",
+    rawResponseNature: "Synthetic local response",
     errorData: success
       ? null
       : {
@@ -1495,11 +2194,13 @@ function buildCallbackStep({ flow, req, params, stateCheck }) {
   };
 }
 
-function buildTokenStep({ requestSnapshot, responseSnapshot }) {
+function buildTokenStep({ requestSnapshot, responseSnapshot, flow = null }) {
   const parsed = responseSnapshot.parsed || {};
   const idTokenClaims = decodeJwt(parsed.id_token || "");
   const accessTokenClaims = decodeJwt(parsed.access_token || "");
   const ok = Boolean(responseSnapshot.ok && (parsed.access_token || parsed.id_token));
+  const authHeader = requestSnapshot.headers?.authorization || "";
+  const clientAuthenticationMethod = /^basic\s+/i.test(authHeader) ? "client_secret_basic" : "none";
 
   return {
     stepName: "token",
@@ -1511,11 +2212,12 @@ function buildTokenStep({ requestSnapshot, responseSnapshot }) {
       method: "POST",
       endpoint: requestSnapshot.url,
       grant_type: "authorization_code",
+      client_authentication_method: clientAuthenticationMethod,
       client_id: requestSnapshot.params?.client_id || "sent via Authorization header",
-      client_secret: "********",
+      client_secret_used: clientAuthenticationMethod === "client_secret_basic" ? "yes, masked" : "no",
       redirect_uri: requestSnapshot.params?.redirect_uri || "",
-      code: requestSnapshot.params?.code ? "present" : "missing",
-      code_verifier: requestSnapshot.params?.code_verifier ? "present" : "missing"
+      authorization_code: requestSnapshot.params?.code ? "received + sent, masked" : "missing",
+      code_verifier: requestSnapshot.params?.code_verifier ? "sent" : "not sent"
     },
     responseData: {
       http_status: responseSnapshot.status || 0,
@@ -1524,13 +2226,16 @@ function buildTokenStep({ requestSnapshot, responseSnapshot }) {
       refresh_token: tokenReceived(parsed.refresh_token),
       expires_in: parsed.expires_in || "",
       token_type: parsed.token_type || "",
-      error: parsed.error || responseSnapshot.error || "",
+      token_error: parsed.error || responseSnapshot.error || "none",
       error_description: parsed.error_description || "",
       id_token_claims: idTokenClaims.isJwt ? selectedClaims(idTokenClaims.payload) : {},
-      access_token_claims: accessTokenClaims.isJwt ? selectedClaims(accessTokenClaims.payload) : {}
+      access_token_claims: accessTokenClaims.isJwt ? selectedClaims(accessTokenClaims.payload) : {},
+      id_token_diagnostics: buildIdTokenDiagnostics(parsed.id_token || "", flow?.runtime?.expectedNonce || "")
     },
     rawRequestData: sanitizeRawRequest(requestSnapshot),
     rawResponseData: sanitizeRawResponse(responseSnapshot),
+    rawRequestNature: "Real outbound HTTP request",
+    rawResponseNature: "Real inbound HTTP response",
     errorData: ok
       ? null
       : {
@@ -1553,13 +2258,17 @@ function buildUserInfoStep({ requestSnapshot = null, responseSnapshot = null, sk
       requestData: {
         method: "GET",
         endpoint: requestSnapshot?.url || "",
+        called: "no",
         Authorization: "Bearer ********"
       },
       responseData: {
+        called: "no",
         skipped_reason: skippedReason
       },
       rawRequestData: sanitizeRawRequest(requestSnapshot),
       rawResponseData: null,
+      rawRequestNature: requestSnapshot ? "Real outbound HTTP request" : "Skipped",
+      rawResponseNature: "Skipped",
       errorData: null,
       completedAt: new Date().toISOString()
     };
@@ -1576,16 +2285,23 @@ function buildUserInfoStep({ requestSnapshot = null, responseSnapshot = null, sk
     requestData: {
       method: "GET",
       endpoint: requestSnapshot.url,
+      called: "yes",
       Authorization: "Bearer ********"
     },
     responseData: {
+      called: "yes",
       http_status: responseSnapshot.status || 0,
-      ...selectedClaims(parsed),
-      error: parsed.error || responseSnapshot.error || "",
+      subject: parsed.sub || "",
+      email_present: parsed.email ? "yes" : "no",
+      name_present: parsed.name ? "yes" : "no",
+      raw_claims_available: Object.keys(parsed || {}).length > 0 ? "yes" : "no",
+      error: parsed.error || responseSnapshot.error || "none",
       error_description: parsed.error_description || ""
     },
     rawRequestData: sanitizeRawRequest(requestSnapshot),
-    rawResponseData: sanitizeRawResponse(responseSnapshot),
+    rawResponseData: sanitizeRawResponse(responseSnapshot, { bodyMode: "userinfo" }),
+    rawRequestNature: "Real outbound HTTP request",
+    rawResponseNature: "Real inbound HTTP response",
     errorData: responseSnapshot.ok
       ? null
       : {
@@ -1642,6 +2358,8 @@ async function startNewUiFlow(session, serviceProviderId) {
       responseData: null,
       rawRequestData: null,
       rawResponseData: null,
+      rawRequestNature: "Skipped",
+      rawResponseNature: "Skipped",
       errorData: {
         errorCode: "service_provider_incomplete",
         errorDescription: "Service Provider is incomplete. Verify name, Client ID, Client Secret and scopes."
@@ -1680,7 +2398,10 @@ async function startNewUiFlow(session, serviceProviderId) {
         tokenEndpoint: runConfig.provider.tokenEndpoint,
         userInfoEndpoint: runConfig.provider.userInfoEndpoint,
         jwksUri: runConfig.provider.jwksUri,
-        redirectUri: runConfig.provider.redirectUri
+        redirectUri: runConfig.provider.redirectUri,
+        scopesSupported: runConfig.provider.scopesSupported || [],
+        responseTypesSupported: runConfig.provider.responseTypesSupported || [],
+        tokenEndpointAuthMethodsSupported: runConfig.provider.tokenEndpointAuthMethodsSupported || []
       },
       authorizationEndpoint: runConfig.config.authorizationEndpoint,
       tokenEndpoint: runConfig.config.tokenEndpoint,
@@ -1713,6 +2434,8 @@ async function startNewUiFlow(session, serviceProviderId) {
       responseData: null,
       rawRequestData: null,
       rawResponseData: null,
+      rawRequestNature: "Skipped",
+      rawResponseNature: "Skipped",
       errorData: {
         errorCode: "authorize_request_failed",
         errorDescription: error.message
@@ -1754,7 +2477,7 @@ async function processNewUiCallback({ req, flow, params }) {
       codeVerifier: flow.runtime?.codeVerifier || ""
     });
     const responseSnapshot = await executeHttp(requestSnapshot);
-    const tokenStep = buildTokenStep({ requestSnapshot, responseSnapshot });
+    const tokenStep = buildTokenStep({ requestSnapshot, responseSnapshot, flow });
     flowService.addFlowStep(flow.id, tokenStep);
 
     if (tokenStep.status === "error") {
@@ -1817,6 +2540,8 @@ async function processNewUiCallback({ req, flow, params }) {
       rawResponseData: {
         error: error.message
       },
+      rawRequestNature: "Skipped",
+      rawResponseNature: "Synthetic local response",
       errorData: {
         errorCode: "token_exchange_failed",
         errorDescription: error.message
@@ -1833,13 +2558,15 @@ function buildPageModel(session, activeTab, url) {
   const editingServiceProvider = sanitizeServiceProviderForUi(getServiceProvider(editServiceProviderId));
   const selectedServiceProvider = sanitizeServiceProviderForUi(getServiceProvider(session.selectedServiceProviderId));
   const sanitizedProviderConfig = sanitizeProviderConfig(providerConfig);
+  const sanitizedServiceProviders = serviceProviderService.listServiceProviders().map(sanitizeServiceProviderForUi);
 
   return {
     session,
     activeTab,
     flash: consumeFlash(session),
     providerConfig: sanitizedProviderConfig,
-    serviceProviders: attachFlowsToServiceProviders(serviceProviderService.listServiceProviders().map(sanitizeServiceProviderForUi)),
+    oidcPageConfiguration: buildOidcPageConfiguration(),
+    serviceProviders: attachFlowsToServiceProviders(sanitizedServiceProviders),
     recentFlows: flowService.listRecentFlows(5).map(flowSummary),
     samlRecentFlows: samlFlowService.listRecentFlows(5).map(samlFlowSummary),
     ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi),
@@ -1879,21 +2606,21 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.method === "GET" && url.pathname === "/service-providers") {
+    if (req.method === "GET" && url.pathname === "/oidc/service-providers") {
       const session = getOrCreateSession(req, res);
       const model = buildPageModel(session, "service-providers", url);
       sendHtml(res, renderServiceProvidersPage(model));
       return;
     }
 
-    if (req.method === "GET" && url.pathname === "/service-providers/new") {
+    if (req.method === "GET" && url.pathname === "/oidc/service-providers/new") {
       const session = getOrCreateSession(req, res);
       const model = buildPageModel(session, "service-providers", url);
       sendHtml(res, renderServiceProviderNewPage(model));
       return;
     }
 
-    if (req.method === "POST" && url.pathname === "/service-providers") {
+    if (req.method === "POST" && url.pathname === "/oidc/service-providers") {
       const session = getOrCreateSession(req, res);
       if (!checkRateLimit(session.id, "sp-create", 20, 5 * 60 * 1000)) {
         sendJson(res, 429, { error: "Too many requests. Please wait before retrying." });
@@ -1924,7 +2651,7 @@ const server = http.createServer(async (req, res) => {
           ? `Service Provider created. ${result.validation.warnings.join(" ")}`
           : "Service Provider created."
       );
-      redirect(res, "/service-providers");
+      redirect(res, "/oidc/service-providers");
       return;
     }
 
@@ -1935,7 +2662,7 @@ const server = http.createServer(async (req, res) => {
 
       if (!serviceProvider) {
         setFlash(session, "warn", "Service Provider not found.");
-        redirect(res, "/service-providers");
+        redirect(res, "/oidc/service-providers");
         return;
       }
 
@@ -1953,7 +2680,7 @@ const server = http.createServer(async (req, res) => {
 
       if (!removeServiceProvider(deleteServiceProviderId)) {
         setFlash(session, "warn", "Service Provider not found.");
-        redirect(res, "/service-providers");
+        redirect(res, "/oidc/service-providers");
         return;
       }
 
@@ -1961,7 +2688,7 @@ const server = http.createServer(async (req, res) => {
         serviceProviderId: deleteServiceProviderId
       });
       setFlash(session, "info", "Service Provider deleted.");
-      redirect(res, "/service-providers");
+      redirect(res, "/oidc/service-providers");
       return;
     }
 
@@ -1974,7 +2701,7 @@ const server = http.createServer(async (req, res) => {
 
       if (result.notFound) {
         setFlash(session, "warn", "Service Provider not found.");
-        redirect(res, "/service-providers");
+        redirect(res, "/oidc/service-providers");
         return;
       }
 
@@ -2007,7 +2734,7 @@ const server = http.createServer(async (req, res) => {
             ? "Service Provider updated. The secret was replaced."
             : "Service Provider updated."
       );
-      redirect(res, "/service-providers");
+      redirect(res, "/oidc/service-providers");
       return;
     }
 
@@ -2022,12 +2749,12 @@ const server = http.createServer(async (req, res) => {
 
       if (result.notFound) {
         setFlash(session, "warn", "Service Provider not found.");
-        redirect(res, "/service-providers");
+        redirect(res, "/oidc/service-providers");
         return;
       }
 
       if (!result.ok) {
-        redirect(res, `/flows/${encodeURIComponent(result.flow.id)}`);
+        redirect(res, `/oidc/flows/${encodeURIComponent(result.flow.id)}`);
         return;
       }
 
@@ -2042,13 +2769,13 @@ const server = http.createServer(async (req, res) => {
 
       if (!flow) {
         setFlash(session, "warn", "Flow not found.");
-        redirect(res, "/service-providers");
+        redirect(res, "/oidc/service-providers");
         return;
       }
 
       const result = await startNewUiFlow(session, flow.serviceProviderId);
       if (!result.ok) {
-        redirect(res, result.flow ? `/flows/${encodeURIComponent(result.flow.id)}` : "/service-providers");
+        redirect(res, result.flow ? `/oidc/flows/${encodeURIComponent(result.flow.id)}` : "/oidc/service-providers");
         return;
       }
 
@@ -2063,7 +2790,7 @@ const server = http.createServer(async (req, res) => {
 
       if (!model) {
         setFlash(session, "warn", "Flow not found.");
-        redirect(res, "/service-providers");
+        redirect(res, "/oidc/service-providers");
         return;
       }
 
@@ -2078,7 +2805,7 @@ const server = http.createServer(async (req, res) => {
 
       if (!model) {
         setFlash(session, "warn", "Flow not found.");
-        redirect(res, "/service-providers");
+        redirect(res, "/oidc/service-providers");
         return;
       }
 
@@ -2086,11 +2813,51 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    const discoveryImportMatch = req.method === "POST" && url.pathname.match(/^\/oidc\/discovery\/import\/(preprod|prod)$/);
+    if (discoveryImportMatch) {
+      const session = getOrCreateSession(req, res);
+      const environmentKey = discoveryImportMatch[1];
+
+      if (!checkRateLimit(session.id, `discovery-import-${environmentKey}`, 10, 60 * 1000)) {
+        sendJson(res, 429, { ok: false, error: "Too many requests. Please wait before retrying." });
+        return;
+      }
+
+      const rawBody = await readBody(req);
+      const body = parseBody(req, rawBody);
+      const rawDiscoveryUrl = String(body?.discoveryUrl || "").trim();
+
+      const urlError = validateDiscoveryUrl(rawDiscoveryUrl);
+      if (urlError) {
+        sendJson(res, 400, { ok: false, error: urlError });
+        return;
+      }
+
+      const result = await importDiscoveryMetadata(rawDiscoveryUrl);
+      if (!result.ok) {
+        sendJson(res, 400, { ok: false, error: result.error });
+        return;
+      }
+
+      oidcEnvironmentConfig[environmentKey] = {
+        discoveryUrl: rawDiscoveryUrl,
+        discoveredAt: new Date().toISOString(),
+        ...result.metadata
+      };
+      schedulePersistState();
+
+      sendJson(res, 200, {
+        ok: true,
+        environment: { key: environmentKey, ...oidcEnvironmentConfig[environmentKey] }
+      });
+      return;
+    }
+
     if (req.method === "GET" && url.pathname === "/saml/service-providers") {
       const session = getOrCreateSession(req, res);
       const flash = consumeFlash(session);
       const model = {
-        serviceProviders: samlServiceProviderService.listSamlServiceProviders().map(sanitizeSamlServiceProviderForUi),
+        serviceProviders: attachSamlFlowsToServiceProviders(samlServiceProviderService.listSamlServiceProviders().map(sanitizeSamlServiceProviderForUi)),
         flash
       };
       sendHtml(res, renderSamlServiceProvidersPage(model));
@@ -2269,17 +3036,6 @@ const server = http.createServer(async (req, res) => {
         nameIdFormat: sp.nameIdFormat || ""
       });
 
-      let samlRequestParam;
-      try {
-        samlRequestParam = encodeAuthnRequestForRedirect(authnRequestXml);
-      } catch (error) {
-        appLog("warn", "saml_flow_start: encode error", { spId: sp.id, error: error.message });
-        setFlash(session, "error", "Failed to encode AuthnRequest.");
-        redirect(res, `/saml/service-providers/${encodeURIComponent(sp.id)}/edit`);
-        return;
-      }
-
-      const authorizationUrl = buildSsoRedirectUrl(idpMetadata.ssoUrl, samlRequestParam, relayState);
       const env = getEzAccessEnvironment(sp.environment || "");
       const envLabel = env?.key === "preprod" ? "Preprod" : env?.key === "prod" ? "Prod" : "";
 
@@ -2291,13 +3047,111 @@ const server = http.createServer(async (req, res) => {
         spEntityId: sp.spEntityId,
         acsUrl,
         nameIdFormat: sp.nameIdFormat || "",
-        authorizationUrl,
+        authorizationUrl: "",
         serviceProviderName: sp.name,
         environment: sp.environment || "",
         environmentLabel: envLabel
       });
 
       const startHttpMethod = req.method || "POST";
+
+      if (idpMetadata.ssoBinding !== "HTTP-Redirect") {
+        const unsupportedBindingRaw = buildUnsupportedSamlBindingRaw(idpMetadata);
+        samlFlowService.addFlowStep(flow.id, {
+          stepName: "authn_request_created",
+          status: "success",
+          httpMethod: startHttpMethod,
+          endpoint: `/saml/flows/start/${sp.id}`,
+          completedAt: new Date().toISOString(),
+          requestData: {
+            request_id: requestId,
+            sp_entity_id: sp.spEntityId,
+            acs_url: acsUrl,
+            destination: idpMetadata.ssoUrl,
+            name_id_format: sp.nameIdFormat || "(unspecified)",
+            issue_instant: issueInstant,
+            idp_entity_id: idpMetadata.entityId || "(not found in metadata)",
+            idp_has_certificate: idpMetadata.hasCertificate ? "yes" : "not found",
+            binding_used_for_request: "not implemented"
+          },
+          responseData: {
+            authn_request: "generated",
+            encoding: "not performed",
+            warning: "HTTP-POST AuthnRequest binding not implemented"
+          },
+          rawRequestData: buildSamlAuthnRequestRaw({
+            authnRequestXml,
+            requestId,
+            issueInstant,
+            idpMetadata,
+            sp,
+            acsUrl,
+            samlRequestParam: "",
+            relayState
+          }),
+          rawResponseData: buildSamlSyntheticResponseRaw({
+            rawType: "Synthetic local response",
+            status: 0,
+            note: "AuthnRequest generated locally; encoding skipped because HTTP-POST AuthnRequest binding is not implemented."
+          })
+        });
+
+        samlFlowService.addFlowStep(flow.id, {
+          stepName: "redirect_to_idp",
+          status: "error",
+          httpMethod: "POST",
+          endpoint: idpMetadata.ssoUrl,
+          httpStatus: null,
+          completedAt: new Date().toISOString(),
+          requestData: {
+            sso_url: idpMetadata.ssoUrl,
+            metadata_binding: idpMetadata.ssoBinding || "not found",
+            binding_used: "not implemented"
+          },
+          responseData: {
+            redirect_to: "not performed",
+            warning: "HTTP-POST AuthnRequest binding not implemented"
+          },
+          rawRequestData: unsupportedBindingRaw,
+          rawResponseData: {
+            ...unsupportedBindingRaw,
+            raw_type: "Synthetic local response",
+            local_http_status: "not emitted"
+          },
+          errorData: {
+            error: "HTTP-POST AuthnRequest binding not implemented"
+          }
+        });
+
+        samlFlowService.completeFlow(flow.id, {
+          status: "failed",
+          failedStep: "redirect_to_idp",
+          errorCode: "saml_authn_request_post_binding_not_implemented",
+          errorDescription: "HTTP-POST AuthnRequest binding not implemented."
+        });
+
+        redirect(res, `/saml/flows/${encodeURIComponent(flow.id)}`);
+        return;
+      }
+
+      let samlRequestParam;
+      try {
+        samlRequestParam = encodeAuthnRequestForRedirect(authnRequestXml);
+      } catch (error) {
+        appLog("warn", "saml_flow_start: encode error", { spId: sp.id, error: error.message });
+        setFlash(session, "error", "Failed to encode AuthnRequest.");
+        redirect(res, `/saml/service-providers/${encodeURIComponent(sp.id)}/edit`);
+        return;
+      }
+
+      const authorizationUrl = buildSsoRedirectUrl(idpMetadata.ssoUrl, samlRequestParam, relayState);
+      samlFlowService.updateFlow(flow.id, {
+        runtime: {
+          ...flow.runtime,
+          authorizationUrl: redactSamlRedirectUrl(authorizationUrl),
+          authorizationUrlNature: "redacted browser redirect URL"
+        }
+      });
 
       samlFlowService.addFlowStep(flow.id, {
         stepName: "authn_request_created",
@@ -2313,14 +3167,34 @@ const server = http.createServer(async (req, res) => {
           name_id_format: sp.nameIdFormat || "(unspecified)",
           issue_instant: issueInstant,
           idp_entity_id: idpMetadata.entityId || "(not found in metadata)",
-          idp_has_certificate: idpMetadata.hasCertificate ? "yes" : "not found"
+          idp_has_certificate: idpMetadata.hasCertificate ? "yes" : "not found",
+          expected_response_protocol_binding: "HTTP-POST",
+          binding_used_for_request: "HTTP-Redirect",
+          saml_request_encoded_size_bytes: Buffer.byteLength(samlRequestParam, "utf8"),
+          saml_request_sha256_12: shortHash(samlRequestParam),
+          relay_state: "present",
+          relay_state_sha256_12: shortHash(relayState)
         },
         responseData: {
           authn_request: "generated",
-          encoding: "HTTP-Redirect (deflate + base64)"
+          encoding: "HTTP-Redirect (deflate + base64)",
+          raw_nature: "Prepared SAML AuthnRequest"
         },
-        rawRequestData: { xml: "[AuthnRequest XML — redacted by default]" },
-        rawResponseData: null
+        rawRequestData: buildSamlAuthnRequestRaw({
+          authnRequestXml,
+          requestId,
+          issueInstant,
+          idpMetadata,
+          sp,
+          acsUrl,
+          samlRequestParam,
+          relayState
+        }),
+        rawResponseData: buildSamlSyntheticResponseRaw({
+          rawType: "Synthetic local response",
+          status: 0,
+          note: "AuthnRequest generated and encoded locally before redirect."
+        })
       });
 
       samlFlowService.addFlowStep(flow.id, {
@@ -2333,15 +3207,26 @@ const server = http.createServer(async (req, res) => {
         requestData: {
           sso_url: idpMetadata.ssoUrl,
           relay_state: "present",
+          relay_state_sha256_12: shortHash(relayState),
           saml_request: "present",
-          binding: idpMetadata.ssoBinding || "HTTP-Redirect"
+          saml_request_encoded_size_bytes: Buffer.byteLength(samlRequestParam, "utf8"),
+          saml_request_sha256_12: shortHash(samlRequestParam),
+          binding: "HTTP-Redirect",
+          http_mode: "browser redirect"
         },
         responseData: {
           redirect_to: "IdP SSO endpoint",
-          awaiting: "SAMLResponse on ACS"
+          redirect_url: "redacted raw available",
+          local_http_status: "302 synthetic/local",
+          awaiting: "SAMLResponse on ACS",
+          raw_nature: "Prepared browser redirect"
         },
-        rawRequestData: null,
-        rawResponseData: null
+        rawRequestData: buildSamlRedirectRaw({ authorizationUrl, idpMetadata, samlRequestParam, relayState }),
+        rawResponseData: buildSamlSyntheticResponseRaw({
+          rawType: "Synthetic local response",
+          status: 302,
+          note: "Local 302 sent by this app to the browser; this is not an IdP response."
+        })
       });
 
       addSessionLog(session, "info", "saml_flow_started", "SAML flow started.", {
@@ -2377,18 +3262,39 @@ const server = http.createServer(async (req, res) => {
         completedAt: new Date().toISOString(),
         requestData: {
           relay_state: relayState ? "present" : "missing",
-          saml_response: samlResponseParam ? "present" : "missing"
+          relay_state_sha256_12: relayState ? shortHash(relayState) : "",
+          saml_response: samlResponseParam ? "present" : "missing",
+          saml_response_size_bytes: samlResponseParam ? Buffer.byteLength(samlResponseParam, "utf8") : 0,
+          saml_response_sha256_12: samlResponseParam ? shortHash(samlResponseParam) : ""
         },
-        responseData: null,
-        rawRequestData: null,
-        rawResponseData: null
+        responseData: {
+          raw_nature: "Reconstructed inbound ACS request"
+        },
+        rawRequestData: buildSamlAcsRequestRaw({ req, url, body, samlResponseParam, relayState }),
+        rawResponseData: buildSamlSyntheticResponseRaw({
+          rawType: "Synthetic local response",
+          status: 302,
+          note: "ACS handled locally and redirected to the flow result page."
+        })
       });
 
       if (!samlResponseParam) {
         samlFlowService.addFlowStep(runningFlow.id, {
           stepName: "saml_response_received",
           status: "error",
+          httpMethod: "POST",
+          endpoint: url.pathname,
           completedAt: new Date().toISOString(),
+          responseData: {
+            decoded: "skipped",
+            raw_nature: "Skipped"
+          },
+          rawRequestData: buildSamlAcsRequestRaw({ req, url, body, samlResponseParam, relayState }),
+          rawResponseData: buildSamlSyntheticResponseRaw({
+            rawType: "Synthetic local response",
+            status: 302,
+            note: "ACS rejected missing SAMLResponse and redirected to the flow result page."
+          }),
           errorData: { error: "SAMLResponse parameter is missing from the ACS POST body." }
         });
         samlFlowService.completeFlow(runningFlow.id, {
@@ -2408,7 +3314,15 @@ const server = http.createServer(async (req, res) => {
         samlFlowService.addFlowStep(runningFlow.id, {
           stepName: "saml_response_received",
           status: "error",
+          httpMethod: "POST",
+          endpoint: url.pathname,
           completedAt: new Date().toISOString(),
+          responseData: {
+            decoded: "error",
+            raw_nature: "Decoded SAMLResponse redacted"
+          },
+          rawRequestData: buildEncodedSamlResponseRaw({ samlResponseParam, relayState, path: url.pathname }),
+          rawResponseData: buildSamlDecodeErrorRaw({ samlResponseParam, relayState, path: url.pathname }),
           errorData: { error: "Failed to base64-decode SAMLResponse." }
         });
         samlFlowService.completeFlow(runningFlow.id, {
@@ -2430,11 +3344,18 @@ const server = http.createServer(async (req, res) => {
         requestData: {
           saml_response: "received",
           relay_state: relayState ? "present" : "missing",
-          size_bytes: samlResponseParam.length
+          relay_state_sha256_12: relayState ? shortHash(relayState) : "",
+          encoded_size_bytes: Buffer.byteLength(samlResponseParam, "utf8"),
+          encoded_sha256_12: shortHash(samlResponseParam),
+          decoded_xml_size_bytes: Buffer.byteLength(responseXml, "utf8"),
+          decoded_xml_sha256_12: shortHash(responseXml)
         },
-        responseData: { decoded: "success" },
-        rawRequestData: { xml: "[SAMLResponse XML — redacted by default]" },
-        rawResponseData: null
+        responseData: {
+          decoded: "success",
+          raw_nature: "Decoded SAMLResponse redacted"
+        },
+        rawRequestData: buildEncodedSamlResponseRaw({ samlResponseParam, relayState, path: url.pathname }),
+        rawResponseData: buildDecodedSamlResponseRaw({ responseXml, samlResponseParam, relayState, path: url.pathname })
       });
 
       let parsed;
@@ -2444,7 +3365,19 @@ const server = http.createServer(async (req, res) => {
         samlFlowService.addFlowStep(runningFlow.id, {
           stepName: "saml_response_decoded",
           status: "error",
+          httpMethod: "POST",
+          endpoint: url.pathname,
           completedAt: new Date().toISOString(),
+          responseData: {
+            parsed: "error",
+            signature_verification_result: "not checked"
+          },
+          rawRequestData: buildDecodedSamlResponseRaw({ responseXml, samlResponseParam, relayState, path: url.pathname }),
+          rawResponseData: buildSamlSyntheticResponseRaw({
+            rawType: "Parsed SAMLResponse summary redacted",
+            status: 0,
+            note: "Parsing failed; no parsed summary available."
+          }),
           errorData: { error: "Failed to parse SAMLResponse XML." }
         });
         samlFlowService.completeFlow(runningFlow.id, {
@@ -2457,25 +3390,79 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
+      // Signature verification — read-only, uses IdP signing certificate from SP metadata XML
+      const acsSpRecord = samlServiceProviderService.getSamlServiceProvider(samlAcsId);
+      const idpMetadataXmlForVerif = acsSpRecord?.idpMetadataXml || "";
+      const idpSigningCerts = idpMetadataXmlForVerif ? extractIdpSigningCertificates(idpMetadataXmlForVerif) : [];
+      const idpCertFingerprints = idpSigningCerts.map((c) => shortHash(c));
+
+      let sigVerification;
+      try {
+        sigVerification = verifySamlXmlSignatures(responseXml, idpSigningCerts);
+      } catch {
+        sigVerification = {
+          response_signature_present: parsed.responseSignaturePresent ? "present" : "missing",
+          assertion_signature_present: parsed.assertionSignaturePresent ? "present" : "missing",
+          response_signature_verification: "not checked",
+          assertion_signature_verification: "not checked",
+          signature_verification_result: "error",
+          verification_note: "Unexpected error during signature verification."
+        };
+      }
+
       const attrCount = Object.keys(parsed.attributes || {}).length;
+      const diagnostics = {
+        in_response_to_vs_request_id: compareDiagnostic(parsed.inResponseTo, runningFlow.runtime?.requestId),
+        destination_vs_acs_url: compareDiagnostic(parsed.destination, runningFlow.runtime?.acsUrl),
+        audience_vs_sp_entity_id: parsed.audience
+          ? compareDiagnostic(parsed.audience, runningFlow.runtime?.spEntityId)
+          : "not extracted",
+        temporal_conditions: parsed.conditionsPresent ? "present" : parsed.assertionPresent ? "missing" : "not extracted"
+      };
+      const statusMessage = sanitizeSamlDiagnosticValue(parsed.statusMessage || "(not extracted)", "status_message");
       samlFlowService.addFlowStep(runningFlow.id, {
         stepName: "saml_response_decoded",
         status: parsed.isSuccess ? "success" : "error",
+        httpMethod: "POST",
+        endpoint: url.pathname,
         completedAt: new Date().toISOString(),
         requestData: {
-          issuer: parsed.issuer || "(not found)",
+          response_issuer: parsed.issuer || "(not found)",
           in_response_to: parsed.inResponseTo || "(not found)",
-          destination: parsed.destination || "(not found)"
+          destination: parsed.destination || "(not found)",
+          status_code: parsed.statusCode || "(not found)",
+          status_message: statusMessage,
+          status_detail: parsed.statusDetailPresent ? "present" : "missing"
         },
         responseData: {
-          status_code: parsed.statusCode || "(not found)",
-          saml_status: parsed.isSuccess ? "Success" : "Failure",
-          name_id: parsed.nameId || "(not present)",
+          assertion_present: parsed.assertionPresent ? "yes" : "no",
+          assertion_issuer: parsed.assertionIssuer || "(not extracted)",
+          subject_present: parsed.subjectPresent ? "yes" : "no",
+          name_id_present: parsed.nameIdPresent ? "yes" : "no",
+          name_id_preview: parsed.nameIdPreview || "(not present)",
+          name_id_hash: parsed.nameIdHash || "",
           name_id_format: parsed.nameIdFormat || "(not present)",
+          saml_status: parsed.isSuccess ? "Success" : "Failure",
           attributes_count: attrCount,
-          ...(attrCount > 0 ? { attributes: parsed.attributes } : {})
+          attribute_names: parsed.attributeNames || [],
+          ...(attrCount > 0 ? { attributes_redacted: parsed.attributes } : {}),
+          conditions_present: parsed.conditionsPresent ? "yes" : "no",
+          audience_restriction_present: parsed.audienceRestrictionPresent ? "yes" : "no",
+          audience: parsed.audience || "(not extracted)",
+          subject_confirmation_present: parsed.subjectConfirmationPresent ? "yes" : "no",
+          recipient: parsed.recipient || "(not extracted)",
+          not_before: parsed.notBefore || "(not extracted)",
+          not_on_or_after: parsed.notOnOrAfter || "(not extracted)",
+          response_signature_present: sigVerification.response_signature_present,
+          assertion_signature_present: sigVerification.assertion_signature_present,
+          response_signature_verification: sigVerification.response_signature_verification,
+          assertion_signature_verification: sigVerification.assertion_signature_verification,
+          signature_verification_result: sigVerification.signature_verification_result,
+          verification_note: sigVerification.verification_note || "",
+          diagnostic_comparisons: diagnostics
         },
-        rawResponseData: { xml: "[SAMLResponse XML — redacted by default]" },
+        rawRequestData: buildDecodedSamlResponseRaw({ responseXml, samlResponseParam, relayState, path: url.pathname }),
+        rawResponseData: buildParsedSamlSummaryRaw({ parsed, diagnostics, attrCount, sigVerification, idpCertFingerprints }),
         errorData: parsed.isSuccess ? null : { saml_status: parsed.statusCode }
       });
 
@@ -2530,7 +3517,7 @@ const server = http.createServer(async (req, res) => {
       const newUiFlow = flowService.findRunningFlowByState(params.state || "", FLOW_STATE_TTL_MS);
       if (newUiFlow) {
         const completedFlow = await processNewUiCallback({ req, flow: newUiFlow, params });
-        redirect(res, `/flows/${encodeURIComponent(completedFlow.id)}`);
+        redirect(res, `/oidc/flows/${encodeURIComponent(completedFlow.id)}`);
         return;
       }
 

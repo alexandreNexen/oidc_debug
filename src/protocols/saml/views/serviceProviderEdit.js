@@ -94,18 +94,10 @@ export function renderSamlServiceProviderEditPage({ serviceProvider, flash, form
     ${renderFlash(flash)}
     ${renderPageHeader({
       title: "Edit SAML Service Provider",
-      description: "Update the SAML configuration for this Service Provider.",
       actions: renderIconBtn({ icon: "return", label: "Back to list", href: "/saml/service-providers", variant: "neutral", showLabel: true })
     })}
 
     <section class="card">
-      <header class="card-header">
-        <div class="card-header__main">
-          <h2 class="card-header__title">${escapeHtml(sp.name || "SAML Service Provider")}</h2>
-          <span class="muted code-inline">${escapeHtml(sp.spEntityId || "entity ID missing")}</span>
-        </div>
-        <span class="badge badge--${escapeHtml(sp.status?.tone || "neutral")}">${escapeHtml(sp.status?.label || "Incomplete")}</span>
-      </header>
       <div class="card__body">
         ${acsUrl ? renderAcsUrlBanner(acsUrl) : ""}
         ${renderErrorSummary(errors)}
@@ -138,13 +130,12 @@ export function renderSamlServiceProviderEditPage({ serviceProvider, flash, form
           })}
 
           <div class="sp-form__actions">
-            ${renderIconBtn({ icon: "save", label: "Save changes", type: "submit", variant: "success", showLabel: true })}
+            ${renderIconBtn({ icon: "save", label: "Save changes", type: "submit", variant: "success" })}
             ${renderIconBtn({ icon: "return", label: "Cancel", href: "/saml/service-providers", variant: "neutral", showLabel: true })}
           </div>
         </form>
 
         <div class="sp-form__delete" style="display:flex;gap:.75rem">
-          ${renderIconBtn({ icon: "start", label: "Run SAML Flow", href: `/saml/flows/start/${encodeURIComponent(sp.id)}`, variant: "success", showLabel: true })}
           <form method="post" action="/saml/service-providers/${encodeURIComponent(sp.id)}/delete" data-confirm="Delete this SAML Service Provider?">
             ${renderIconBtn({ icon: "delete", label: "Delete", type: "submit", variant: "danger", showLabel: true })}
           </form>

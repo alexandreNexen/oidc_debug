@@ -1,20 +1,20 @@
 import { escapeHtml, renderFlash, renderIconBtn, renderLayout, renderPageHeader, renderStatusIcon } from "../../../common/views/layout.js";
 
 function formatDate(value) {
-  return value ? new Date(value).toLocaleString("fr-FR") : "Non disponible";
+  return value ? new Date(value).toLocaleString("fr-FR") : "Not available";
 }
 
 function formatDuration(ms) {
-  if (ms === null || ms === undefined) return "En cours";
+  if (ms === null || ms === undefined) return "Running";
   if (ms < 1000) return `${ms} ms`;
   return `${(ms / 1000).toFixed(1)} s`;
 }
 
 function resultTitle(status) {
-  if (status === "success") return "Flow SAML terminé avec succès";
-  if (status === "failed") return "Flow SAML en échec";
-  if (status === "partial_success") return "Flow SAML partiellement complété";
-  return "Flow SAML en cours";
+  if (status === "success") return "Flow completed successfully";
+  if (status === "failed") return "Flow failed";
+  if (status === "partial_success") return "Flow partially completed";
+  return "Flow running";
 }
 
 function renderSummaryRow(label, value) {
@@ -26,89 +26,132 @@ function renderSummaryRow(label, value) {
   `;
 }
 
-function renderTimeline(steps = []) {
+// ---- Functional section mapping ----
+
+const STEP_TO_SECTION = {
+  authn_request_created: "Authentication exchange",
+  redirect_to_idp: "Authentication exchange",
+  acs_callback_received: "Authentication exchange",
+  saml_response_received: "Authentication exchange",
+  saml_response_decoded: "Identity assertion"
+};
+
+function sectionBadge(status) {
+  if (status === "success") return { tone: "success", label: "Done" };
+  if (status === "error") return { tone: "error", label: "Error" };
+  if (status === "running") return { tone: "warning", label: "Running" };
+  if (status === "skipped") return { tone: "neutral", label: "Skipped" };
+  return { tone: "neutral", label: "Pending" };
+}
+
+function computeSections(steps) {
+  const byName = new Map(steps.map((s) => [s.stepName, s]));
+  const authn = byName.get("authn_request_created");
+  const redirect = byName.get("redirect_to_idp");
+  const samlResp = byName.get("saml_response_received");
+  const decoded = byName.get("saml_response_decoded");
+
+  let exchangeStatus = "pending";
+  if (authn?.status === "error" || redirect?.status === "error" || samlResp?.status === "error") {
+    exchangeStatus = "error";
+  } else if (samlResp?.status === "success") {
+    exchangeStatus = "success";
+  } else if (authn?.status === "success") {
+    exchangeStatus = "running";
+  }
+
+  const identityStatus = decoded?.status || "pending";
+
+  return [
+    { label: "Authentication exchange", status: exchangeStatus },
+    { label: "Identity assertion", status: identityStatus }
+  ];
+}
+
+function renderFunctionalTimeline(steps) {
+  const sections = computeSections(steps);
   return `
     <ol class="flow-timeline">
-      ${steps
-        .map(
-          (step) => `
-            <li class="flow-timeline__item flow-timeline__item--${escapeHtml(step.badge.tone)}">
-              <span class="flow-timeline__dot"></span>
-              <span class="flow-timeline__label">${escapeHtml(step.stepName)}</span>
-              ${renderStatusIcon(step.badge)}
-            </li>
-          `
-        )
-        .join("")}
+      ${sections.map((s) => {
+        const badge = sectionBadge(s.status);
+        return `
+          <li class="flow-timeline__item flow-timeline__item--${escapeHtml(badge.tone)}">
+            <span class="flow-timeline__dot"></span>
+            <span class="flow-timeline__label">${escapeHtml(s.label)}</span>
+            ${renderStatusIcon(badge)}
+          </li>
+        `;
+      }).join("")}
     </ol>
   `;
 }
 
 export function renderSamlFlowResultPage({ flow, serviceProvider, steps = [], flash }) {
-  const status = flow.statusBadge || { label: "En cours", tone: "neutral" };
+  const status = flow.statusBadge || { label: "Running", tone: "neutral" };
   const failed = flow.status === "failed" || flow.status === "partial_success";
   const detailsHref = `/saml/flows/${encodeURIComponent(flow.id)}/details`;
+  const failedSectionLabel = flow.failedStep ? (STEP_TO_SECTION[flow.failedStep] || flow.failedStep) : "";
 
   const body = `
     ${renderFlash(flash)}
     ${renderPageHeader({
-      title: "Résultat du flow SAML",
+      title: "Flow result",
       description: resultTitle(flow.status),
       actions: `<span class="badge badge--${escapeHtml(status.tone)}">${escapeHtml(status.label)}</span>`
     })}
 
     <section class="card">
       <header class="card-header">
-        <h2 class="card-header__title">Résumé</h2>
+        <h2 class="card-header__title">Summary</h2>
       </header>
       <div class="card__body">
         <dl class="kv-list">
-          ${renderSummaryRow("Service Provider", escapeHtml(serviceProvider.name || "Inconnu"))}
+          ${renderSummaryRow("Service Provider", escapeHtml(serviceProvider.name || "Unknown"))}
           ${renderSummaryRow("Environment", flow.environmentLabel
             ? `<span class="badge badge--neutral">${escapeHtml(flow.environmentLabel)}</span>`
-            : `<span class="badge badge--warning">Environment manquant</span>`
+            : `<span class="badge badge--warning">Environment missing</span>`
           )}
           ${renderSummaryRow("SP Entity ID", `<code class="code-inline">${escapeHtml(flow.runtime?.spEntityId || "")}</code>`)}
           ${renderSummaryRow("IdP SSO URL", flow.runtime?.ssoUrl
             ? `<code class="code-inline">${escapeHtml(flow.runtime.ssoUrl)}</code>`
-            : `<span class="muted">Non disponible</span>`
+            : `<span class="muted">Not available</span>`
           )}
           ${renderSummaryRow("IdP Entity ID", flow.runtime?.idpEntityId
             ? `<code class="code-inline">${escapeHtml(flow.runtime.idpEntityId)}</code>`
-            : `<span class="muted">Non disponible</span>`
+            : `<span class="muted">Not available</span>`
           )}
           ${renderSummaryRow("ACS URL", `<code class="code-inline">${escapeHtml(flow.runtime?.acsUrl || "")}</code>`)}
-          ${renderSummaryRow("RelayState", flow.runtime?.relayState ? "Présent" : `<span class="muted">Absent</span>`)}
-          ${renderSummaryRow("Démarré à", escapeHtml(formatDate(flow.startedAt)))}
-          ${renderSummaryRow("Durée", escapeHtml(formatDuration(flow.durationMs)))}
-          ${failed && flow.failedStep ? renderSummaryRow("Étape en échec", `<span class="badge badge--warning">${escapeHtml(flow.failedStep)}</span>`) : ""}
-          ${failed && flow.errorCode ? renderSummaryRow("Code erreur", `<code class="code-inline">${escapeHtml(flow.errorCode)}</code>`) : ""}
-          ${failed && flow.errorDescription ? renderSummaryRow("Erreur", escapeHtml(flow.errorDescription)) : ""}
+          ${renderSummaryRow("RelayState", flow.runtime?.relayState ? "Present" : `<span class="muted">Absent</span>`)}
+          ${renderSummaryRow("Started at", escapeHtml(formatDate(flow.startedAt)))}
+          ${renderSummaryRow("Duration", escapeHtml(formatDuration(flow.durationMs)))}
+          ${failed && failedSectionLabel ? renderSummaryRow("Failed at", `<span class="badge badge--warning">${escapeHtml(failedSectionLabel)}</span>`) : ""}
+          ${failed && flow.errorCode ? renderSummaryRow("Error code", `<code class="code-inline">${escapeHtml(flow.errorCode)}</code>`) : ""}
+          ${failed && flow.errorDescription ? renderSummaryRow("Error", escapeHtml(flow.errorDescription)) : ""}
         </dl>
       </div>
     </section>
 
     <section class="card flow-section">
       <header class="card-header">
-        <h2 class="card-header__title">Étapes</h2>
+        <h2 class="card-header__title">Steps</h2>
       </header>
       <div class="card__body">
-        ${renderTimeline(steps)}
+        ${renderFunctionalTimeline(steps)}
       </div>
     </section>
 
     <div class="flow-actions">
-      ${renderIconBtn({ icon: "details", label: "Voir les détails", href: detailsHref, variant: "neutral", showLabel: true })}
-      ${renderIconBtn({ icon: "replay", label: "Relancer", href: `/saml/flows/start/${encodeURIComponent(flow.serviceProviderId)}`, variant: "neutral", showLabel: true })}
+      ${renderIconBtn({ icon: "details", label: "View flow details", href: detailsHref, variant: "neutral", showLabel: true })}
+      ${renderIconBtn({ icon: "replay", label: "Run again", href: `/saml/flows/start/${encodeURIComponent(flow.serviceProviderId)}`, variant: "neutral", showLabel: true })}
       ${failed && serviceProvider?.id
-        ? renderIconBtn({ icon: "edit", label: "Modifier le Service Provider", href: `/saml/service-providers/${encodeURIComponent(serviceProvider.id)}/edit`, variant: "neutral", showLabel: true })
+        ? renderIconBtn({ icon: "edit", label: "Edit Service Provider", href: `/saml/service-providers/${encodeURIComponent(serviceProvider.id)}/edit`, variant: "neutral", showLabel: true })
         : ""}
-      ${renderIconBtn({ icon: "return", label: "Retour à la liste", href: "/saml/service-providers", variant: "neutral", showLabel: true })}
+      ${renderIconBtn({ icon: "return", label: "Back to list", href: "/saml/service-providers", variant: "neutral", showLabel: true })}
     </div>
   `;
 
   return renderLayout({
-    title: "Résultat flow SAML — Ez-Access Debug",
+    title: "Flow result — Ez-Access SAML Debug",
     activeNav: "saml-service-providers",
     body
   });

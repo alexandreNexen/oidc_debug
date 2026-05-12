@@ -45,6 +45,8 @@ function normalizeStep(step = {}, { createId }) {
     responseData: step.responseData || null,
     rawRequestData: step.rawRequestData || null,
     rawResponseData: step.rawResponseData || null,
+    rawRequestNature: step.rawRequestNature || "",
+    rawResponseNature: step.rawResponseNature || "",
     errorData: step.errorData || null,
     httpMethod: step.httpMethod || "",
     endpoint: step.endpoint || "",

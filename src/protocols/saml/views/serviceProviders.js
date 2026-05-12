@@ -17,6 +17,28 @@ function renderIdpMetadata(sp) {
   return `<span class="badge badge--warning">Missing</span>`;
 }
 
+function formatLastFlowDate(value) {
+  return value ? new Date(value).toLocaleString("fr-FR") : "Unknown date";
+}
+
+function renderLastFlow(lastFlow) {
+  if (!lastFlow) {
+    return `<span class="muted">Not executed yet</span>`;
+  }
+
+  const startedAt = formatLastFlowDate(lastFlow.startedAt);
+  const label = lastFlow.statusBadge?.label || lastFlow.status || "Flow";
+
+  return `
+    <a class="last-flow-link" href="/saml/flows/${encodeURIComponent(lastFlow.id)}" aria-label="Open last SAML flow, ${escapeHtml(label)}, started at ${escapeHtml(startedAt)}">
+      ${renderStatusIcon(lastFlow.statusBadge)}
+      <span class="last-flow-link__text">
+        <span class="last-flow-link__date muted">${escapeHtml(startedAt)}</span>
+      </span>
+    </a>
+  `;
+}
+
 function renderEmptyState() {
   return `
     <div class="card">
@@ -41,10 +63,10 @@ function renderList(serviceProviders) {
           <td>${renderEnvironment(sp)}</td>
           <td><code class="code-inline">${escapeHtml(sp.spEntityId || "Missing")}</code></td>
           <td>${renderIdpMetadata(sp)}</td>
+          <td>${renderLastFlow(sp.lastFlow)}</td>
           <td>${renderStatusIcon(status)}</td>
           <td class="table__actions">
             ${renderIconBtn({ icon: "start", label: "Run SAML Flow", href: `/saml/flows/start/${encodeURIComponent(sp.id)}`, variant: "success" })}
-            ${renderIconBtn({ icon: "copy", label: "Copy ACS URL", variant: "neutral", attr: `data-copy="${escapeHtml(sp.acsUrl || "")}"` })}
             ${renderIconBtn({ icon: "edit", label: "Edit", href: `/saml/service-providers/${encodeURIComponent(sp.id)}/edit`, variant: "neutral" })}
             <form method="post" action="/saml/service-providers/${encodeURIComponent(sp.id)}/delete" data-confirm="Delete this SAML Service Provider?">
               ${renderIconBtn({ icon: "delete", label: "Delete", type: "submit", variant: "danger" })}
@@ -57,9 +79,6 @@ function renderList(serviceProviders) {
 
   return `
     <div class="card">
-      <header class="card-header">
-        <span class="muted">${escapeHtml(String(serviceProviders.length))} configured</span>
-      </header>
       <div class="card__body card__body--flush table-scroll">
         <table class="table">
           <thead>
@@ -68,6 +87,7 @@ function renderList(serviceProviders) {
               <th scope="col">Environment</th>
               <th scope="col">SP Entity ID</th>
               <th scope="col">IdP Metadata</th>
+              <th scope="col">Last flow</th>
               <th scope="col">Status</th>
               <th scope="col" class="table__actions">Actions</th>
             </tr>

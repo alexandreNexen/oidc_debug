@@ -73,8 +73,7 @@ export function renderServiceProviderNewPage({ flash, form = {}, ezAccessEnviron
     ${renderFlash(flash)}
     ${renderPageHeader({
       title: "Add Service Provider",
-      description: "Create an OIDC client configuration for a future Ez-Access test flow.",
-      actions: renderIconBtn({ icon: "return", label: "Back to list", href: "/service-providers", variant: "neutral", showLabel: true })
+      actions: renderIconBtn({ icon: "return", label: "Back to list", href: "/oidc/service-providers", variant: "neutral", showLabel: true })
     })}
 
     <section class="card">
@@ -85,7 +84,7 @@ export function renderServiceProviderNewPage({ flash, form = {}, ezAccessEnviron
       <div class="card__body">
         ${renderErrorSummary(errors)}
         ${renderWarnings(warnings)}
-        <form class="sp-form" method="post" action="/service-providers" novalidate>
+        <form class="sp-form" method="post" action="/oidc/service-providers" novalidate>
           ${renderField({
             label: "Name",
             name: "name",
@@ -125,7 +124,7 @@ export function renderServiceProviderNewPage({ flash, form = {}, ezAccessEnviron
 
           <div class="sp-form__actions">
             ${renderIconBtn({ icon: "save", label: "Save Service Provider", type: "submit", variant: "success", showLabel: true })}
-            ${renderIconBtn({ icon: "return", label: "Cancel", href: "/service-providers", variant: "neutral", showLabel: true })}
+            ${renderIconBtn({ icon: "return", label: "Cancel", href: "/oidc/service-providers", variant: "neutral", showLabel: true })}
           </div>
         </form>
       </div>
