@@ -17,7 +17,7 @@ function encodeRawData(value) {
 
 // ---- Status badge helpers ----
 
-const BADGE_SUCCESS = new Set(["yes", "received", "present", "sent", "valid", "success", "match", "ok"]);
+const BADGE_SUCCESS = new Set(["yes", "received", "present", "sent", "valid", "success", "match", "ok", "received / redacted"]);
 const BADGE_ERROR = new Set(["no", "missing", "failed", "mismatch", "error", "failure"]);
 const BADGE_NEUTRAL = new Set(["not implemented", "not checked", "not extracted", "skipped", "none",
   "disabled", "not sent", "pending", "not performed", "not available"]);
@@ -157,9 +157,8 @@ function computeSectionTabs(steps) {
   const tokenStatus = token?.status || "pending";
   const uiStatus = ui?.status || "pending";
 
-  const diag = token?.responseData?.id_token_diagnostics;
-  const idTokenStatus = diag?.id_token_received === "yes" ? "success"
-    : (token && token.status !== "pending") ? "pending"
+  const idTokenStatus = token?.status === "error" ? "error"
+    : token?.status === "success" ? "success"
     : "pending";
 
   return [
@@ -280,6 +279,8 @@ function renderUserInfo(steps) {
   const resp = ui?.responseData || {};
   const notReached = !ui || ui.status === "pending";
   const skipped = ui?.status === "skipped";
+  const emailStatus = resp.email || (resp.email_present === "yes" ? "received" : resp.email_present === "no" ? "missing" : "");
+  const nameStatus = resp.name || (resp.name_present === "yes" ? "received" : resp.name_present === "no" ? "missing" : "");
 
   const requestContent = notReached
     ? `<p class="muted">Not reached.</p>`
@@ -298,8 +299,8 @@ function renderUserInfo(steps) {
     : dl([
         row("HTTP status", badge(resp.http_status != null ? String(resp.http_status) : "")),
         row("Subject", resp.subject ? plain(resp.subject) : badge("missing")),
-        row("Email", badge(resp.email_present === "yes" ? "present" : "missing")),
-        row("Name", badge(resp.name_present === "yes" ? "present" : "missing")),
+        row("Email", badge(emailStatus || "unavailable")),
+        row("Name", badge(nameStatus || "unavailable")),
         row("Claims available", badge(resp.raw_claims_available)),
         row("Error", uiError
           ? `<span class="badge badge--error">${escapeHtml(String(resp.error))}</span>`

@@ -60,10 +60,11 @@ function computeSections(steps) {
   let uiStatus = ui?.status || "pending";
   if (uiStatus === "pending" && tokenStatus === "success") uiStatus = "pending";
 
-  const diag = token?.responseData?.id_token_diagnostics;
   let idTokenStatus = "pending";
-  if (token && token.status !== "pending") {
-    idTokenStatus = diag?.id_token_received === "yes" ? "success" : "pending";
+  if (token?.status === "error") {
+    idTokenStatus = "error";
+  } else if (token?.status === "success") {
+    idTokenStatus = "success";
   }
 
   return [

@@ -525,6 +525,10 @@ export function redactObject(value, parentKey = "") {
 }
 
 function tokenPresence(value) {
+  if (["present", "missing", "received", "redacted", "received / redacted", "unavailable", "unknown"].includes(value)) {
+    return value;
+  }
+
   return value === undefined || value === null || value === "" ? "missing" : "present";
 }
 

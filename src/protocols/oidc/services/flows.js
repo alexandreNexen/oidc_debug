@@ -20,12 +20,15 @@ function durationMs(startedAt, completedAt = nowIso()) {
 
 function normalizeFlow(flow = {}) {
   const startedAt = flow.startedAt || nowIso();
+  const updatedAt = flow.updatedAt || flow.completedAt || startedAt;
   return {
     id: flow.id || "",
     serviceProviderId: flow.serviceProviderId || "",
     status: ["running", "success", "failed", "partial_success"].includes(flow.status) ? flow.status : "running",
     startedAt,
+    updatedAt,
     completedAt: flow.completedAt || null,
+    lastStep: flow.lastStep || "",
     failedStep: flow.failedStep || "",
     errorCode: flow.errorCode || "",
     errorDescription: flow.errorDescription || "",
@@ -132,7 +135,8 @@ export function createFlowService({ getFlows, setFlows, getSteps, setSteps, crea
 
     const next = normalizeFlow({
       ...existing,
-      ...patch
+      ...patch,
+      updatedAt: patch.updatedAt || nowIso()
     });
 
     if (next.completedAt && next.durationMs === null) {
@@ -149,6 +153,7 @@ export function createFlowService({ getFlows, setFlows, getSteps, setSteps, crea
     return updateFlow(flowId, {
       ...patch,
       completedAt,
+      updatedAt: patch.updatedAt || completedAt,
       durationMs: durationMs(getFlow(flowId)?.startedAt, completedAt)
     });
   }
@@ -168,6 +173,10 @@ export function createFlowService({ getFlows, setFlows, getSteps, setSteps, crea
       : [...getSteps(), normalized];
 
     setSteps(sortSteps(nextSteps));
+    updateFlow(flowId, {
+      lastStep: normalized.stepName,
+      updatedAt: normalized.completedAt || nowIso()
+    });
     onChange();
     return normalized;
   }

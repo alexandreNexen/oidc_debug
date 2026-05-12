@@ -309,8 +309,52 @@ function sanitizeDiagnosticError(value = "") {
     .replace(/\b(access_token|id_token|refresh_token|client_secret|code_verifier|code|state|nonce)=([^&\s]+)/gi, "$1=********");
 }
 
+function lifecycleHash(value = "") {
+  return value ? crypto.createHash("sha256").update(String(value)).digest("hex") : "";
+}
+
+function lifecycleHashMatches(value = "", expectedHash = "") {
+  return Boolean(value && expectedHash && lifecycleHash(value) === expectedHash);
+}
+
 function tokenPresence(value) {
+  if (["present", "missing", "received", "redacted", "received / redacted", "unavailable", "unknown"].includes(value)) {
+    return value;
+  }
+
   return value === undefined || value === null || value === "" ? "missing" : "present";
+}
+
+function tokenSummaryStatus(value) {
+  if (value === "present" || value === "received" || value === "redacted" || value === "received / redacted") {
+    return "received";
+  }
+
+  if (value === "missing") {
+    return "missing";
+  }
+
+  return value === undefined || value === null || value === "" ? "missing" : "received";
+}
+
+function claimSummaryStatus(value) {
+  if (value === undefined || value === null || value === "" || value === "missing" || value === "no") {
+    return "missing";
+  }
+
+  if (value === "yes") {
+    return "received";
+  }
+
+  if (value === "redacted" || value === "received / redacted") {
+    return "received / redacted";
+  }
+
+  if (value === "received" || value === "present") {
+    return "received";
+  }
+
+  return "received";
 }
 
 function usefulSanitizedHeaders(headers = {}) {
@@ -419,7 +463,15 @@ function sanitizeUserInfoClaims(claims = {}) {
   }
 
   const { claims: _nestedClaims, ...withoutNestedClaims } = sanitized;
-  return withoutNestedClaims;
+  const redactedClaims = { ...withoutNestedClaims };
+
+  for (const key of ["email", "name"]) {
+    if (redactedClaims[key] !== undefined && redactedClaims[key] !== null && redactedClaims[key] !== "" && redactedClaims[key] !== "missing") {
+      redactedClaims[key] = "received / redacted";
+    }
+  }
+
+  return redactedClaims;
 }
 
 function extractUserInfoClaims(parsed = {}) {
@@ -451,11 +503,45 @@ function sanitizeUserInfoResponseRaw(response = null) {
     headers: usefulSanitizedHeaders(response.headers || {}),
     body: {
       sub: claims.sub || "missing",
-      email: claims.email || "missing",
-      name: claims.name || "missing",
+      email: claimSummaryStatus(claims.email),
+      name: claimSummaryStatus(claims.name),
       claims
     },
     error: response.error ? sanitizeDiagnosticError(response.error) : null
+  };
+}
+
+function buildTokenResponseSummary(rawResponseData = null, fallback = {}) {
+  const body = rawResponseData?.body || {};
+
+  return {
+    ...fallback,
+    http_status: rawResponseData?.status ?? fallback.http_status ?? 0,
+    access_token: tokenSummaryStatus(body.access_token ?? fallback.access_token),
+    id_token: tokenSummaryStatus(body.id_token ?? fallback.id_token),
+    refresh_token: tokenSummaryStatus(body.refresh_token ?? fallback.refresh_token),
+    expires_in: body.expires_in ?? fallback.expires_in ?? "",
+    token_type: body.token_type ?? fallback.token_type ?? "",
+    token_error: body.error || rawResponseData?.error || fallback.token_error || "none",
+    error_description: body.error_description || fallback.error_description || ""
+  };
+}
+
+function buildUserInfoResponseSummary(rawResponseData = null, fallback = {}) {
+  const body = rawResponseData?.body || {};
+  const claims = body.claims && typeof body.claims === "object" ? body.claims : {};
+  const claimCount = Object.keys(claims).length;
+
+  return {
+    ...fallback,
+    called: fallback.called || "yes",
+    http_status: rawResponseData?.status ?? fallback.http_status ?? 0,
+    subject: body.sub && body.sub !== "missing" ? body.sub : fallback.subject || "",
+    email: claimSummaryStatus(body.email ?? fallback.email ?? fallback.email_present),
+    name: claimSummaryStatus(body.name ?? fallback.name ?? fallback.name_present),
+    raw_claims_available: claimCount > 0 || fallback.raw_claims_available === "yes" ? "yes" : "no",
+    error: rawResponseData?.error || fallback.error || "none",
+    error_description: fallback.error_description || ""
   };
 }
 
@@ -494,6 +580,7 @@ function buildIdTokenAnalysisRaw(idToken = "", flow = null) {
   const expectedIssuer = flow?.runtime?.provider?.issuer || "";
   const expectedAudience = flow?.runtime?.clientId || "";
   const expectedNonce = flow?.runtime?.expectedNonce || "";
+  const expectedNonceHash = flow?.runtime?.nonceSha256 || "";
 
   if (!idToken) {
     return {
@@ -551,7 +638,11 @@ function buildIdTokenAnalysisRaw(idToken = "", flow = null) {
       issuer: expectedIssuer ? (payload.iss === expectedIssuer ? "valid" : "invalid") : "not_checked",
       audience: expectedAudience ? (audienceValues.includes(expectedAudience) ? "valid" : "invalid") : "not_checked",
       expiration: evaluateJwtExpiration(payload.exp),
-      nonce: expectedNonce ? (nonceClaim ? (nonceClaim === expectedNonce ? "valid" : "invalid") : "missing") : "not_checked",
+      nonce: expectedNonce
+        ? (nonceClaim ? (nonceClaim === expectedNonce ? "valid" : "invalid") : "missing")
+        : expectedNonceHash
+          ? (nonceClaim ? (lifecycleHashMatches(nonceClaim, expectedNonceHash) ? "valid" : "invalid") : "missing")
+          : "not_checked",
       signature: "not_implemented",
       overall: "incomplete"
     },
@@ -744,10 +835,10 @@ function sanitizeSessionArtifacts(session) {
         }
       : null,
     flow: {
-      expectedState: session.flow?.expectedState ? "present" : "missing",
-      expectedNonce: session.flow?.expectedNonce ? "present" : "missing",
-      codeVerifier: session.flow?.codeVerifier ? "present" : "missing",
-      codeChallenge: session.flow?.codeChallenge ? "present" : "missing"
+      statePresent: session.flow?.expectedState ? "present" : "missing",
+      noncePresent: session.flow?.expectedNonce ? "present" : "missing",
+      codeVerifierPresent: session.flow?.codeVerifier ? "present" : "missing",
+      codeChallengePresent: session.flow?.codeChallenge ? "present" : "missing"
     },
     steps: {
       ...session.steps,
@@ -796,26 +887,32 @@ function sanitizeTerminalOidcFlow(flow) {
     return flow;
   }
 
+  return {
+    ...flow,
+    runtime: sanitizeTerminalOidcRuntime(flow.runtime)
+  };
+}
+
+function sanitizeTerminalOidcRuntime(flowRuntime = {}) {
   const {
     expectedState,
     expectedNonce,
     codeVerifier,
     codeChallenge,
     ...runtime
-  } = flow.runtime;
+  } = flowRuntime;
 
   return {
-    ...flow,
-    runtime: {
-      ...runtime,
-      pkceMethod: codeChallenge ? "S256" : runtime.pkceMethod || "",
-      codeChallengePresent: codeChallenge ? "yes" : runtime.codeChallengePresent || "no",
-      codeVerifierPresent: codeVerifier ? "yes" : runtime.codeVerifierPresent || "no",
-      stateGenerated: expectedState ? "yes" : runtime.stateGenerated || "no",
-      stateSent: expectedState ? "yes" : runtime.stateSent || "no",
-      nonceGenerated: expectedNonce ? "yes" : runtime.nonceGenerated || "no",
-      nonceSent: expectedNonce ? "yes" : runtime.nonceSent || "no"
-    }
+    ...runtime,
+    stateSha256: runtime.stateSha256 || lifecycleHash(expectedState),
+    nonceSha256: runtime.nonceSha256 || lifecycleHash(expectedNonce),
+    pkceMethod: codeChallenge ? "S256" : runtime.pkceMethod || "",
+    codeChallengePresent: codeChallenge ? "yes" : runtime.codeChallengePresent || "no",
+    codeVerifierPresent: codeVerifier ? "yes" : runtime.codeVerifierPresent || "no",
+    stateGenerated: expectedState ? "yes" : runtime.stateGenerated || "no",
+    stateSent: expectedState ? "yes" : runtime.stateSent || "no",
+    nonceGenerated: expectedNonce ? "yes" : runtime.nonceGenerated || "no",
+    nonceSent: expectedNonce ? "yes" : runtime.nonceSent || "no"
   };
 }
 
@@ -1013,10 +1110,10 @@ async function loadPersistedState() {
         selectedServiceProviderId: candidate.selectedServiceProviderId || "",
         runtimeContext: candidate.runtimeContext || null,
         flow: {
-          expectedState: candidate.flow?.expectedState || "",
-          expectedNonce: candidate.flow?.expectedNonce || "",
-          codeVerifier: candidate.flow?.codeVerifier || "",
-          codeChallenge: candidate.flow?.codeChallenge || ""
+          expectedState: candidate.flow?.expectedState && candidate.flow.expectedState !== "present" ? candidate.flow.expectedState : "",
+          expectedNonce: candidate.flow?.expectedNonce && candidate.flow.expectedNonce !== "present" ? candidate.flow.expectedNonce : "",
+          codeVerifier: candidate.flow?.codeVerifier && candidate.flow.codeVerifier !== "present" ? candidate.flow.codeVerifier : "",
+          codeChallenge: candidate.flow?.codeChallenge && candidate.flow.codeChallenge !== "present" ? candidate.flow.codeChallenge : ""
         },
         steps: {
           discovery: candidate.steps?.discovery || null,
@@ -1707,6 +1804,43 @@ function evaluateState(expectedState, receivedState) {
   return expectedState === receivedState ? "match" : "mismatch";
 }
 
+function evaluateFlowState(flow, receivedState) {
+  const expectedState = flow?.runtime?.expectedState || "";
+  if (expectedState) {
+    return evaluateState(expectedState, receivedState);
+  }
+
+  return lifecycleHashMatches(receivedState, flow?.runtime?.stateSha256 || "") ? "match" : evaluateState("", receivedState);
+}
+
+function findRunningFlowByCallbackState(state) {
+  const directMatch = flowService.findRunningFlowByState(state || "", FLOW_STATE_TTL_MS);
+  if (directMatch) {
+    return directMatch;
+  }
+
+  if (!state) {
+    return null;
+  }
+
+  const cutoff = Date.now() - FLOW_STATE_TTL_MS;
+  return flowService.listFlows().find((flow) =>
+    flow.status === "running" &&
+    lifecycleHashMatches(state, flow.runtime?.stateSha256 || "") &&
+    new Date(flow.startedAt).getTime() > cutoff
+  ) || null;
+}
+
+function findSingleRecentRunningOidcFlow() {
+  const cutoff = Date.now() - FLOW_STATE_TTL_MS;
+  const candidates = flowService.listFlows().filter((flow) =>
+    flow.status === "running" &&
+    new Date(flow.startedAt).getTime() > cutoff
+  );
+
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
 function responseHeadersToObject(headers) {
   const result = {};
   headers.forEach((value, key) => {
@@ -1873,7 +2007,7 @@ function epochToIso(value) {
   return new Date(numberValue * 1000).toISOString();
 }
 
-function buildIdTokenDiagnostics(idToken = "", expectedNonce = "") {
+function buildIdTokenDiagnostics(idToken = "", expectedNonce = "", expectedNonceHash = "") {
   const decoded = decodeJwt(idToken || "");
   if (!idToken) {
     return {
@@ -1901,7 +2035,9 @@ function buildIdTokenDiagnostics(idToken = "", expectedNonce = "") {
   const nonceClaim = decoded.payload?.nonce || "";
   const nonceValidation = nonceClaim && expectedNonce
     ? (nonceClaim === expectedNonce ? "valid" : "invalid")
-    : nonceClaim ? "not checked" : "missing";
+    : nonceClaim && expectedNonceHash
+      ? (lifecycleHashMatches(nonceClaim, expectedNonceHash) ? "valid" : "invalid")
+      : nonceClaim ? "not checked" : "missing";
 
   return {
     id_token_received: "yes",
@@ -2158,7 +2294,9 @@ function flowSummary(flow) {
     status: flow.status,
     statusBadge: flowStatusLabel(flow.status),
     startedAt: flow.startedAt,
+    updatedAt: flow.updatedAt,
     completedAt: flow.completedAt,
+    lastStep: flow.lastStep,
     failedStep: flow.failedStep,
     errorCode: flow.errorCode,
     errorDescription: flow.errorDescription,
@@ -2198,12 +2336,17 @@ function flowStepSummary(stepName, step) {
   const rawResponseData = step?.rawResponseData
     ? sanitizeOidcRawResponseForStep(stepName, step.rawResponseData, step)
     : null;
-  const responseData = step?.responseData?.authorization_url_full
+  const baseResponseData = step?.responseData?.authorization_url_full
     ? {
         ...step.responseData,
         authorization_url_full: redactDiagnosticUrl(step.responseData.authorization_url_full)
       }
     : step?.responseData || null;
+  const responseData = stepName === "token" && rawResponseData
+    ? buildTokenResponseSummary(rawResponseData, baseResponseData || {})
+    : stepName === "userinfo" && rawResponseData
+      ? buildUserInfoResponseSummary(rawResponseData, baseResponseData || {})
+      : baseResponseData;
 
   return {
     stepName,
@@ -2552,9 +2695,10 @@ function buildTokenStep({ requestSnapshot, responseSnapshot, flow = null }) {
   const parsed = responseSnapshot.parsed || {};
   const idTokenClaims = decodeJwt(parsed.id_token || "");
   const accessTokenClaims = decodeJwt(parsed.access_token || "");
-  const ok = Boolean(responseSnapshot.ok && (parsed.access_token || parsed.id_token));
+  const ok = Boolean(responseSnapshot.ok && !parsed.error && !responseSnapshot.error);
   const authHeader = requestSnapshot.headers?.authorization || "";
   const clientAuthenticationMethod = /^basic\s+/i.test(authHeader) ? "client_secret_basic" : "none";
+  const rawResponseData = sanitizeTokenResponseRaw(responseSnapshot);
 
   return {
     stepName: "token",
@@ -2574,20 +2718,15 @@ function buildTokenStep({ requestSnapshot, responseSnapshot, flow = null }) {
       code_verifier: requestSnapshot.params?.code_verifier ? "sent" : "not sent"
     },
     responseData: {
-      http_status: responseSnapshot.status || 0,
-      id_token: tokenPresence(parsed.id_token),
-      access_token: tokenPresence(parsed.access_token),
-      refresh_token: tokenPresence(parsed.refresh_token),
-      expires_in: parsed.expires_in || "",
-      token_type: parsed.token_type || "",
+      ...buildTokenResponseSummary(rawResponseData),
       token_error: parsed.error || responseSnapshot.error || "none",
       error_description: parsed.error_description || "",
       id_token_claims: idTokenClaims.isJwt ? selectedClaims(idTokenClaims.payload) : {},
       access_token_claims: accessTokenClaims.isJwt ? selectedClaims(accessTokenClaims.payload) : {},
-      id_token_diagnostics: buildIdTokenDiagnostics(parsed.id_token || "", flow?.runtime?.expectedNonce || "")
+      id_token_diagnostics: buildIdTokenDiagnostics(parsed.id_token || "", flow?.runtime?.expectedNonce || "", flow?.runtime?.nonceSha256 || "")
     },
     rawRequestData: sanitizeTokenRequestRaw(requestSnapshot),
-    rawResponseData: sanitizeTokenResponseRaw(responseSnapshot),
+    rawResponseData,
     rawAnalysisData: buildIdTokenAnalysisRaw(parsed.id_token || "", flow),
     rawRequestNature: "Real outbound HTTP request",
     rawResponseNature: "Real inbound HTTP response",
@@ -2630,6 +2769,7 @@ function buildUserInfoStep({ requestSnapshot = null, responseSnapshot = null, sk
   }
 
   const parsed = responseSnapshot.parsed || {};
+  const rawResponseData = sanitizeUserInfoResponseRaw(responseSnapshot);
 
   return {
     stepName: "userinfo",
@@ -2644,17 +2784,16 @@ function buildUserInfoStep({ requestSnapshot = null, responseSnapshot = null, sk
       Authorization: "Bearer ********"
     },
     responseData: {
-      called: "yes",
-      http_status: responseSnapshot.status || 0,
-      subject: parsed.sub || "",
-      email_present: parsed.email ? "yes" : "no",
-      name_present: parsed.name ? "yes" : "no",
-      raw_claims_available: Object.keys(parsed || {}).length > 0 ? "yes" : "no",
+      ...buildUserInfoResponseSummary(rawResponseData, {
+        called: "yes",
+        subject: parsed.sub || "",
+        raw_claims_available: Object.keys(parsed || {}).length > 0 ? "yes" : "no"
+      }),
       error: parsed.error || responseSnapshot.error || "none",
       error_description: parsed.error_description || ""
     },
     rawRequestData: sanitizeUserInfoRequestRaw(requestSnapshot),
-    rawResponseData: sanitizeUserInfoResponseRaw(responseSnapshot),
+    rawResponseData,
     rawRequestNature: "Real outbound HTTP request",
     rawResponseNature: "Real inbound HTTP response",
     errorData: responseSnapshot.ok
@@ -2669,20 +2808,23 @@ function buildUserInfoStep({ requestSnapshot = null, responseSnapshot = null, sk
 }
 
 function failFlow(flowId, failedStep, errorCode, errorDescription) {
-  return flowService.completeFlow(flowId, {
+  return completeOidcFlow(flowId, {
     status: "failed",
+    lastStep: failedStep,
     failedStep,
     errorCode: errorCode || `${failedStep}_failed`,
     errorDescription: errorDescription || recommendedAction(failedStep)
   });
 }
 
-function completePartialFlow(flowId, failedStep, errorCode, errorDescription) {
+function completeOidcFlow(flowId, patch = {}) {
+  const flow = flowService.getFlow(flowId);
   return flowService.completeFlow(flowId, {
-    status: "partial_success",
-    failedStep,
-    errorCode: errorCode || "",
-    errorDescription: errorDescription || ""
+    ...patch,
+    runtime: sanitizeTerminalOidcRuntime({
+      ...(flow?.runtime || {}),
+      ...(patch.runtime || {})
+    })
   });
 }
 
@@ -2765,6 +2907,8 @@ async function startNewUiFlow(session, serviceProviderId) {
       tokenEndpointAuthMethod: prepared.config.tokenEndpointAuthMethod,
       expectedState: prepared.runtime.state,
       expectedNonce: prepared.runtime.nonce,
+      stateSha256: lifecycleHash(prepared.runtime.state),
+      nonceSha256: lifecycleHash(prepared.runtime.nonce),
       codeVerifier: prepared.runtime.codeVerifier,
       codeChallenge: prepared.runtime.codeChallenge
     };
@@ -2802,7 +2946,7 @@ async function startNewUiFlow(session, serviceProviderId) {
 }
 
 async function processNewUiCallback({ req, flow, params }) {
-  const stateCheck = evaluateState(flow.runtime?.expectedState || "", params.state);
+  const stateCheck = evaluateFlowState(flow, params.state);
   const callbackStep = buildCallbackStep({ flow, req, params, stateCheck });
   flowService.addFlowStep(flow.id, callbackStep);
 
@@ -2826,6 +2970,43 @@ async function processNewUiCallback({ req, flow, params }) {
       clientSecret,
       redirectUri: flow.runtime?.redirectUri || FIXED_REDIRECT_URI
     });
+
+    if (effectiveConfig.pkceEnabled !== false && flow.runtime?.codeVerifierPresent === "yes" && !flow.runtime?.codeVerifier) {
+      flowService.addFlowStep(flow.id, {
+        stepName: "token",
+        status: "error",
+        httpMethod: "POST",
+        endpoint: flow.runtime?.tokenEndpoint || effectiveConfig.tokenEndpoint || "",
+        httpStatus: null,
+        requestData: {
+          method: "POST",
+          endpoint: flow.runtime?.tokenEndpoint || effectiveConfig.tokenEndpoint || "",
+          client_id: selected.clientId,
+          client_secret: selected.clientType === "confidential" ? "********" : "not used",
+          code: params.code ? "present" : "missing",
+          code_verifier: "missing"
+        },
+        responseData: null,
+        rawRequestData: null,
+        rawResponseData: {
+          status: 0,
+          ok: false,
+          headers: {},
+          body: {},
+          error: "PKCE verifier is no longer available for this running flow."
+        },
+        rawRequestNature: "Skipped",
+        rawResponseNature: "Synthetic local response",
+        errorData: {
+          errorCode: "pkce_verifier_missing",
+          errorDescription: "The running flow lost its PKCE verifier before callback processing. Start a new flow."
+        },
+        completedAt: new Date().toISOString()
+      });
+      failFlow(flow.id, "token", "pkce_verifier_missing", "The running flow lost its PKCE verifier before callback processing. Start a new flow.");
+      return flowService.getFlow(flow.id);
+    }
+
     const requestSnapshot = buildTokenExchangeRequest({
       config: effectiveConfig,
       code: params.code,
@@ -2847,7 +3028,13 @@ async function processNewUiCallback({ req, flow, params }) {
     if (!accessToken || !userInfoEndpoint) {
       const skippedReason = !accessToken ? "access_token missing" : "UserInfo endpoint missing";
       flowService.addFlowStep(flow.id, buildUserInfoStep({ skippedReason }));
-      completePartialFlow(flow.id, "userinfo", "userinfo_skipped", skippedReason);
+      completeOidcFlow(flow.id, {
+        status: "success",
+        lastStep: "userinfo",
+        failedStep: "",
+        errorCode: "",
+        errorDescription: ""
+      });
       return flowService.getFlow(flow.id);
     }
 
@@ -2864,11 +3051,17 @@ async function processNewUiCallback({ req, flow, params }) {
 
     if (userInfoStep.status === "error") {
       const errorData = userInfoStep.errorData || {};
-      completePartialFlow(flow.id, "userinfo", errorData.errorCode, errorData.errorDescription);
+      failFlow(flow.id, "userinfo", errorData.errorCode, errorData.errorDescription);
       return flowService.getFlow(flow.id);
     }
 
-    flowService.completeFlow(flow.id, { status: "success" });
+    completeOidcFlow(flow.id, {
+      status: "success",
+      lastStep: "userinfo",
+      failedStep: "",
+      errorCode: "",
+      errorDescription: ""
+    });
     return flowService.getFlow(flow.id);
   } catch (error) {
     flowService.addFlowStep(flow.id, {
@@ -3877,9 +4070,16 @@ const server = http.createServer(async (req, res) => {
       const body = req.method === "POST" ? parseBody(req, rawBody) : {};
       const params = req.method === "POST" ? body : Object.fromEntries(url.searchParams.entries());
 
-      const newUiFlow = flowService.findRunningFlowByState(params.state || "", FLOW_STATE_TTL_MS);
+      const newUiFlow = findRunningFlowByCallbackState(params.state || "");
       if (newUiFlow) {
         const completedFlow = await processNewUiCallback({ req, flow: newUiFlow, params });
+        redirect(res, `/oidc/flows/${encodeURIComponent(completedFlow.id)}`);
+        return;
+      }
+
+      const invalidStateFlow = findSingleRecentRunningOidcFlow();
+      if (invalidStateFlow) {
+        const completedFlow = await processNewUiCallback({ req, flow: invalidStateFlow, params });
         redirect(res, `/oidc/flows/${encodeURIComponent(completedFlow.id)}`);
         return;
       }

@@ -24,7 +24,9 @@ import {
   normalizeProviderConfig
 } from "../src/protocols/oidc/oidc.js";
 
+import { createFlowService } from "../src/protocols/oidc/services/flows.js";
 import { validateServiceProviderInput } from "../src/protocols/oidc/services/serviceProviders.js";
+import { renderFlowResultPage } from "../src/protocols/oidc/views/flowResult.js";
 
 // ---------------------------------------------------------------------------
 // Helper
@@ -34,6 +36,92 @@ function containsSecret(obj, secret) {
   const serialized = JSON.stringify(obj);
   return serialized.includes(secret);
 }
+
+function createInMemoryFlowService() {
+  let flows = [];
+  let steps = [];
+  let sequence = 0;
+
+  return createFlowService({
+    getFlows: () => flows,
+    setFlows: (next) => {
+      flows = next;
+    },
+    getSteps: () => steps,
+    setSteps: (next) => {
+      steps = next;
+    },
+    createId: (prefix) => `${prefix}_${++sequence}`
+  });
+}
+
+// ---------------------------------------------------------------------------
+// OIDC lifecycle status
+// ---------------------------------------------------------------------------
+
+describe("OIDC lifecycle status", () => {
+  it("creates new OIDC flows as running and marks completed flows explicitly", () => {
+    const flowService = createInMemoryFlowService();
+    const flow = flowService.createFlow("sp_1", { serviceProviderName: "Test SP" });
+
+    assert.equal(flow.status, "running");
+    assert.equal(flow.completedAt, null);
+
+    flowService.addFlowStep(flow.id, {
+      stepName: "callback",
+      status: "success",
+      completedAt: "2026-05-12T10:00:00.000Z"
+    });
+
+    const completed = flowService.completeFlow(flow.id, {
+      status: "success",
+      lastStep: "userinfo"
+    });
+
+    assert.equal(completed.status, "success");
+    assert.equal(completed.lastStep, "userinfo");
+    assert.ok(completed.completedAt, "completedAt must be set");
+    assert.ok(completed.updatedAt, "updatedAt must be set");
+  });
+
+  it("does not render ID Token analysis as pending once token analysis completed", () => {
+    const html = renderFlowResultPage({
+      flow: {
+        id: "flow_1",
+        status: "success",
+        statusBadge: { label: "Success", tone: "success" },
+        startedAt: "2026-05-12T10:00:00.000Z",
+        durationMs: 42
+      },
+      serviceProvider: { name: "Test SP", clientId: "client" },
+      steps: [
+        { stepName: "authorize", status: "success" },
+        { stepName: "callback", status: "success" },
+        {
+          stepName: "token",
+          status: "success",
+          responseData: {
+            id_token_diagnostics: {
+              id_token_received: "yes",
+              signature_validation: "not implemented",
+              overall_validation: "incomplete"
+            }
+          },
+          rawAnalysisData: {
+            validation: {
+              signature: "not_implemented",
+              overall: "incomplete"
+            }
+          }
+        },
+        { stepName: "userinfo", status: "success" }
+      ]
+    });
+
+    assert.match(html, /ID Token analysis/);
+    assert.doesNotMatch(html, /ID Token analysis[\s\S]*Pending/);
+  });
+});
 
 // ---------------------------------------------------------------------------
 // analyzeTokens — must NOT expose raw token values
