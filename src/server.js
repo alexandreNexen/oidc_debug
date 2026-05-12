@@ -228,6 +228,10 @@ function parseSnapshotBody(body = "", contentType = "") {
     return null;
   }
 
+  if (typeof body !== "string") {
+    return body;
+  }
+
   if (contentType.includes("application/x-www-form-urlencoded")) {
     return Object.fromEntries(new URLSearchParams(body).entries());
   }
@@ -250,7 +254,11 @@ function diagnosticReceived(value) {
 function redactProtocolParam(key, value) {
   const normalized = String(key || "").toLowerCase();
 
-  if (["state", "nonce", "code_challenge", "code_challenge_method"].includes(normalized)) {
+  if (normalized === "code_challenge_method") {
+    return sanitizeDiagnosticData(value, key);
+  }
+
+  if (["state", "nonce", "code_challenge"].includes(normalized)) {
     return diagnosticPresence(value);
   }
 
@@ -288,6 +296,268 @@ function redactDiagnosticUrl(rawUrl = "") {
   } catch {
     return rawUrl;
   }
+}
+
+function sanitizeDiagnosticError(value = "") {
+  if (!value) {
+    return "";
+  }
+
+  return String(value)
+    .replace(/\b(Bearer|Basic)\s+[A-Za-z0-9._~+/-]+=*/gi, "$1 ********")
+    .replace(/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted-jwt]")
+    .replace(/\b(access_token|id_token|refresh_token|client_secret|code_verifier|code|state|nonce)=([^&\s]+)/gi, "$1=********");
+}
+
+function tokenPresence(value) {
+  return value === undefined || value === null || value === "" ? "missing" : "present";
+}
+
+function usefulSanitizedHeaders(headers = {}) {
+  return sanitizeDiagnosticData(headers || {});
+}
+
+function sanitizeAuthorizationRequestRaw(request = {}) {
+  return {
+    method: request.method || "GET",
+    url: redactDiagnosticUrl(request.url || ""),
+    headers: usefulSanitizedHeaders(request.headers || {}),
+    params: redactProtocolParams(request.params || {})
+  };
+}
+
+function sanitizeCallbackParams(params = {}) {
+  return sanitizeDiagnosticData({
+    code: diagnosticPresence(params.code),
+    state: diagnosticPresence(params.state),
+    ...(params.error ? { error: sanitizeDiagnosticError(params.error) } : {}),
+    ...(params.error_description ? { error_description: sanitizeDiagnosticError(params.error_description) } : {})
+  });
+}
+
+function sanitizeCallbackRaw({ req, params = {}, stateCheck = "" }) {
+  const method = req?.method || "GET";
+  const localUrl = method === "GET"
+    ? redactDiagnosticUrl(req?.url || "/oidc/callback")
+    : "/oidc/callback";
+  const callbackParams = sanitizeCallbackParams(params);
+
+  return {
+    method,
+    url: localUrl,
+    ...(method === "POST" ? { body: callbackParams } : { query: callbackParams }),
+    validation: {
+      callback_received: true,
+      state_received: Boolean(params.state),
+      state_valid: stateCheck === "match",
+      provider_error: params.error ? sanitizeDiagnosticError(params.error) : null
+    },
+    app_response_raw: {
+      status: 302,
+      ok: true,
+      headers: {
+        location: "flow result page"
+      }
+    }
+  };
+}
+
+function sanitizeTokenRequestRaw(request = {}) {
+  const contentType = request.headers?.["content-type"] || request.headers?.["Content-Type"] || "";
+  const parsedBody = parseSnapshotBody(request.body || "", contentType) || request.params || {};
+
+  return {
+    method: request.method || "POST",
+    url: redactDiagnosticUrl(request.url || ""),
+    headers: usefulSanitizedHeaders(request.headers || {}),
+    body: redactProtocolParams(parsedBody || {})
+  };
+}
+
+function sanitizeTokenResponseRaw(response = null) {
+  if (!response) {
+    return null;
+  }
+
+  const parsed = response.parsed || parseSnapshotBody(response.body || "", response.headers?.["content-type"] || "") || {};
+
+  return sanitizeDiagnosticData({
+    status: response.status ?? 0,
+    ok: Boolean(response.ok),
+    headers: usefulSanitizedHeaders(response.headers || {}),
+    body: {
+      access_token: tokenPresence(parsed.access_token),
+      id_token: tokenPresence(parsed.id_token),
+      refresh_token: tokenPresence(parsed.refresh_token),
+      ...(parsed.token_type !== undefined ? { token_type: parsed.token_type } : {}),
+      ...(parsed.expires_in !== undefined ? { expires_in: parsed.expires_in } : {}),
+      ...(parsed.scope !== undefined ? { scope: parsed.scope } : {}),
+      ...(parsed.error !== undefined ? { error: sanitizeDiagnosticError(parsed.error) } : {}),
+      ...(parsed.error_description !== undefined ? { error_description: sanitizeDiagnosticError(parsed.error_description) } : {})
+    },
+    error: response.error ? sanitizeDiagnosticError(response.error) : null
+  });
+}
+
+function sanitizeUserInfoRequestRaw(request = null) {
+  if (!request) {
+    return null;
+  }
+
+  return {
+    method: request.method || "GET",
+    url: redactDiagnosticUrl(request.url || ""),
+    headers: usefulSanitizedHeaders(request.headers || {}),
+    params: {}
+  };
+}
+
+function sanitizeUserInfoClaims(claims = {}) {
+  const sanitized = sanitizeDiagnosticData(claims || {});
+  if (!sanitized || typeof sanitized !== "object" || Array.isArray(sanitized)) {
+    return sanitized;
+  }
+
+  const { claims: _nestedClaims, ...withoutNestedClaims } = sanitized;
+  return withoutNestedClaims;
+}
+
+function extractUserInfoClaims(parsed = {}) {
+  let claims = parsed || {};
+
+  while (
+    claims?.claims &&
+    typeof claims.claims === "object" &&
+    !Array.isArray(claims.claims) &&
+    !claims.raw_claims_available
+  ) {
+    claims = claims.claims;
+  }
+
+  return sanitizeUserInfoClaims(claims);
+}
+
+function sanitizeUserInfoResponseRaw(response = null) {
+  if (!response) {
+    return null;
+  }
+
+  const parsed = response.parsed || parseSnapshotBody(response.body || "", response.headers?.["content-type"] || "") || {};
+  const claims = extractUserInfoClaims(parsed);
+
+  return {
+    status: response.status ?? 0,
+    ok: Boolean(response.ok),
+    headers: usefulSanitizedHeaders(response.headers || {}),
+    body: {
+      sub: claims.sub || "missing",
+      email: claims.email || "missing",
+      name: claims.name || "missing",
+      claims
+    },
+    error: response.error ? sanitizeDiagnosticError(response.error) : null
+  };
+}
+
+function sanitizeJwtPayload(payload = {}) {
+  const claims = sanitizeDiagnosticData(payload || {});
+  const usefulClaims = {};
+
+  for (const [key, value] of Object.entries(claims)) {
+    if (!["iss", "aud", "sub", "exp", "iat", "nonce"].includes(key)) {
+      usefulClaims[key] = value;
+    }
+  }
+
+  return {
+    iss: claims.iss || "",
+    aud: claims.aud || "",
+    sub: claims.sub || "",
+    exp: claims.exp || "",
+    iat: claims.iat || "",
+    nonce: diagnosticPresence(payload?.nonce),
+    ...usefulClaims
+  };
+}
+
+function evaluateJwtExpiration(exp) {
+  const epochSeconds = Number(exp);
+  if (!Number.isFinite(epochSeconds)) {
+    return "not_checked";
+  }
+
+  return epochSeconds * 1000 > Date.now() ? "valid" : "invalid";
+}
+
+function buildIdTokenAnalysisRaw(idToken = "", flow = null) {
+  const decoded = decodeJwt(idToken || "");
+  const expectedIssuer = flow?.runtime?.provider?.issuer || "";
+  const expectedAudience = flow?.runtime?.clientId || "";
+  const expectedNonce = flow?.runtime?.expectedNonce || "";
+
+  if (!idToken) {
+    return {
+      source: "token_response.id_token",
+      jwt: null,
+      validation: {
+        issuer: "not_checked",
+        audience: "not_checked",
+        expiration: "not_checked",
+        nonce: "missing",
+        signature: "not_implemented",
+        overall: "incomplete"
+      },
+      decoded: "no",
+      claims_readable: "no"
+    };
+  }
+
+  if (!decoded.isJwt) {
+    return {
+      source: "token_response.id_token",
+      jwt: {
+        header: {},
+        payload: {}
+      },
+      validation: {
+        issuer: "not_checked",
+        audience: "not_checked",
+        expiration: "not_checked",
+        nonce: "not_checked",
+        signature: "not_implemented",
+        overall: "incomplete"
+      },
+      decoded: "no",
+      claims_readable: "no",
+      error: sanitizeDiagnosticError(decoded.error || "JWT could not be decoded.")
+    };
+  }
+
+  const payload = decoded.payload || {};
+  const audienceValues = Array.isArray(payload.aud) ? payload.aud : [payload.aud].filter(Boolean);
+  const nonceClaim = payload.nonce || "";
+
+  return {
+    source: "token_response.id_token",
+    jwt: {
+      header: sanitizeDiagnosticData({
+        alg: decoded.header?.alg || "",
+        kid: decoded.header?.kid || "",
+        ...(decoded.header?.typ ? { typ: decoded.header.typ } : {})
+      }),
+      payload: sanitizeJwtPayload(payload)
+    },
+    validation: {
+      issuer: expectedIssuer ? (payload.iss === expectedIssuer ? "valid" : "invalid") : "not_checked",
+      audience: expectedAudience ? (audienceValues.includes(expectedAudience) ? "valid" : "invalid") : "not_checked",
+      expiration: evaluateJwtExpiration(payload.exp),
+      nonce: expectedNonce ? (nonceClaim ? (nonceClaim === expectedNonce ? "valid" : "invalid") : "missing") : "not_checked",
+      signature: "not_implemented",
+      overall: "incomplete"
+    },
+    decoded: "yes",
+    claims_readable: "yes"
+  };
 }
 
 function sanitizeRawRequest(request = null) {
@@ -335,11 +605,89 @@ function sanitizeRawResponse(response = null, { bodyMode = "default" } = {}) {
   return sanitizeDiagnosticData({
     status: response.status ?? 0,
     ok: Boolean(response.ok),
-    headers: response.headers || {},
+    headers: usefulSanitizedHeaders(response.headers || {}),
     body,
-    error: response.error || "",
+    error: response.error ? sanitizeDiagnosticError(response.error) : "",
     diagnostics: response.diagnostics || null
   });
+}
+
+function callbackStateCheckFromStep(step = {}) {
+  const value = step.responseData?.state_validation || step.responseData?.state || step.rawResponseData?.state_validation || step.rawResponseData?.state || "";
+  if (value === "valid" || value === "match") {
+    return "match";
+  }
+  if (value === "missing" || value === "mismatch") {
+    return value;
+  }
+  return "";
+}
+
+function sanitizeCallbackRawFromStep(step = {}) {
+  const raw = step.rawRequestData || step.rawResponseData || {};
+  const params = raw.query || raw.body || raw.params || {
+    code: step.responseData?.authorization_code,
+    state: step.responseData?.state,
+    error: step.responseData?.error,
+    error_description: step.responseData?.error_description
+  };
+
+  return sanitizeCallbackRaw({
+    req: {
+      method: raw.method || step.httpMethod || "GET",
+      url: raw.url || "/oidc/callback"
+    },
+    params,
+    stateCheck: callbackStateCheckFromStep(step)
+  });
+}
+
+function sanitizeOidcRawRequestForStep(stepName, rawRequestData, step = {}) {
+  if (!rawRequestData) {
+    return null;
+  }
+
+  if (stepName === "authorize") {
+    return sanitizeAuthorizationRequestRaw(rawRequestData);
+  }
+
+  if (stepName === "callback") {
+    return sanitizeCallbackRawFromStep(step);
+  }
+
+  if (stepName === "token") {
+    return sanitizeTokenRequestRaw(rawRequestData);
+  }
+
+  if (stepName === "userinfo") {
+    return sanitizeUserInfoRequestRaw(rawRequestData);
+  }
+
+  return sanitizeRawRequest(rawRequestData);
+}
+
+function sanitizeOidcRawResponseForStep(stepName, rawResponseData, step = {}) {
+  if (!rawResponseData) {
+    return null;
+  }
+
+  if (stepName === "callback") {
+    return sanitizeCallbackRawFromStep(step);
+  }
+
+  if (stepName === "token") {
+    return sanitizeTokenResponseRaw(rawResponseData);
+  }
+
+  if (stepName === "userinfo") {
+    return sanitizeUserInfoResponseRaw(rawResponseData);
+  }
+
+  if (rawResponseData.body && typeof rawResponseData.body === "object") {
+    return sanitizeDiagnosticData(rawResponseData);
+  }
+
+  return sanitizeRawResponse(rawResponseData);
 }
 
 function sanitizeProviderConfig(input = providerConfig) {
@@ -395,6 +743,12 @@ function sanitizeSessionArtifacts(session) {
           ...session.runtimeContext
         }
       : null,
+    flow: {
+      expectedState: session.flow?.expectedState ? "present" : "missing",
+      expectedNonce: session.flow?.expectedNonce ? "present" : "missing",
+      codeVerifier: session.flow?.codeVerifier ? "present" : "missing",
+      codeChallenge: session.flow?.codeChallenge ? "present" : "missing"
+    },
     steps: {
       ...session.steps,
       token: session.steps?.token
@@ -438,7 +792,7 @@ function createSession() {
 }
 
 function sanitizeTerminalOidcFlow(flow) {
-  if (!flow || flow.status === "running" || !flow.runtime) {
+  if (!flow || !flow.runtime) {
     return flow;
   }
 
@@ -473,25 +827,17 @@ function sanitizeOidcStepForPersistence(step = {}) {
       }
     : step.responseData;
   const rawResponseData = step.rawResponseData
-    ? sanitizeDiagnosticData({
-        ...step.rawResponseData,
-        body: step.stepName === "userinfo" && step.rawResponseData.body && typeof step.rawResponseData.body === "object"
-          ? summarizeUserInfoClaims(step.rawResponseData.body)
-          : step.rawResponseData.body
-      })
+    ? sanitizeOidcRawResponseForStep(step.stepName, step.rawResponseData, step)
     : step.rawResponseData;
 
   return {
     ...step,
     responseData,
     rawRequestData: step.rawRequestData
-      ? {
-          ...step.rawRequestData,
-          url: redactDiagnosticUrl(step.rawRequestData.url || ""),
-          params: redactProtocolParams(step.rawRequestData.params || {})
-        }
+      ? sanitizeOidcRawRequestForStep(step.stepName, step.rawRequestData, step)
       : step.rawRequestData,
-    rawResponseData
+    rawResponseData,
+    rawAnalysisData: step.rawAnalysisData ? sanitizeDiagnosticData(step.rawAnalysisData) : null
   };
 }
 
@@ -648,7 +994,10 @@ async function loadPersistedState() {
     providerConfig = sanitizeProviderConfig(hydrated.oidc?.providerConfig);
     oidcEnvironmentConfig = hydrated.oidc?.environmentConfig || {};
     serviceProviderService.hydrateServiceProviders(hydrated.oidc?.serviceProviders || []);
-    flowService.hydrateFlows(hydrated.oidc?.flows || [], hydrated.oidc?.flowSteps || []);
+    flowService.hydrateFlows(
+      (hydrated.oidc?.flows || []).map(sanitizeTerminalOidcFlow),
+      (hydrated.oidc?.flowSteps || []).map(sanitizeOidcStepForPersistence)
+    );
     samlServiceProviderService.hydrateSamlServiceProviders(hydrated.saml?.serviceProviders || []);
     samlFlowService.hydrateSamlFlows(hydrated.saml?.flows || [], hydrated.saml?.flowSteps || []);
 
@@ -695,6 +1044,8 @@ async function loadPersistedState() {
       oidcFlows: flows.length,
       samlServiceProviders: samlServiceProviders.length
     });
+
+    await persistStateNow();
   } catch (error) {
     if (error.code === "ENOENT") {
       appLog("info", "No persisted state found, starting with empty state", {
@@ -1526,7 +1877,11 @@ function buildIdTokenDiagnostics(idToken = "", expectedNonce = "") {
   const decoded = decodeJwt(idToken || "");
   if (!idToken) {
     return {
-      id_token_received: "no"
+      id_token_received: "no",
+      decoded: "no",
+      claims_readable: "no",
+      signature_validation: "not implemented",
+      overall_validation: "incomplete"
     };
   }
 
@@ -1535,18 +1890,23 @@ function buildIdTokenDiagnostics(idToken = "", expectedNonce = "") {
       id_token_received: "yes",
       format: "not JWT",
       decode_error: decoded.error || "JWT could not be decoded.",
-      nonce_validation: "not implemented",
-      signature_validation: "not implemented"
+      decoded: "no",
+      claims_readable: "no",
+      nonce_validation: "not checked",
+      signature_validation: "not implemented",
+      overall_validation: "incomplete"
     };
   }
 
   const nonceClaim = decoded.payload?.nonce || "";
   const nonceValidation = nonceClaim && expectedNonce
-    ? (nonceClaim === expectedNonce ? "valid" : "failed")
-    : "not implemented";
+    ? (nonceClaim === expectedNonce ? "valid" : "invalid")
+    : nonceClaim ? "not checked" : "missing";
 
   return {
     id_token_received: "yes",
+    decoded: "yes",
+    claims_readable: "yes",
     jwt_header_alg: decoded.header?.alg || "",
     jwt_header_kid: decoded.header?.kid || "",
     issuer: decoded.payload?.iss || "",
@@ -1556,7 +1916,8 @@ function buildIdTokenDiagnostics(idToken = "", expectedNonce = "") {
     issued_at: epochToIso(decoded.payload?.iat),
     nonce_claim_present: yesNo(nonceClaim),
     nonce_validation: nonceValidation,
-    signature_validation: "not implemented"
+    signature_validation: "not implemented",
+    overall_validation: "incomplete"
   };
 }
 
@@ -1831,9 +2192,11 @@ function samlFlowSummary(flow) {
 }
 
 function flowStepSummary(stepName, step) {
-  const rawRequestData = step?.rawRequestData ? sanitizeRawRequest(step.rawRequestData) : null;
+  const rawRequestData = step?.rawRequestData
+    ? sanitizeOidcRawRequestForStep(stepName, step.rawRequestData, step)
+    : null;
   const rawResponseData = step?.rawResponseData
-    ? sanitizeRawResponse(step.rawResponseData, { bodyMode: stepName === "userinfo" ? "userinfo" : "default" })
+    ? sanitizeOidcRawResponseForStep(stepName, step.rawResponseData, step)
     : null;
   const responseData = step?.responseData?.authorization_url_full
     ? {
@@ -1853,6 +2216,7 @@ function flowStepSummary(stepName, step) {
     responseData,
     rawRequestData,
     rawResponseData,
+    rawAnalysisData: step?.rawAnalysisData ? sanitizeDiagnosticData(step.rawAnalysisData) : null,
     rawRequestNature: step?.rawRequestNature || "",
     rawResponseNature: step?.rawResponseNature || "",
     errorData: step?.errorData || null,
@@ -1968,7 +2332,7 @@ function attachSamlFlowsToServiceProviders(entries) {
 }
 
 function buildAuthorizeStep({ flow, runConfig, prepared }) {
-  const rawRequestData = sanitizeRawRequest(prepared.request);
+  const rawRequestData = sanitizeAuthorizationRequestRaw(prepared.request);
 
   return {
     stepName: "authorize",
@@ -2168,20 +2532,10 @@ function buildCallbackStep({ flow, req, params, stateCheck }) {
       error: params.error || "",
       error_description: params.error_description || ""
     },
-    rawRequestData: sanitizeDiagnosticData({
-      method: req.method,
-      url: "/oidc/callback",
-      params: redactProtocolParams(params)
-    }),
-    rawResponseData: sanitizeDiagnosticData({
-      status: 302,
-      state_validation: stateCheck === "match" ? "valid" : stateCheck,
-      authorization_code: params.code ? "received" : "missing",
-      error: params.error || "",
-      error_description: params.error_description || ""
-    }),
+    rawRequestData: sanitizeCallbackRaw({ req, params, stateCheck }),
+    rawResponseData: sanitizeCallbackRaw({ req, params, stateCheck }),
     rawRequestNature: "Reconstructed inbound request",
-    rawResponseNature: "Synthetic local response",
+    rawResponseNature: "Callback received",
     errorData: success
       ? null
       : {
@@ -2221,9 +2575,9 @@ function buildTokenStep({ requestSnapshot, responseSnapshot, flow = null }) {
     },
     responseData: {
       http_status: responseSnapshot.status || 0,
-      id_token: tokenReceived(parsed.id_token),
-      access_token: tokenReceived(parsed.access_token),
-      refresh_token: tokenReceived(parsed.refresh_token),
+      id_token: tokenPresence(parsed.id_token),
+      access_token: tokenPresence(parsed.access_token),
+      refresh_token: tokenPresence(parsed.refresh_token),
       expires_in: parsed.expires_in || "",
       token_type: parsed.token_type || "",
       token_error: parsed.error || responseSnapshot.error || "none",
@@ -2232,15 +2586,16 @@ function buildTokenStep({ requestSnapshot, responseSnapshot, flow = null }) {
       access_token_claims: accessTokenClaims.isJwt ? selectedClaims(accessTokenClaims.payload) : {},
       id_token_diagnostics: buildIdTokenDiagnostics(parsed.id_token || "", flow?.runtime?.expectedNonce || "")
     },
-    rawRequestData: sanitizeRawRequest(requestSnapshot),
-    rawResponseData: sanitizeRawResponse(responseSnapshot),
+    rawRequestData: sanitizeTokenRequestRaw(requestSnapshot),
+    rawResponseData: sanitizeTokenResponseRaw(responseSnapshot),
+    rawAnalysisData: buildIdTokenAnalysisRaw(parsed.id_token || "", flow),
     rawRequestNature: "Real outbound HTTP request",
     rawResponseNature: "Real inbound HTTP response",
     errorData: ok
       ? null
       : {
-          errorCode: parsed.error || responseSnapshot.error || "token_exchange_failed",
-          errorDescription: parsed.error_description || responseSnapshot.error || "Token endpoint did not return usable tokens.",
+          errorCode: sanitizeDiagnosticError(parsed.error || responseSnapshot.error || "token_exchange_failed"),
+          errorDescription: sanitizeDiagnosticError(parsed.error_description || responseSnapshot.error || "Token endpoint did not return usable tokens."),
           diagnostics: responseSnapshot.diagnostics || null
         },
     completedAt: new Date().toISOString()
@@ -2265,7 +2620,7 @@ function buildUserInfoStep({ requestSnapshot = null, responseSnapshot = null, sk
         called: "no",
         skipped_reason: skippedReason
       },
-      rawRequestData: sanitizeRawRequest(requestSnapshot),
+      rawRequestData: sanitizeUserInfoRequestRaw(requestSnapshot),
       rawResponseData: null,
       rawRequestNature: requestSnapshot ? "Real outbound HTTP request" : "Skipped",
       rawResponseNature: "Skipped",
@@ -2298,15 +2653,15 @@ function buildUserInfoStep({ requestSnapshot = null, responseSnapshot = null, sk
       error: parsed.error || responseSnapshot.error || "none",
       error_description: parsed.error_description || ""
     },
-    rawRequestData: sanitizeRawRequest(requestSnapshot),
-    rawResponseData: sanitizeRawResponse(responseSnapshot, { bodyMode: "userinfo" }),
+    rawRequestData: sanitizeUserInfoRequestRaw(requestSnapshot),
+    rawResponseData: sanitizeUserInfoResponseRaw(responseSnapshot),
     rawRequestNature: "Real outbound HTTP request",
     rawResponseNature: "Real inbound HTTP response",
     errorData: responseSnapshot.ok
       ? null
       : {
-          errorCode: parsed.error || responseSnapshot.error || "userinfo_failed",
-          errorDescription: parsed.error_description || responseSnapshot.error || "UserInfo endpoint did not return a successful response.",
+          errorCode: sanitizeDiagnosticError(parsed.error || responseSnapshot.error || "userinfo_failed"),
+          errorDescription: sanitizeDiagnosticError(parsed.error_description || responseSnapshot.error || "UserInfo endpoint did not return a successful response."),
           diagnostics: responseSnapshot.diagnostics || null
         },
     completedAt: new Date().toISOString()
@@ -2532,13 +2887,21 @@ async function processNewUiCallback({ req, flow, params }) {
       responseData: null,
       rawRequestData: sanitizeDiagnosticData({
         method: "POST",
-        endpoint: flow.runtime?.tokenEndpoint || "",
-        client_id: selected.clientId,
-        code: params.code ? "present" : "missing",
-        code_verifier: flow.runtime?.codeVerifier ? "present" : "missing"
+        url: flow.runtime?.tokenEndpoint || "",
+        headers: {},
+        body: {
+          grant_type: "authorization_code",
+          code: params.code ? "present" : "missing",
+          redirect_uri: flow.runtime?.redirectUri || "",
+          code_verifier: flow.runtime?.codeVerifier ? "present" : "missing"
+        }
       }),
       rawResponseData: {
-        error: error.message
+        status: 0,
+        ok: false,
+        headers: {},
+        body: {},
+        error: sanitizeDiagnosticError(error.message)
       },
       rawRequestNature: "Skipped",
       rawResponseNature: "Synthetic local response",

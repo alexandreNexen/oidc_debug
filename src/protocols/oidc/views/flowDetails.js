@@ -90,7 +90,7 @@ function rawBtn(title, stepName, type, rawData) {
     data-raw-step="${escapeHtml(stepName)}"
     data-raw-type="${escapeHtml(label)}"
     data-raw-json="${escapeHtml(encodeRawData(rawData))}"
-  >Raw</button>`;
+  >Sanitized raw</button>`;
 }
 
 function sectionHead(title, summary) {
@@ -212,8 +212,8 @@ function renderAuthorization(steps) {
           rawBtn("Raw Authorization Request", "authorize", "request", auth?.rawRequestData),
           requestContent,
           auth?.errorData?.errorDescription)}
-        ${exchangePanel("Response",
-          rawBtn("Raw Callback Response", "callback", "response", cb?.rawResponseData),
+        ${exchangePanel("Callback received",
+          rawBtn("Sanitized Callback Received", "callback", "response", cb?.rawResponseData || cb?.rawRequestData),
           responseContent,
           cb?.errorData?.errorDescription)}
       </div>
@@ -328,7 +328,8 @@ function renderUserInfo(steps) {
 function renderIdTokenAnalysis(steps) {
   const token = steps.find((s) => s.stepName === "token");
   const diag = token?.responseData?.id_token_diagnostics;
-  const rawButton = rawBtn("Raw Token Response", "token", "response", token?.rawResponseData);
+  const analysisRaw = token?.rawAnalysisData || null;
+  const rawButton = rawBtn("Sanitized ID Token Analysis", "token", "response", analysisRaw);
   const noData = !diag || diag.id_token_received === "no";
 
   return `
@@ -343,6 +344,8 @@ function renderIdTokenAnalysis(steps) {
           ? `<p class="muted">${token ? "No ID token received." : "Not reached."}</p>`
           : dl([
               row("ID token received", badge(diag.id_token_received)),
+              row("Decoded", badge(diag.decoded || "yes")),
+              row("Claims readable", badge(diag.claims_readable || "yes")),
               diag.format ? row("Format", plain(diag.format)) : null,
               diag.decode_error ? row("Decode error", plain(diag.decode_error)) : null,
               diag.jwt_header_alg ? row("Algorithm (alg)", plain(diag.jwt_header_alg)) : null,
@@ -354,7 +357,8 @@ function renderIdTokenAnalysis(steps) {
               diag.issued_at ? row("Issued at", plain(diag.issued_at)) : null,
               row("Nonce claim present", badge(diag.nonce_claim_present)),
               row("Nonce validation", badge(diag.nonce_validation)),
-              row("Signature validation", badge(diag.signature_validation || "not implemented"))
+              row("Signature validation", badge(diag.signature_validation || "not implemented")),
+              row("Overall validation", badge(diag.overall_validation || "incomplete"))
             ])}
       </article>
     </section>`;
@@ -435,7 +439,7 @@ export function renderFlowDetailsPage({ flow, serviceProvider, steps = [], flash
       <section class="modal" role="dialog" aria-modal="true" aria-labelledby="raw-modal-title">
         <header class="modal__header">
           <div>
-            <h2 id="raw-modal-title">Raw data</h2>
+            <h2 id="raw-modal-title">Sanitized raw data</h2>
             <p class="modal__subtitle muted" data-raw-modal-subtitle></p>
           </div>
         </header>

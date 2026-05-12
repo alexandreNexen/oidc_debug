@@ -525,7 +525,7 @@ export function redactObject(value, parentKey = "") {
 }
 
 function tokenPresence(value) {
-  return value === undefined || value === null || value === "" ? "missing" : "received";
+  return value === undefined || value === null || value === "" ? "missing" : "present";
 }
 
 function presence(value) {
