@@ -26,7 +26,7 @@ function encodeRawData(value) {
 
 // ---- Status badge helpers ----
 
-const BADGE_SUCCESS = new Set(["yes", "received", "present", "sent", "valid", "success", "match", "ok", "decoded: success"]);
+const BADGE_SUCCESS = new Set(["yes", "received", "present", "sent", "valid", "success", "match", "ok", "decoded: success", "complete", "available"]);
 const BADGE_ERROR = new Set(["no", "missing", "failed", "mismatch", "error", "failure", "invalid"]);
 const BADGE_NEUTRAL = new Set([
   "not implemented", "not checked", "not extracted", "skipped", "none",
@@ -322,15 +322,27 @@ function renderIdentityAssertion(steps) {
     row("InResponseTo vs Request ID", badge(diagnostics.in_response_to_vs_request_id)),
     row("Destination vs ACS URL", badge(diagnostics.destination_vs_acs_url)),
     row("Audience vs SP Entity ID", badge(diagnostics.audience_vs_sp_entity_id)),
-    row("Temporal conditions", badge(diagnostics.temporal_conditions))
+    row("Temporal conditions", badge(diagnostics.temporal_conditions)),
+    row("Issuer validation", badge(diagnostics.issuer_validation || resp.issuer_validation || "not_checked")),
+    row("XSW protection", badge(diagnostics.xsw_protection || resp.xsw_protection || "incomplete"))
   ]));
 
   const sigNote = resp.verification_note
     ? `<p class="muted" style="margin:8px 0 0">${escapeHtml(resp.verification_note)}</p>`
     : "";
-  const trustWarning = resp.saml_status === "Success" && resp.trust_validation !== "complete"
-    ? `<div class="form-banner form-banner--warning" style="margin-top:12px">SAML status is Success, but trust validation is incomplete because the signature was not verified against a trusted IdP certificate.</div>`
-    : "";
+
+  let trustWarning = "";
+  if (resp.saml_status === "Success" && resp.trust_validation !== "complete") {
+    const errors = Array.isArray(resp.trust_validation_errors) && resp.trust_validation_errors.length > 0
+      ? resp.trust_validation_errors.join(" ")
+      : resp.trust_validation === "failed"
+        ? "One or more validation checks failed."
+        : "The SAML response was not fully verified against trusted IdP metadata.";
+    const tone = resp.trust_validation === "failed" ? "error" : "warning";
+    const prefix = resp.trust_validation === "failed" ? "Trust validation failed" : "Trust validation incomplete";
+    trustWarning = `<div class="form-banner form-banner--${escapeHtml(tone)}" style="margin-top:12px">${escapeHtml(prefix)}: ${escapeHtml(errors)}</div>`;
+  }
+
   const signatureStatus = analysisPanel("Signature status", "", dl([
     row("Response signature", badge(resp.response_signature_present || "not extracted")),
     row("Response verification", badge(resp.response_signature_verification || "not_checked")),
@@ -338,7 +350,11 @@ function renderIdentityAssertion(steps) {
     row("Assertion verification", badge(resp.assertion_signature_verification || "not_checked")),
     row("Signature verification result", badge(resp.signature_verification_result || "not_checked")),
     row("Trust validation", badge(resp.trust_validation || "incomplete")),
-    row("IdP certificates used", plain(String(resp.idp_certificates_used ?? 0)))
+    row("IdP certificates used", plain(String(resp.idp_certificates_used ?? 0))),
+    row("Issuer validation", badge(resp.issuer_validation || "not_checked")),
+    row("Temporal validation", badge(resp.temporal_validation || "not_checked")),
+    row("Replay validation", badge(resp.replay_validation || "not_implemented")),
+    row("XSW protection", badge(resp.xsw_protection || "incomplete"))
   ]) + sigNote + trustWarning);
 
   return `

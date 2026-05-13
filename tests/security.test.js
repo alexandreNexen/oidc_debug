@@ -355,7 +355,7 @@ describe("SAML diagnostics", () => {
       ]
     });
 
-    assert.match(html, /SAML status is Success, but trust validation is incomplete/);
+    assert.match(html, /Trust validation incomplete/);
     assert.match(html, /present \/ not evaluated/);
     assert.doesNotMatch(html, /alice@example\.com/);
 

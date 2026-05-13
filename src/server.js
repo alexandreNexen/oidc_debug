@@ -52,7 +52,16 @@ import {
   summarizeRelayState,
   summarizeSensitiveValue,
   extractIdpSigningCertificates,
-  verifySamlXmlSignatures
+  verifySamlXmlSignatures,
+  evaluateSamlTemporalConditions,
+  evaluateSamlIssuerValidation,
+  evaluateSamlAudienceValidation,
+  evaluateSamlDestinationValidation,
+  evaluateSamlInResponseTo,
+  evaluateSamlSubjectConfirmation,
+  checkXswProtection,
+  evaluateSamlTrustValidation,
+  SAML_CLOCK_SKEW_SECONDS
 } from "./protocols/saml/saml.js";
 import { createSamlFlowService, SAML_STEP_ORDER } from "./protocols/saml/services/flows.js";
 import { renderSamlFlowResultPage } from "./protocols/saml/views/flowResult.js";
@@ -1646,9 +1655,15 @@ function buildSamlDecodeErrorRaw({ samlResponseParam, relayState, path }) {
   };
 }
 
-function buildParsedSamlSummaryRaw({ parsed, diagnostics, attrCount, sigVerification, idpCertFingerprints }) {
+function buildParsedSamlSummaryRaw({
+  parsed, diagnostics, attrCount, sigVerification, idpCertFingerprints,
+  trustResult, xswProtection, issuerValidation, audienceValidation,
+  destinationValidation, inResponseToValidation, subjectConfirmationValidation,
+  temporalValidation, replayValidation, metadataCertificates
+}) {
   const statusMessage = sanitizeSamlDiagnosticValue(parsed.statusMessage || "(not extracted)", "status_message");
   const sv = sigVerification || {};
+  const tr = trustResult || {};
   return {
     raw_type: "Parsed SAMLResponse summary redacted",
     is_real_http_exchange: false,
@@ -1678,8 +1693,8 @@ function buildParsedSamlSummaryRaw({ parsed, diagnostics, attrCount, sigVerifica
         ? { present: true, sha256_12: parsed.sessionIndexHash }
         : { present: false },
       conditions_present: parsed.conditionsPresent ? "yes" : "no",
-      conditions_evaluated: "no",
-      temporal_conditions_status: parsed.conditionsPresent ? "present / not evaluated" : parsed.assertionPresent ? "missing" : "not extracted",
+      conditions_evaluated: temporalValidation?.conditions_evaluated ? "yes" : "no",
+      temporal_conditions_status: temporalValidation?.result || "not_checked",
       audience_restriction_present: parsed.audienceRestrictionPresent ? "yes" : "no",
       audience: parsed.audience || "(not extracted)",
       subject_confirmation_present: parsed.subjectConfirmationPresent ? "yes" : "no",
@@ -1693,11 +1708,25 @@ function buildParsedSamlSummaryRaw({ parsed, diagnostics, attrCount, sigVerifica
       assertion_signature: sv.assertion_signature_present || "not extracted",
       assertion_verification: sv.assertion_signature_verification || "not_checked",
       verification_result: sv.signature_verification_result || "not_checked",
-      trust_validation: sv.trust_validation || "incomplete",
-      idp_certificates_used: idpCertFingerprints?.length || 0,
-      ...(idpCertFingerprints?.length > 0 ? { idp_cert_fingerprints: idpCertFingerprints } : {}),
+      trusted_idp_certificates: metadataCertificates || { available: false, count: 0, source: "idp_metadata" },
       ...(sv.response_verification_error ? { response_error: sv.response_verification_error } : {}),
       ...(sv.assertion_verification_error ? { assertion_error: sv.assertion_verification_error } : {})
+    },
+    trust_validation: {
+      trust_validation: tr.trust_validation || "incomplete",
+      overall_result: tr.overall_result || "unverified",
+      checks: tr.checks || {},
+      warnings: tr.warnings || [],
+      errors: tr.errors || [],
+      metadata_certificates: metadataCertificates || { available: false, count: 0, source: "idp_metadata" },
+      issuer_validation: issuerValidation || { result: "not_checked" },
+      audience_validation: audienceValidation || { result: "not_checked" },
+      destination_validation: destinationValidation || { result: "not_checked" },
+      in_response_to_validation: inResponseToValidation || { result: "not_checked" },
+      subject_confirmation_validation: subjectConfirmationValidation || { result: "not_checked" },
+      temporal_validation: temporalValidation || { result: "not_checked" },
+      xsw_protection: xswProtection || { result: "incomplete" },
+      replay_validation: replayValidation || { result: "not_implemented" }
     },
     diagnostic_comparisons: diagnostics
   };
@@ -1713,6 +1742,44 @@ const SECURITY_HEADERS = {
 };
 
 const rateLimitMap = new Map();
+
+// SAML replay protection — stores full sha256 hashes of seen response/assertion IDs
+const samlSeenIds = new Map();
+const SAML_REPLAY_TTL_MS = 8 * 60 * 60 * 1000;
+
+function pruneSamlSeenIds() {
+  const now = Date.now();
+  for (const [key, expiry] of samlSeenIds) {
+    if (now > expiry) samlSeenIds.delete(key);
+  }
+}
+
+function checkSamlReplay(parsed) {
+  pruneSamlSeenIds();
+  const now = Date.now();
+  const responseIdHash = parsed.responseId ? shortHash(parsed.responseId, 64) : null;
+  const assertionIdHash = parsed.assertionId ? shortHash(parsed.assertionId, 64) : null;
+
+  const responseIdSeenBefore = Boolean(responseIdHash && samlSeenIds.has(`r:${responseIdHash}`));
+  const assertionIdSeenBefore = Boolean(assertionIdHash && samlSeenIds.has(`a:${assertionIdHash}`));
+
+  if (responseIdSeenBefore || assertionIdSeenBefore) {
+    return { result: "replay_detected", response_id_seen_before: responseIdSeenBefore, assertion_id_seen_before: assertionIdSeenBefore };
+  }
+
+  // TTL: use NotOnOrAfter + clock skew if available, else default
+  let ttlMs = SAML_REPLAY_TTL_MS;
+  if (parsed.notOnOrAfter) {
+    const noaTime = new Date(parsed.notOnOrAfter).getTime();
+    if (Number.isFinite(noaTime) && noaTime > now) {
+      ttlMs = Math.min(noaTime - now + SAML_CLOCK_SKEW_SECONDS * 1000, SAML_REPLAY_TTL_MS);
+    }
+  }
+
+  if (responseIdHash) samlSeenIds.set(`r:${responseIdHash}`, now + ttlMs);
+  if (assertionIdHash) samlSeenIds.set(`a:${assertionIdHash}`, now + ttlMs);
+  return { result: "valid", response_id_seen_before: false, assertion_id_seen_before: false };
+}
 
 function checkRateLimit(sessionId, action, max, windowMs) {
   const key = `${action}:${sessionId}`;
@@ -4055,11 +4122,21 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      // Signature verification — read-only, uses IdP signing certificate from SP metadata XML
+      // Trust validation — cryptographic + semantic, fail-closed
       const acsSpRecord = samlServiceProviderService.getSamlServiceProvider(samlAcsId);
-      const idpMetadataXmlForVerif = acsSpRecord?.idpMetadataXml || "";
+      let idpMetadataXmlForVerif = acsSpRecord?.idpMetadataXml || "";
+      if (!idpMetadataXmlForVerif && acsSpRecord?.idpMetadataUrl) {
+        try {
+          idpMetadataXmlForVerif = await fetchIdpMetadataFromUrl(acsSpRecord.idpMetadataUrl);
+        } catch {
+          // Metadata fetch failed — signature verification will be incomplete
+          appLog("warn", "saml_acs: metadata fetch failed for verification", { spId: samlAcsId });
+        }
+      }
       const idpSigningCerts = idpMetadataXmlForVerif ? extractIdpSigningCertificates(idpMetadataXmlForVerif) : [];
       const idpCertFingerprints = idpSigningCerts.map((c) => shortHash(c));
+      const idpMetadataParsed = idpMetadataXmlForVerif ? parseIdpMetadata(idpMetadataXmlForVerif) : null;
+      const idpEntityId = idpMetadataParsed?.entityId || "";
 
       let sigVerification;
       try {
@@ -4076,17 +4153,50 @@ const server = http.createServer(async (req, res) => {
         };
       }
 
-      const attrCount = Object.keys(parsed.attributes || {}).length;
-      const diagnostics = {
-        in_response_to_vs_request_id: compareDiagnostic(parsed.inResponseTo, runningFlow.runtime?.requestId),
-        destination_vs_acs_url: compareDiagnostic(parsed.destination, runningFlow.runtime?.acsUrl),
-        audience_vs_sp_entity_id: parsed.audience
-          ? compareDiagnostic(parsed.audience, runningFlow.runtime?.spEntityId)
-          : "not extracted",
-        temporal_conditions: parsed.conditionsPresent ? "present / not evaluated" : parsed.assertionPresent ? "missing" : "not extracted",
-        temporal_conditions_present: parsed.conditionsPresent ? "yes" : parsed.assertionPresent ? "no" : "not extracted",
-        temporal_conditions_evaluated: "no"
+      const xswProtection = checkXswProtection(responseXml, parsed);
+      const issuerValidation = evaluateSamlIssuerValidation(parsed, idpEntityId);
+      const audienceValidation = evaluateSamlAudienceValidation(parsed, runningFlow.runtime?.spEntityId);
+      const destinationValidation = evaluateSamlDestinationValidation(parsed, runningFlow.runtime?.acsUrl);
+      const inResponseToValidation = evaluateSamlInResponseTo(parsed, runningFlow.runtime?.requestId);
+      const subjectConfirmationValidation = evaluateSamlSubjectConfirmation(
+        parsed,
+        runningFlow.runtime?.acsUrl,
+        runningFlow.runtime?.requestId
+      );
+      const temporalValidation = evaluateSamlTemporalConditions(parsed);
+      const replayValidation = checkSamlReplay(parsed);
+      const metadataCertificates = {
+        available: idpSigningCerts.length > 0,
+        count: idpSigningCerts.length,
+        sha256_12: idpCertFingerprints,
+        source: "idp_metadata"
       };
+
+      const trustResult = evaluateSamlTrustValidation({
+        signatureVerification: sigVerification,
+        xswProtection,
+        issuerValidation,
+        audienceValidation,
+        destinationValidation,
+        inResponseToValidation,
+        subjectConfirmationValidation,
+        temporalValidation,
+        replayValidation,
+        metadataCertificates
+      });
+
+      const attrCount = Object.keys(parsed.attributes || {}).length;
+
+      // Consistency checks — used in UI "Consistency checks" panel
+      const diagnostics = {
+        in_response_to_vs_request_id: inResponseToValidation.result,
+        destination_vs_acs_url: destinationValidation.result,
+        audience_vs_sp_entity_id: audienceValidation.result,
+        temporal_conditions: temporalValidation.result,
+        xsw_protection: xswProtection.result,
+        issuer_validation: issuerValidation.result
+      };
+
       const statusMessage = sanitizeSamlDiagnosticValue(parsed.statusMessage || "(not extracted)", "status_message");
       samlFlowService.addFlowStep(runningFlow.id, {
         stepName: "saml_response_decoded",
@@ -4118,8 +4228,8 @@ const server = http.createServer(async (req, res) => {
             ? { present: true, sha256_12: parsed.sessionIndexHash }
             : { present: false },
           conditions_present: parsed.conditionsPresent ? "yes" : "no",
-          conditions_evaluated: "no",
-          temporal_conditions_status: parsed.conditionsPresent ? "present / not evaluated" : parsed.assertionPresent ? "missing" : "not extracted",
+          conditions_evaluated: temporalValidation.conditions_evaluated ? "yes" : "no",
+          temporal_conditions_status: temporalValidation.result,
           audience_restriction_present: parsed.audienceRestrictionPresent ? "yes" : "no",
           audience: parsed.audience || "(not extracted)",
           subject_confirmation_present: parsed.subjectConfirmationPresent ? "yes" : "no",
@@ -4131,13 +4241,25 @@ const server = http.createServer(async (req, res) => {
           response_signature_verification: sigVerification.response_signature_verification,
           assertion_signature_verification: sigVerification.assertion_signature_verification,
           signature_verification_result: sigVerification.signature_verification_result,
-          trust_validation: sigVerification.trust_validation || "incomplete",
+          trust_validation: trustResult.trust_validation,
+          trust_validation_checks: trustResult.checks,
+          trust_validation_errors: trustResult.errors,
+          trust_validation_warnings: trustResult.warnings,
           idp_certificates_used: idpCertFingerprints.length,
           verification_note: sigVerification.verification_note || "",
+          issuer_validation: issuerValidation.result,
+          temporal_validation: temporalValidation.result,
+          replay_validation: replayValidation.result,
+          xsw_protection: xswProtection.result,
           diagnostic_comparisons: diagnostics
         },
         rawRequestData: buildDecodedSamlResponseRaw({ responseXml, samlResponseParam, relayState, path: url.pathname }),
-        rawResponseData: buildParsedSamlSummaryRaw({ parsed, diagnostics, attrCount, sigVerification, idpCertFingerprints }),
+        rawResponseData: buildParsedSamlSummaryRaw({
+          parsed, diagnostics, attrCount, sigVerification, idpCertFingerprints,
+          trustResult, xswProtection, issuerValidation, audienceValidation,
+          destinationValidation, inResponseToValidation, subjectConfirmationValidation,
+          temporalValidation, replayValidation, metadataCertificates
+        }),
         errorData: parsed.isSuccess ? null : { saml_status: parsed.statusCode }
       });
 

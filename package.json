@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "test": "node --test tests/security.test.js"
+    "test": "node --test tests/security.test.js tests/saml-trust.test.js"
   },
   "dependencies": {
     "dotenv": "^17.4.2",

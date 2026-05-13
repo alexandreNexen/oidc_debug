@@ -278,6 +278,15 @@ export function parseSamlResponse(xml) {
   const subjectXml = assertionXml ? extractXmlElement(assertionXml, "Subject") : "";
   const conditionsXml = assertionXml ? extractXmlElement(assertionXml, "Conditions") : "";
   const subjectConfirmationXml = assertionXml ? extractXmlElement(assertionXml, "SubjectConfirmation") : "";
+  const subjectConfirmationMethod = subjectConfirmationXml
+    ? extractXmlAttr(subjectConfirmationXml, /\bMethod="([^"]+)"/i)
+    : "";
+  const subjectConfirmationNotOnOrAfter = subjectConfirmationXml
+    ? extractXmlAttr(subjectConfirmationXml, /\bNotOnOrAfter="([^"]+)"/i)
+    : "";
+  const subjectConfirmationInResponseTo = subjectConfirmationXml
+    ? extractXmlAttr(subjectConfirmationXml, /\bInResponseTo="([^"]+)"/i)
+    : "";
   const audience = assertionXml ? extractXmlText(assertionXml, /<(?:[^:>]+:)?Audience[^>]*>([^<]+)<\/(?:[^:>]+:)?Audience>/i) : "";
   const statusCode = extractXmlAttr(xml, /StatusCode[^>]+Value="([^"]+)"/i);
   const isSuccess =
@@ -355,6 +364,9 @@ export function parseSamlResponse(xml) {
     subjectConfirmationPresent: Boolean(subjectConfirmationXml),
     notBefore,
     notOnOrAfter,
+    subjectConfirmationMethod,
+    subjectConfirmationNotOnOrAfter,
+    subjectConfirmationInResponseTo,
     responseSignaturePresent: directResponseSignaturePresent(xml, assertionXml),
     assertionSignaturePresent: assertionXml ? hasXmlElement(assertionXml, "Signature") : false
   };
@@ -416,8 +428,8 @@ export function extractIdpSigningCertificates(metadataXml) {
   if (!metadataXml) return [];
   const certs = [];
 
-  // Prefer KeyDescriptor use="signing"
-  const signingKeyRe = /<KeyDescriptor[^>]+use="signing"[^>]*>([\s\S]*?)<\/KeyDescriptor>/gi;
+  // Handles both prefixed (md:KeyDescriptor, ds:X509Certificate) and unprefixed elements
+  const signingKeyRe = /<(?:[^:>]+:)?KeyDescriptor[^>]+use="signing"[^>]*>([\s\S]*?)<\/(?:[^:>]+:)?KeyDescriptor>/gi;
   let m;
   while ((m = signingKeyRe.exec(metadataXml)) !== null) {
     const cm = /<(?:[^:>]+:)?X509Certificate[^>]*>([\s\S]*?)<\/(?:[^:>]+:)?X509Certificate>/i.exec(m[1]);
@@ -429,7 +441,7 @@ export function extractIdpSigningCertificates(metadataXml) {
 
   // Fall back: any KeyDescriptor that is NOT use="encryption"
   if (certs.length === 0) {
-    const anyKeyRe = /<KeyDescriptor(?![^>]*use="encryption")[^>]*>([\s\S]*?)<\/KeyDescriptor>/gi;
+    const anyKeyRe = /<(?:[^:>]+:)?KeyDescriptor(?![^>]*use="encryption")[^>]*>([\s\S]*?)<\/(?:[^:>]+:)?KeyDescriptor>/gi;
     while ((m = anyKeyRe.exec(metadataXml)) !== null) {
       const cm = /<(?:[^:>]+:)?X509Certificate[^>]*>([\s\S]*?)<\/(?:[^:>]+:)?X509Certificate>/i.exec(m[1]);
       if (cm) {
@@ -570,6 +582,455 @@ export function verifySamlXmlSignatures(responseXml, rawCerts = []) {
     ...(responseVerif.error ? { response_verification_error: responseVerif.error } : {}),
     ...(assertionVerif.error ? { assertion_verification_error: assertionVerif.error } : {})
   };
+}
+
+export const SAML_CLOCK_SKEW_SECONDS = 120;
+
+const SAML_BEARER_METHOD = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
+
+// ---- Temporal validation ----
+
+export function evaluateSamlTemporalConditions(parsed, clockSkewSeconds = SAML_CLOCK_SKEW_SECONDS) {
+  if (!parsed.assertionPresent) {
+    return { result: "not_checked", conditions_evaluated: false, clock_skew_seconds: clockSkewSeconds };
+  }
+  if (!parsed.conditionsPresent) {
+    return { result: "missing", conditions_evaluated: false, clock_skew_seconds: clockSkewSeconds };
+  }
+
+  const now = Date.now();
+  const skewMs = clockSkewSeconds * 1000;
+  let notBeforeResult = "not_checked";
+  let notOnOrAfterResult = "not_checked";
+
+  if (parsed.notBefore) {
+    const nbTime = new Date(parsed.notBefore).getTime();
+    if (!Number.isFinite(nbTime)) {
+      return {
+        result: "invalid_format",
+        conditions_evaluated: false,
+        not_before_result: "invalid_format",
+        not_on_or_after_result: "not_checked",
+        clock_skew_seconds: clockSkewSeconds
+      };
+    }
+    notBeforeResult = now + skewMs < nbTime ? "not_yet_valid" : "valid";
+  }
+
+  if (parsed.notOnOrAfter) {
+    const noaTime = new Date(parsed.notOnOrAfter).getTime();
+    if (!Number.isFinite(noaTime)) {
+      return {
+        result: "invalid_format",
+        conditions_evaluated: false,
+        not_before_result: notBeforeResult,
+        not_on_or_after_result: "invalid_format",
+        clock_skew_seconds: clockSkewSeconds
+      };
+    }
+    notOnOrAfterResult = now - skewMs >= noaTime ? "expired" : "valid";
+  }
+
+  let result = "valid";
+  if (notBeforeResult === "not_yet_valid") result = "not_yet_valid";
+  else if (notOnOrAfterResult === "expired") result = "expired";
+  else if (notBeforeResult === "not_checked" && notOnOrAfterResult === "not_checked") result = "missing";
+
+  return {
+    result,
+    conditions_evaluated: result !== "missing",
+    not_before_result: notBeforeResult,
+    not_on_or_after_result: notOnOrAfterResult,
+    clock_skew_seconds: clockSkewSeconds
+  };
+}
+
+// ---- Issuer validation ----
+
+export function evaluateSamlIssuerValidation(parsed, expectedIdpEntityId) {
+  const expected = (expectedIdpEntityId || "").trim();
+  const responseIssuer = (parsed.issuer || "").trim();
+  const assertionIssuer = (parsed.assertionIssuer || "").trim();
+
+  if (!expected) {
+    return {
+      result: "not_checked",
+      expected_issuer: "(not configured)",
+      response_issuer: responseIssuer || "(missing)",
+      assertion_issuer: assertionIssuer || "(missing)"
+    };
+  }
+
+  if (!responseIssuer && !assertionIssuer) {
+    return {
+      result: "missing",
+      expected_issuer: expected,
+      response_issuer: "(missing)",
+      assertion_issuer: "(missing)"
+    };
+  }
+
+  const responseMatch = responseIssuer ? responseIssuer === expected : null;
+  const assertionMatch = assertionIssuer ? assertionIssuer === expected : null;
+
+  if (responseMatch === false || assertionMatch === false) {
+    return {
+      result: "invalid",
+      expected_issuer: expected,
+      response_issuer: responseIssuer || "(missing)",
+      assertion_issuer: assertionIssuer || "(missing)",
+      response_issuer_matches: responseMatch,
+      assertion_issuer_matches: assertionMatch
+    };
+  }
+
+  return {
+    result: "valid",
+    expected_issuer: expected,
+    response_issuer: responseIssuer || "(missing)",
+    assertion_issuer: assertionIssuer || "(missing)",
+    response_issuer_matches: responseMatch,
+    assertion_issuer_matches: assertionMatch
+  };
+}
+
+// ---- Audience validation ----
+
+export function evaluateSamlAudienceValidation(parsed, expectedSpEntityId) {
+  const expected = (expectedSpEntityId || "").trim();
+
+  if (!parsed.assertionPresent) {
+    return { result: "not_checked", expected_audience: expected };
+  }
+
+  if (!parsed.audienceRestrictionPresent) {
+    return {
+      result: "failed",
+      expected_audience: expected,
+      actual_audiences_count: 0,
+      matching_audience_present: false
+    };
+  }
+
+  if (!expected) {
+    return {
+      result: "not_checked",
+      actual_audience: parsed.audience || "(missing)",
+      actual_audiences_count: parsed.audience ? 1 : 0
+    };
+  }
+
+  if (!parsed.audience) {
+    return {
+      result: "failed",
+      expected_audience: expected,
+      actual_audiences_count: 0,
+      matching_audience_present: false
+    };
+  }
+
+  const matches = parsed.audience.trim() === expected;
+  return {
+    result: matches ? "valid" : "invalid",
+    expected_audience: expected,
+    actual_audience: parsed.audience,
+    actual_audiences_count: 1,
+    matching_audience_present: matches
+  };
+}
+
+// ---- Destination validation ----
+
+export function evaluateSamlDestinationValidation(parsed, expectedAcsUrl) {
+  const expected = (expectedAcsUrl || "").trim();
+  const actual = (parsed.destination || "").trim();
+
+  if (!actual) {
+    return { result: "missing", expected_destination: expected };
+  }
+  if (!expected) {
+    return { result: "not_checked", actual_destination: actual };
+  }
+  return {
+    result: actual === expected ? "valid" : "invalid",
+    expected_destination: expected,
+    actual_destination: actual
+  };
+}
+
+// ---- InResponseTo validation ----
+
+export function evaluateSamlInResponseTo(parsed, expectedRequestId) {
+  const expected = (expectedRequestId || "").trim();
+  const actual = (parsed.inResponseTo || "").trim();
+
+  if (!actual) {
+    return { result: "missing" };
+  }
+  if (!expected) {
+    return { result: "not_checked" };
+  }
+  return { result: actual === expected ? "valid" : "invalid" };
+}
+
+// ---- SubjectConfirmation validation ----
+
+export function evaluateSamlSubjectConfirmation(parsed, expectedAcsUrl, expectedRequestId, clockSkewSeconds = SAML_CLOCK_SKEW_SECONDS) {
+  if (!parsed.assertionPresent) {
+    return { result: "not_checked", bearer_confirmation_present: false };
+  }
+  if (!parsed.subjectConfirmationPresent) {
+    return { result: "missing", bearer_confirmation_present: false };
+  }
+
+  const method = (parsed.subjectConfirmationMethod || "").trim();
+  let methodResult = "not_checked";
+  if (method) {
+    methodResult = method === SAML_BEARER_METHOD ? "valid" : "invalid";
+  }
+
+  const recipient = (parsed.recipient || "").trim();
+  const expectedAcs = (expectedAcsUrl || "").trim();
+  let recipientResult = "not_checked";
+  if (!recipient) {
+    recipientResult = "missing";
+  } else if (expectedAcs) {
+    recipientResult = recipient === expectedAcs ? "valid" : "invalid";
+  }
+
+  const scInResponseTo = (parsed.subjectConfirmationInResponseTo || "").trim();
+  const expectedReqId = (expectedRequestId || "").trim();
+  let inResponseToResult = "not_checked";
+  if (scInResponseTo && expectedReqId) {
+    inResponseToResult = scInResponseTo === expectedReqId ? "valid" : "invalid";
+  }
+
+  let temporalResult = "not_checked";
+  if (parsed.subjectConfirmationNotOnOrAfter) {
+    const noaTime = new Date(parsed.subjectConfirmationNotOnOrAfter).getTime();
+    if (!Number.isFinite(noaTime)) {
+      temporalResult = "invalid_format";
+    } else {
+      temporalResult = Date.now() - clockSkewSeconds * 1000 >= noaTime ? "expired" : "valid";
+    }
+  }
+
+  let result = "valid";
+  if (methodResult === "invalid" || recipientResult === "invalid" || inResponseToResult === "invalid" || temporalResult === "expired" || temporalResult === "invalid_format") {
+    result = "invalid";
+  } else if (recipientResult === "missing" || recipientResult === "not_checked" || methodResult === "not_checked") {
+    result = "incomplete";
+  }
+
+  return {
+    result,
+    bearer_confirmation_present: true,
+    method_validation: methodResult,
+    recipient_validation: recipientResult,
+    in_response_to_validation: inResponseToResult,
+    subject_confirmation_temporal_validation: temporalResult
+  };
+}
+
+// ---- XSW protection ----
+
+export function checkXswProtection(responseXml, parsed) {
+  if (!_DOMParser) {
+    return {
+      result: "incomplete",
+      duplicate_ids: "not_checked",
+      signed_element_matches_used_element: null,
+      ambiguous_assertions: false,
+      signed_references: []
+    };
+  }
+
+  let doc;
+  try {
+    doc = new _DOMParser({
+      errorHandler: { warning() {}, error() {}, fatalError(e) { throw e; } }
+    }).parseFromString(responseXml, "application/xml");
+  } catch {
+    return {
+      result: "incomplete",
+      duplicate_ids: "not_checked",
+      signed_element_matches_used_element: null,
+      ambiguous_assertions: false,
+      signed_references: []
+    };
+  }
+
+  // Collect all element IDs
+  const idCounts = new Map();
+  function collectIds(node) {
+    if (node.nodeType !== 1) return;
+    const id = node.getAttribute && (node.getAttribute("ID") || node.getAttribute("Id") || node.getAttribute("id"));
+    if (id) idCounts.set(id, (idCounts.get(id) || 0) + 1);
+    let child = node.firstChild;
+    while (child) { collectIds(child); child = child.nextSibling; }
+  }
+  collectIds(doc.documentElement);
+
+  const hasDuplicateIds = [...idCounts.values()].some((n) => n > 1);
+
+  // Count Assertion elements (ambiguous if > 1)
+  const assertionNs = "urn:oasis:names:tc:SAML:2.0:assertion";
+  const assertionCount = doc.getElementsByTagNameNS(assertionNs, "Assertion").length;
+  const ambiguousAssertions = assertionCount > 1;
+
+  // Collect signed references
+  const sigNodes = Array.from(doc.getElementsByTagNameNS(XMLDSIG_NS, "Signature"));
+  const signedRefs = [];
+
+  for (const sigNode of sigNodes) {
+    const refs = Array.from(sigNode.getElementsByTagNameNS(XMLDSIG_NS, "Reference"));
+    for (const refNode of refs) {
+      const uri = refNode.getAttribute("URI") || "";
+      let target = "unknown";
+      let targetRawId = "";
+      let matchesUsed = false;
+
+      if (uri.startsWith("#")) {
+        targetRawId = uri.slice(1);
+        if (parsed.responseId && targetRawId === parsed.responseId) {
+          target = "response";
+          matchesUsed = true;
+        } else if (parsed.assertionId && targetRawId === parsed.assertionId) {
+          target = "assertion";
+          matchesUsed = true;
+        }
+      } else if (uri === "") {
+        target = "whole_document";
+      }
+
+      signedRefs.push({
+        uri_fragment: uri.startsWith("#") ? `#${shortHash(targetRawId)}` : (uri || "(empty)"),
+        target,
+        target_id_sha256_12: targetRawId ? shortHash(targetRawId) : "",
+        matches_used_element: matchesUsed
+      });
+    }
+  }
+
+  const allRefsMatch = signedRefs.length > 0 && signedRefs.every((r) => r.matches_used_element);
+  const hasUnmatchedRef = signedRefs.some((r) => !r.matches_used_element && r.target !== "whole_document" && r.uri_fragment !== "(empty)");
+  const hasEmptyUriRef = signedRefs.some((r) => r.target === "whole_document" || r.uri_fragment === "(empty)");
+
+  let result = "valid";
+  if (hasDuplicateIds || ambiguousAssertions || hasUnmatchedRef) {
+    result = "failed";
+  } else if (hasEmptyUriRef || sigNodes.length === 0) {
+    result = sigNodes.length === 0 ? "valid" : "incomplete";
+  }
+
+  return {
+    result,
+    duplicate_ids: hasDuplicateIds ? "detected" : "none",
+    signed_element_matches_used_element: allRefsMatch,
+    ambiguous_assertions: ambiguousAssertions,
+    signed_references: signedRefs
+  };
+}
+
+// ---- Trust validation aggregator ----
+
+export function evaluateSamlTrustValidation({
+  signatureVerification,
+  xswProtection,
+  issuerValidation,
+  audienceValidation,
+  destinationValidation,
+  inResponseToValidation,
+  subjectConfirmationValidation,
+  temporalValidation,
+  replayValidation,
+  metadataCertificates
+}) {
+  const errors = [];
+  const warnings = [];
+  const checks = {};
+
+  checks.metadata_certificates = metadataCertificates?.available ? "available" : "unavailable";
+
+  // Signature
+  const sigResult = signatureVerification?.signature_verification_result || "unavailable";
+  if (sigResult === "invalid") errors.push("Signature verification failed.");
+  checks.signature = sigResult === "valid" ? "valid" : sigResult === "invalid" ? "invalid" : sigResult;
+
+  // XSW
+  const xswResult = xswProtection?.result || "incomplete";
+  if (xswResult === "failed") errors.push("XML Signature Wrapping protection check failed.");
+  checks.signed_element = xswResult;
+
+  // Issuer
+  const issuerResult = issuerValidation?.result || "not_checked";
+  if (issuerResult === "invalid") errors.push("Issuer validation failed.");
+  checks.issuer = issuerResult;
+
+  // InResponseTo
+  const inRtResult = inResponseToValidation?.result || "not_checked";
+  if (inRtResult === "invalid") errors.push("InResponseTo mismatch: response does not match the expected AuthnRequest.");
+  checks.in_response_to = inRtResult;
+
+  // Destination
+  const destResult = destinationValidation?.result || "not_checked";
+  if (destResult === "invalid") errors.push("Destination mismatch.");
+  checks.destination = destResult;
+
+  // Recipient
+  const recipResult = subjectConfirmationValidation?.recipient_validation || "not_checked";
+  if (recipResult === "invalid") errors.push("SubjectConfirmation Recipient mismatch.");
+  checks.recipient = recipResult;
+
+  // Audience — missing = failed per SAML spec recommendation
+  const audResult = audienceValidation?.result || "not_checked";
+  if (audResult === "invalid" || audResult === "failed" || audResult === "missing") {
+    errors.push(audResult === "missing"
+      ? "AudienceRestriction element missing from Assertion."
+      : "Audience validation failed: SP entity ID not in AudienceRestriction.");
+  }
+  checks.audience = audResult;
+
+  // Temporal
+  const tempResult = temporalValidation?.result || "not_checked";
+  if (["expired", "not_yet_valid", "invalid_format"].includes(tempResult)) {
+    errors.push(`Temporal validation failed: ${tempResult.replace(/_/g, " ")}.`);
+  }
+  checks.temporal = ["expired", "not_yet_valid", "invalid_format"].includes(tempResult) ? "invalid" : tempResult;
+
+  // Replay
+  const replayResult = replayValidation?.result || "not_implemented";
+  if (replayResult === "replay_detected") errors.push("Replay detected: this response or assertion has been processed before.");
+  checks.replay = replayResult === "replay_detected" ? "failed" : replayResult;
+
+  if (errors.length > 0) {
+    return { trust_validation: "failed", overall_result: "untrusted", checks, warnings, errors };
+  }
+
+  // Signature must be valid for complete
+  if (checks.signature !== "valid") {
+    return { trust_validation: "incomplete", overall_result: "unverified", checks, warnings, errors: [] };
+  }
+
+  // Check remaining required conditions for complete — fail-closed: not_checked blocks complete
+  const incomplete = [];
+  if (checks.signed_element === "incomplete") incomplete.push("XSW check incomplete");
+  if (checks.issuer !== "valid") incomplete.push("Issuer not validated");
+  if (checks.destination !== "valid") incomplete.push("Destination not validated");
+  if (checks.audience !== "valid") incomplete.push("Audience not validated");
+  if (checks.temporal !== "valid") incomplete.push("Temporal conditions not evaluated");
+
+  if (incomplete.length > 0) {
+    return {
+      trust_validation: "incomplete",
+      overall_result: "unverified",
+      checks,
+      warnings: [...warnings, ...incomplete],
+      errors: []
+    };
+  }
+
+  return { trust_validation: "complete", overall_result: "trusted", checks, warnings, errors: [] };
 }
 
 export async function fetchIdpMetadataFromUrl(url) {
