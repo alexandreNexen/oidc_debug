@@ -121,7 +121,10 @@ export function renderSamlFlowResultPage({ flow, serviceProvider, steps = [], fl
             : `<span class="muted">Not available</span>`
           )}
           ${renderSummaryRow("ACS URL", `<code class="code-inline">${escapeHtml(flow.runtime?.acsUrl || "")}</code>`)}
-          ${renderSummaryRow("RelayState", flow.runtime?.relayState ? "Present" : `<span class="muted">Absent</span>`)}
+          ${renderSummaryRow("RelayState", flow.runtime?.relayStatePresent || flow.runtime?.relayStateSha25612
+            ? "Present"
+            : `<span class="muted">Absent</span>`
+          )}
           ${renderSummaryRow("Started at", escapeHtml(formatDate(flow.startedAt)))}
           ${renderSummaryRow("Duration", escapeHtml(formatDuration(flow.durationMs)))}
           ${failed && failedSectionLabel ? renderSummaryRow("Failed at", `<span class="badge badge--warning">${escapeHtml(failedSectionLabel)}</span>`) : ""}

@@ -27,6 +27,17 @@ import {
 import { createFlowService } from "../src/protocols/oidc/services/flows.js";
 import { validateServiceProviderInput } from "../src/protocols/oidc/services/serviceProviders.js";
 import { renderFlowResultPage } from "../src/protocols/oidc/views/flowResult.js";
+import { createSamlFlowService } from "../src/protocols/saml/services/flows.js";
+import { renderSamlFlowDetailsPage } from "../src/protocols/saml/views/flowDetails.js";
+import {
+  parseSamlResponse,
+  redactSamlRedirectUrl,
+  redactSamlXml,
+  shortHash,
+  summarizeRelayState,
+  summarizeSamlResponseXml,
+  verifySamlXmlSignatures
+} from "../src/protocols/saml/saml.js";
 
 // ---------------------------------------------------------------------------
 // Helper
@@ -54,6 +65,56 @@ function createInMemoryFlowService() {
     createId: (prefix) => `${prefix}_${++sequence}`
   });
 }
+
+function createInMemorySamlFlowService() {
+  let flows = [];
+  let steps = [];
+  let sequence = 0;
+
+  return createSamlFlowService({
+    getFlows: () => flows,
+    setFlows: (next) => {
+      flows = next;
+    },
+    getSteps: () => steps,
+    setSteps: (next) => {
+      steps = next;
+    },
+    createId: (prefix) => `${prefix}_${++sequence}`
+  });
+}
+
+const SAMPLE_SAML_XML = `<?xml version="1.0"?>
+<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="_response-secret-id" InResponseTo="_request-secret-id" Destination="http://localhost:3000/saml/acs/saml_sp_1">
+  <saml:Issuer>https://idp.example/metadata</saml:Issuer>
+  <samlp:Status><samlp:StatusCode Value="urn:oasis:names:tc:SAML:2.0:status:Success"/></samlp:Status>
+  <ds:Signature>
+    <ds:SignedInfo>
+      <ds:SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"/>
+      <ds:Reference URI="#_response-secret-id">
+        <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+        <ds:DigestValue>DIGEST_SECRET_VALUE</ds:DigestValue>
+      </ds:Reference>
+    </ds:SignedInfo>
+    <ds:SignatureValue>SIGNATURE_SECRET_VALUE</ds:SignatureValue>
+    <ds:KeyInfo><ds:X509Data><ds:X509Certificate>CERTIFICATE_SECRET_VALUE</ds:X509Certificate></ds:X509Data></ds:KeyInfo>
+  </ds:Signature>
+  <saml:Assertion ID="_assertion-secret-id">
+    <saml:Issuer>https://idp.example/metadata</saml:Issuer>
+    <saml:Subject>
+      <saml:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">alice@example.com</saml:NameID>
+      <saml:SubjectConfirmation><saml:SubjectConfirmationData Recipient="http://localhost:3000/saml/acs/saml_sp_1"/></saml:SubjectConfirmation>
+    </saml:Subject>
+    <saml:Conditions NotBefore="2026-05-13T10:00:00Z" NotOnOrAfter="2026-05-13T10:05:00Z">
+      <saml:AudienceRestriction><saml:Audience>sp-entity</saml:Audience></saml:AudienceRestriction>
+    </saml:Conditions>
+    <saml:AttributeStatement>
+      <saml:Attribute Name="mail"><saml:AttributeValue>alice@example.com</saml:AttributeValue></saml:Attribute>
+      <saml:Attribute Name="groups"><saml:AttributeValue>admins</saml:AttributeValue><saml:AttributeValue>finance</saml:AttributeValue></saml:Attribute>
+    </saml:AttributeStatement>
+    <saml:AuthnStatement SessionIndex="_session-secret-index"/>
+  </saml:Assertion>
+</samlp:Response>`;
 
 // ---------------------------------------------------------------------------
 // OIDC lifecycle status
@@ -120,6 +181,203 @@ describe("OIDC lifecycle status", () => {
 
     assert.match(html, /ID Token analysis/);
     assert.doesNotMatch(html, /ID Token analysis[\s\S]*Pending/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SAML diagnostics — safe raw data and trust wording
+// ---------------------------------------------------------------------------
+
+describe("SAML diagnostics", () => {
+  it("redacts XMLDSig values, certificates, session indexes, IDs, NameID and attributes in SAML XML", () => {
+    const redacted = redactSamlXml(SAMPLE_SAML_XML);
+
+    assert.doesNotMatch(redacted, /SIGNATURE_SECRET_VALUE/);
+    assert.doesNotMatch(redacted, /DIGEST_SECRET_VALUE/);
+    assert.doesNotMatch(redacted, /CERTIFICATE_SECRET_VALUE/);
+    assert.doesNotMatch(redacted, /_session-secret-index/);
+    assert.doesNotMatch(redacted, /_response-secret-id/);
+    assert.doesNotMatch(redacted, /_assertion-secret-id/);
+    assert.doesNotMatch(redacted, /alice@example\.com/);
+    assert.doesNotMatch(redacted, />admins</);
+    assert.doesNotMatch(redacted, />finance</);
+
+    assert.match(redacted, /\[redacted signature value sha256:[a-f0-9]{12}\]/);
+    assert.match(redacted, /\[redacted digest value sha256:[a-f0-9]{12}\]/);
+    assert.match(redacted, /\[redacted certificate sha256:[a-f0-9]{12}\]/);
+    assert.match(redacted, /\[redacted session index sha256:[a-f0-9]{12}\]/);
+    assert.match(redacted, /\[redacted nameid sha256:[a-f0-9]{12}\]/);
+    assert.match(redacted, new RegExp(`ID="\\[redacted response id sha256:${shortHash("_response-secret-id")}\\]"`));
+    assert.match(redacted, new RegExp(`URI="#\\[redacted reference id sha256:${shortHash("_response-secret-id")}\\]"`));
+    assert.match(redacted, new RegExp(`ID="\\[redacted assertion id sha256:${shortHash("_assertion-secret-id")}\\]"`));
+    assert.match(redacted, new RegExp(`SessionIndex="\\[redacted session index sha256:${shortHash("_session-secret-index")}\\]"`));
+    assert.equal(redactSamlXml(redacted), redacted);
+  });
+
+  it("summarizes SAMLResponse raw diagnostics without exposing base64, signature, digest, certificate or personal values", () => {
+    const summary = summarizeSamlResponseXml(SAMPLE_SAML_XML);
+    const serialized = JSON.stringify(summary);
+
+    assert.equal(summary.response_id.present, true);
+    assert.equal(summary.assertion_id.present, true);
+    assert.equal(summary.signatures.response, "present");
+    assert.equal(summary.signatures.assertion, "missing");
+    assert.equal(summary.certificates.embedded, "present");
+    assert.deepEqual(summary.signatures.signature_algorithms, ["http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"]);
+    assert.deepEqual(summary.signatures.digest_algorithms, ["http://www.w3.org/2001/04/xmlenc#sha256"]);
+    assert.doesNotMatch(serialized, /SIGNATURE_SECRET_VALUE|DIGEST_SECRET_VALUE|CERTIFICATE_SECRET_VALUE|alice@example\.com|admins|finance/);
+  });
+
+  it("redacts identity assertion values while keeping counts, names and hashes", () => {
+    const parsed = parseSamlResponse(SAMPLE_SAML_XML);
+    const serialized = JSON.stringify(parsed.attributes);
+
+    assert.equal(parsed.nameIdPreview, "received / redacted");
+    assert.equal(parsed.nameIdHash, shortHash("alice@example.com"));
+    assert.equal(Object.keys(parsed.attributes).length, 2);
+    assert.deepEqual(parsed.attributeNames, ["mail", "groups"]);
+    assert.equal(parsed.attributes.groups.values_count, 2);
+    assert.match(serialized, /received \/ redacted/);
+    assert.doesNotMatch(serialized, /alice@example\.com|admins|finance/);
+  });
+
+  it("does not persist raw RelayState in new SAML flows and can still match callbacks by hash", () => {
+    const flowService = createInMemorySamlFlowService();
+    const relayState = "relay-state-secret-value";
+    const flow = flowService.createFlow("saml_sp_1", {
+      relayState,
+      requestId: "_request",
+      acsUrl: "http://localhost:3000/saml/acs/saml_sp_1"
+    });
+
+    assert.equal(flow.runtime.relayState, "received / redacted");
+    assert.equal(flow.runtime.relayStateSha25612, shortHash(relayState));
+    assert.equal(flowService.findRunningFlowByRelayState(relayState, 30 * 60 * 1000).id, flow.id);
+    assert.ok(!JSON.stringify(flowService.listFlows()).includes(relayState));
+  });
+
+  it("summarizes Redirect parameters without exposing SAMLRequest, RelayState or Signature query values", () => {
+    const url = "https://idp.example/sso?SAMLRequest=REQUEST_SECRET&RelayState=RELAY_SECRET&Signature=SIGNATURE_SECRET";
+    const redacted = redactSamlRedirectUrl(url);
+    const redactedAgain = redactSamlRedirectUrl(redacted);
+    const relaySummary = summarizeRelayState("RELAY_SECRET");
+
+    assert.doesNotMatch(redacted, /REQUEST_SECRET|RELAY_SECRET|SIGNATURE_SECRET/);
+    assert.equal(redactedAgain, redacted);
+    assert.equal(relaySummary.present, true);
+    assert.equal(relaySummary.sha256_12, shortHash("RELAY_SECRET"));
+    assert.ok(!("preview" in relaySummary));
+  });
+
+  it("marks trust validation as incomplete when signatures are present but trusted verification is unavailable", () => {
+    const verification = verifySamlXmlSignatures(SAMPLE_SAML_XML, []);
+
+    assert.equal(verification.response_signature_present, "present");
+    assert.equal(verification.response_signature_verification, "unavailable");
+    assert.equal(verification.trust_validation, "incomplete");
+    assert.equal(
+      verification.verification_note,
+      "Signature detected, but no trusted IdP signing certificate from metadata was available for verification."
+    );
+  });
+
+  it("renders an explicit warning that SAML Success does not mean trusted assertion and keeps Identity raw scoped", () => {
+    const html = renderSamlFlowDetailsPage({
+      flow: { id: "saml_flow_1", status: "success", startedAt: "2026-05-13T10:00:00.000Z", durationMs: 1, runtime: {} },
+      serviceProvider: { id: "saml_sp_1", name: "SP" },
+      steps: [
+        { stepName: "authn_request_created", status: "success" },
+        { stepName: "redirect_to_idp", status: "success" },
+        { stepName: "saml_response_received", status: "success" },
+        {
+          stepName: "saml_response_decoded",
+          status: "success",
+          responseData: {
+            assertion_present: "yes",
+            subject_present: "yes",
+            name_id_present: "yes",
+            name_id_preview: "received / redacted",
+            name_id_hash: shortHash("alice@example.com"),
+            name_id_format: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+            saml_status: "Success",
+            attributes_count: 2,
+            attribute_names: ["mail", "groups"],
+            attributes_redacted: {
+              mail: {
+                values_count: 1,
+                values: [{ present: "present", sha256_12: shortHash("alice@example.com"), redacted: "received / redacted" }]
+              }
+            },
+            response_signature_present: "present",
+            response_signature_verification: "unavailable",
+            assertion_signature_present: "missing",
+            assertion_signature_verification: "not_checked",
+            signature_verification_result: "unavailable",
+            trust_validation: "incomplete",
+            idp_certificates_used: 0,
+            diagnostic_comparisons: {
+              in_response_to_vs_request_id: "match",
+              destination_vs_acs_url: "match",
+              audience_vs_sp_entity_id: "match",
+              temporal_conditions: "present / not evaluated"
+            }
+          },
+          rawResponseData: {
+            assertion: {
+              present: "yes",
+              subject_present: "yes",
+              name_id_present: "yes",
+              name_id_preview: "received / redacted",
+              name_id_hash: shortHash("alice@example.com"),
+              name_id_format: "urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress",
+              attributes_count: 2,
+              attribute_names: ["mail", "groups"],
+              attributes_redacted: {
+                mail: {
+                  values_count: 1,
+                  values: [{ present: "present", sha256_12: shortHash("alice@example.com"), redacted: "received / redacted" }]
+                }
+              },
+              session_index: { present: true, sha256_12: shortHash("_session-secret-index") },
+              conditions_present: "yes",
+              conditions_evaluated: "no",
+              temporal_conditions_status: "present / not evaluated",
+              audience_restriction_present: "yes",
+              audience: "sp-entity",
+              subject_confirmation_present: "yes",
+              recipient: "http://localhost:3000/saml/acs/saml_sp_1",
+              not_before: "2026-05-13T10:00:00Z",
+              not_on_or_after: "2026-05-13T10:05:00Z"
+            },
+            signature: { trust_validation: "incomplete" }
+          }
+        }
+      ]
+    });
+
+    assert.match(html, /SAML status is Success, but trust validation is incomplete/);
+    assert.match(html, /present \/ not evaluated/);
+    assert.doesNotMatch(html, /alice@example\.com/);
+
+    const rawJson = html.match(/data-raw-title="Raw identity summary"[\s\S]*?data-raw-json="([^"]+)"/)?.[1];
+    assert.ok(rawJson, "Identity summary raw button must be present");
+    const raw = JSON.parse(Buffer.from(rawJson, "base64").toString("utf8"));
+    const serializedRaw = JSON.stringify(raw);
+
+    assert.deepEqual(Object.keys(raw.assertion), [
+      "present",
+      "subject_present",
+      "name_id_present",
+      "name_id_preview",
+      "name_id_hash",
+      "name_id_format",
+      "attributes_count",
+      "attribute_names",
+      "attributes_redacted"
+    ]);
+    assert.doesNotMatch(serializedRaw, /session_index|conditions_present|conditions_evaluated|temporal_conditions_status/);
+    assert.doesNotMatch(serializedRaw, /audience_restriction_present|audience|subject_confirmation_present|recipient/);
+    assert.doesNotMatch(serializedRaw, /not_before|not_on_or_after/);
   });
 });
 

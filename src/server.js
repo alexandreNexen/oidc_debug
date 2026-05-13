@@ -47,6 +47,7 @@ import {
   redactSamlRedirectUrl,
   redactSamlXml,
   shortHash,
+  summarizeSamlResponseXml,
   summarizeEncodedSamlParam,
   summarizeRelayState,
   summarizeSensitiveValue,
@@ -938,6 +939,39 @@ function sanitizeOidcStepForPersistence(step = {}) {
   };
 }
 
+function sanitizeSamlRuntimeForPersistence(runtime = null) {
+  if (!runtime || typeof runtime !== "object" || Array.isArray(runtime)) return runtime;
+  const next = { ...runtime };
+  if (typeof next.relayState === "string" && next.relayState && next.relayState !== "received / redacted") {
+    next.relayStateSha25612 = next.relayStateSha25612 || shortHash(next.relayState);
+    next.relayState = "received / redacted";
+    next.relayStatePresent = true;
+  }
+  if (typeof next.authorizationUrl === "string" && next.authorizationUrl) {
+    next.authorizationUrl = redactSamlRedirectUrl(next.authorizationUrl);
+    next.authorizationUrlNature = next.authorizationUrlNature || "redacted browser redirect URL";
+  }
+  return sanitizeSamlDiagnosticValue(next);
+}
+
+function sanitizeSamlFlowForPersistence(flow = {}) {
+  return {
+    ...flow,
+    runtime: sanitizeSamlRuntimeForPersistence(flow.runtime)
+  };
+}
+
+function sanitizeSamlStepForPersistence(step = {}) {
+  return {
+    ...step,
+    requestData: sanitizeSamlDiagnosticValue(step.requestData || null),
+    responseData: sanitizeSamlDiagnosticValue(step.responseData || null),
+    rawRequestData: sanitizeSamlDiagnosticValue(step.rawRequestData || null),
+    rawResponseData: sanitizeSamlDiagnosticValue(step.rawResponseData || null),
+    errorData: sanitizeSamlDiagnosticValue(step.errorData || null)
+  };
+}
+
 function buildPersistedState() {
   return {
     version: 4,
@@ -951,8 +985,8 @@ function buildPersistedState() {
     },
     saml: {
       serviceProviders: samlServiceProviders,
-      flows: samlFlows,
-      flowSteps: samlFlowSteps
+      flows: samlFlows.map(sanitizeSamlFlowForPersistence),
+      flowSteps: samlFlowSteps.map(sanitizeSamlStepForPersistence)
     },
     sessions: Array.from(sessions.values()).map((session) => ({
       ...sanitizeSessionArtifacts(session),
@@ -1097,6 +1131,9 @@ async function loadPersistedState() {
     );
     samlServiceProviderService.hydrateSamlServiceProviders(hydrated.saml?.serviceProviders || []);
     samlFlowService.hydrateSamlFlows(hydrated.saml?.flows || [], hydrated.saml?.flowSteps || []);
+    if ((hydrated.saml?.flows || []).length || (hydrated.saml?.flowSteps || []).length) {
+      schedulePersistState();
+    }
 
     for (const candidate of hydrated.sessions || []) {
       if (!candidate?.id) {
@@ -1426,13 +1463,31 @@ function samlParamPresence(searchParams, name) {
   return value ? summarizeSensitiveValue(value) : { present: false };
 }
 
+function samlParamStatus(searchParams, name) {
+  return (searchParams.get(name) || "") ? "present" : "missing";
+}
+
 function compareDiagnostic(actual, expected) {
   if (!actual) return "missing";
-  if (!expected) return "not checked";
+  if (!expected) return "not_checked";
   return actual === expected ? "match" : "mismatch";
 }
 
-function buildSamlAuthnRequestRaw({ authnRequestXml, requestId, issueInstant, idpMetadata, sp, acsUrl, samlRequestParam, relayState }) {
+function buildPreparedRedirectSummary(authorizationUrl = "") {
+  const searchParams = authorizationUrl ? new URL(authorizationUrl).searchParams : new URLSearchParams();
+  return {
+    method: "GET",
+    url: authorizationUrl ? redactSamlRedirectUrl(authorizationUrl) : "",
+    params: {
+      SAMLRequest: samlParamStatus(searchParams, "SAMLRequest"),
+      RelayState: samlParamStatus(searchParams, "RelayState"),
+      SigAlg: samlParamStatus(searchParams, "SigAlg"),
+      Signature: samlParamStatus(searchParams, "Signature")
+    }
+  };
+}
+
+function buildSamlAuthnRequestRaw({ authnRequestXml, requestId, issueInstant, idpMetadata, sp, acsUrl, samlRequestParam, relayState, authorizationUrl = "" }) {
   return {
     raw_type: "Prepared SAML AuthnRequest",
     is_real_http_exchange: false,
@@ -1447,6 +1502,7 @@ function buildSamlAuthnRequestRaw({ authnRequestXml, requestId, issueInstant, id
     issue_instant: issueInstant,
     name_id_format: sp.nameIdFormat || "(unspecified)",
     expected_response_protocol_binding: "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST",
+    prepared_http_redirect: buildPreparedRedirectSummary(authorizationUrl),
     xml_redacted: redactSamlXml(authnRequestXml),
     xml_size_bytes: Buffer.byteLength(authnRequestXml || "", "utf8"),
     xml_sha256_12: shortHash(authnRequestXml),
@@ -1474,10 +1530,16 @@ function buildSamlRedirectRaw({ authorizationUrl, idpMetadata, samlRequestParam,
     local_status: 302,
     binding: "HTTP-Redirect",
     sso_url: idpMetadata.ssoUrl,
-    redirect_url_redacted: authorizationUrl ? redactSamlRedirectUrl(authorizationUrl) : "",
-    query_params: {
+    url: authorizationUrl ? redactSamlRedirectUrl(authorizationUrl) : "",
+    params: {
+      SAMLRequest: samlParamStatus(searchParams, "SAMLRequest"),
+      RelayState: samlParamStatus(searchParams, "RelayState"),
+      SigAlg: samlParamStatus(searchParams, "SigAlg"),
+      Signature: samlParamStatus(searchParams, "Signature")
+    },
+    query_param_summaries: {
       SAMLRequest: samlParamPresence(searchParams, "SAMLRequest"),
-      RelayState: searchParams.get("RelayState") ? summarizeRelayState(searchParams.get("RelayState")) : { present: "missing" },
+      RelayState: searchParams.get("RelayState") ? summarizeRelayState(searchParams.get("RelayState")) : { present: false },
       SigAlg: samlParamPresence(searchParams, "SigAlg"),
       Signature: samlParamPresence(searchParams, "Signature")
     },
@@ -1526,6 +1588,7 @@ function buildSamlAcsRequestRaw({ req, url, body, samlResponseParam, relayState 
 }
 
 function buildDecodedSamlResponseRaw({ responseXml, samlResponseParam, relayState, path }) {
+  const summary = summarizeSamlResponseXml(responseXml);
   return {
     raw_type: "Decoded SAMLResponse redacted",
     is_real_http_exchange: false,
@@ -1534,6 +1597,16 @@ function buildDecodedSamlResponseRaw({ responseXml, samlResponseParam, relayStat
     method: "POST",
     path,
     base64: summarizeEncodedSamlParam(samlResponseParam),
+    response_id: summary.response_id,
+    assertion_id: summary.assertion_id,
+    issuer: summary.issuer,
+    in_response_to: summary.in_response_to,
+    destination: summary.destination,
+    status_code: summary.status_code,
+    status_message: sanitizeSamlDiagnosticValue(summary.status_message || "(not extracted)", "status_message"),
+    status_detail: summary.status_detail,
+    signatures: summary.signatures,
+    certificates: summary.certificates,
     xml: {
       decoded: Boolean(responseXml),
       size_bytes: responseXml ? Buffer.byteLength(responseXml, "utf8") : 0,
@@ -1581,6 +1654,7 @@ function buildParsedSamlSummaryRaw({ parsed, diagnostics, attrCount, sigVerifica
     is_real_http_exchange: false,
     timestamp: new Date().toISOString(),
     response: {
+      response_id: parsed.responseIdSummary || { present: false },
       issuer: parsed.issuer || "(not found)",
       in_response_to: parsed.inResponseTo || "(not found)",
       destination: parsed.destination || "(not found)",
@@ -1590,6 +1664,7 @@ function buildParsedSamlSummaryRaw({ parsed, diagnostics, attrCount, sigVerifica
     },
     assertion: {
       present: parsed.assertionPresent ? "yes" : "no",
+      assertion_id: parsed.assertionIdSummary || { present: false },
       issuer: parsed.assertionIssuer || "(not extracted)",
       subject_present: parsed.subjectPresent ? "yes" : "no",
       name_id_present: parsed.nameIdPresent ? "yes" : "no",
@@ -1599,7 +1674,12 @@ function buildParsedSamlSummaryRaw({ parsed, diagnostics, attrCount, sigVerifica
       attributes_count: attrCount,
       attribute_names: parsed.attributeNames || [],
       attributes_redacted: parsed.attributes || {},
+      session_index: parsed.sessionIndexPresent
+        ? { present: true, sha256_12: parsed.sessionIndexHash }
+        : { present: false },
       conditions_present: parsed.conditionsPresent ? "yes" : "no",
+      conditions_evaluated: "no",
+      temporal_conditions_status: parsed.conditionsPresent ? "present / not evaluated" : parsed.assertionPresent ? "missing" : "not extracted",
       audience_restriction_present: parsed.audienceRestrictionPresent ? "yes" : "no",
       audience: parsed.audience || "(not extracted)",
       subject_confirmation_present: parsed.subjectConfirmationPresent ? "yes" : "no",
@@ -1609,10 +1689,11 @@ function buildParsedSamlSummaryRaw({ parsed, diagnostics, attrCount, sigVerifica
     },
     signature: {
       response_signature: sv.response_signature_present || "not extracted",
-      response_verification: sv.response_signature_verification || "not checked",
+      response_verification: sv.response_signature_verification || "not_checked",
       assertion_signature: sv.assertion_signature_present || "not extracted",
-      assertion_verification: sv.assertion_signature_verification || "not checked",
-      verification_result: sv.signature_verification_result || "not checked",
+      assertion_verification: sv.assertion_signature_verification || "not_checked",
+      verification_result: sv.signature_verification_result || "not_checked",
+      trust_validation: sv.trust_validation || "incomplete",
       idp_certificates_used: idpCertFingerprints?.length || 0,
       ...(idpCertFingerprints?.length > 0 ? { idp_cert_fingerprints: idpCertFingerprints } : {}),
       ...(sv.response_verification_error ? { response_error: sv.response_verification_error } : {}),
@@ -2126,6 +2207,17 @@ function isLegacySamlPlaceholder(value = "") {
 function redactSamlScalarForUi(key = "", value = "") {
   const text = String(value ?? "");
   const normalizedKey = String(key || "").toLowerCase();
+  const sensitiveScalarKeys = new Set([
+    "samlrequest",
+    "samlresponse",
+    "relaystate",
+    "signature",
+    "signaturevalue",
+    "digestvalue",
+    "x509certificate",
+    "sessionindex",
+    "attributevalue"
+  ]);
   const isNameIdValue =
     (normalizedKey === "name_id" || normalizedKey === "nameid" || normalizedKey.endsWith("_name_id")) &&
     !normalizedKey.includes("format") &&
@@ -2137,7 +2229,15 @@ function redactSamlScalarForUi(key = "", value = "") {
   if (isNameIdValue && text) {
     return {
       present: "yes",
-      preview: maskSamlValue(text),
+      preview: "received / redacted",
+      sha256_12: shortHash(text)
+    };
+  }
+
+  if (sensitiveScalarKeys.has(normalizedKey) && text && !["present", "missing", "received / redacted", "redacted"].includes(text)) {
+    return {
+      present: "present",
+      size_bytes: Buffer.byteLength(text, "utf8"),
       sha256_12: shortHash(text)
     };
   }
@@ -2146,7 +2246,11 @@ function redactSamlScalarForUi(key = "", value = "") {
     return "[legacy placeholder: raw XML was not persisted]";
   }
 
-  if (normalizedKey.includes("xml") && text.includes("<")) {
+  if (text && /[?&](SAMLRequest|SAMLResponse|RelayState|Signature)=/i.test(text)) {
+    return redactSamlRedirectUrl(text);
+  }
+
+  if (text.includes("<") && (normalizedKey.includes("xml") || /(?:saml|SignatureValue|DigestValue|X509Certificate|AttributeValue|NameID)/i.test(text))) {
     return redactSamlXml(text);
   }
 
@@ -2170,9 +2274,9 @@ function sanitizeLegacySamlAttributes(value) {
         {
           values_count: values.length,
           values: values.map((entry) => ({
-            present: entry !== null && entry !== undefined && entry !== "",
+            present: entry !== null && entry !== undefined && entry !== "" ? "present" : "missing",
             sha256_12: entry ? shortHash(entry) : "",
-            redacted: "[redacted]"
+            redacted: entry ? "received / redacted" : "missing"
           }))
         }
       ];
@@ -3596,7 +3700,9 @@ const server = http.createServer(async (req, res) => {
       const envLabel = env?.key === "preprod" ? "Preprod" : env?.key === "prod" ? "Prod" : "";
 
       const flow = samlFlowService.createFlow(sp.id, {
-        relayState,
+        relayState: "received / redacted",
+        relayStatePresent: true,
+        relayStateSha25612: shortHash(relayState),
         requestId,
         ssoUrl: idpMetadata.ssoUrl,
         idpEntityId: idpMetadata.entityId,
@@ -3643,7 +3749,8 @@ const server = http.createServer(async (req, res) => {
             sp,
             acsUrl,
             samlRequestParam: "",
-            relayState
+            relayState,
+            authorizationUrl: ""
           }),
           rawResponseData: buildSamlSyntheticResponseRaw({
             rawType: "Synthetic local response",
@@ -3744,7 +3851,8 @@ const server = http.createServer(async (req, res) => {
           sp,
           acsUrl,
           samlRequestParam,
-          relayState
+          relayState,
+          authorizationUrl
         }),
         rawResponseData: buildSamlSyntheticResponseRaw({
           rawType: "Synthetic local response",
@@ -3926,7 +4034,8 @@ const server = http.createServer(async (req, res) => {
           completedAt: new Date().toISOString(),
           responseData: {
             parsed: "error",
-            signature_verification_result: "not checked"
+            signature_verification_result: "not_checked",
+            trust_validation: "incomplete"
           },
           rawRequestData: buildDecodedSamlResponseRaw({ responseXml, samlResponseParam, relayState, path: url.pathname }),
           rawResponseData: buildSamlSyntheticResponseRaw({
@@ -3959,9 +4068,10 @@ const server = http.createServer(async (req, res) => {
         sigVerification = {
           response_signature_present: parsed.responseSignaturePresent ? "present" : "missing",
           assertion_signature_present: parsed.assertionSignaturePresent ? "present" : "missing",
-          response_signature_verification: "not checked",
-          assertion_signature_verification: "not checked",
-          signature_verification_result: "error",
+          response_signature_verification: "unavailable",
+          assertion_signature_verification: "unavailable",
+          signature_verification_result: "unavailable",
+          trust_validation: "incomplete",
           verification_note: "Unexpected error during signature verification."
         };
       }
@@ -3973,7 +4083,9 @@ const server = http.createServer(async (req, res) => {
         audience_vs_sp_entity_id: parsed.audience
           ? compareDiagnostic(parsed.audience, runningFlow.runtime?.spEntityId)
           : "not extracted",
-        temporal_conditions: parsed.conditionsPresent ? "present" : parsed.assertionPresent ? "missing" : "not extracted"
+        temporal_conditions: parsed.conditionsPresent ? "present / not evaluated" : parsed.assertionPresent ? "missing" : "not extracted",
+        temporal_conditions_present: parsed.conditionsPresent ? "yes" : parsed.assertionPresent ? "no" : "not extracted",
+        temporal_conditions_evaluated: "no"
       };
       const statusMessage = sanitizeSamlDiagnosticValue(parsed.statusMessage || "(not extracted)", "status_message");
       samlFlowService.addFlowStep(runningFlow.id, {
@@ -4002,7 +4114,12 @@ const server = http.createServer(async (req, res) => {
           attributes_count: attrCount,
           attribute_names: parsed.attributeNames || [],
           ...(attrCount > 0 ? { attributes_redacted: parsed.attributes } : {}),
+          session_index: parsed.sessionIndexPresent
+            ? { present: true, sha256_12: parsed.sessionIndexHash }
+            : { present: false },
           conditions_present: parsed.conditionsPresent ? "yes" : "no",
+          conditions_evaluated: "no",
+          temporal_conditions_status: parsed.conditionsPresent ? "present / not evaluated" : parsed.assertionPresent ? "missing" : "not extracted",
           audience_restriction_present: parsed.audienceRestrictionPresent ? "yes" : "no",
           audience: parsed.audience || "(not extracted)",
           subject_confirmation_present: parsed.subjectConfirmationPresent ? "yes" : "no",
@@ -4014,6 +4131,8 @@ const server = http.createServer(async (req, res) => {
           response_signature_verification: sigVerification.response_signature_verification,
           assertion_signature_verification: sigVerification.assertion_signature_verification,
           signature_verification_result: sigVerification.signature_verification_result,
+          trust_validation: sigVerification.trust_validation || "incomplete",
+          idp_certificates_used: idpCertFingerprints.length,
           verification_note: sigVerification.verification_note || "",
           diagnostic_comparisons: diagnostics
         },

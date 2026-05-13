@@ -31,7 +31,9 @@ const BADGE_ERROR = new Set(["no", "missing", "failed", "mismatch", "error", "fa
 const BADGE_NEUTRAL = new Set([
   "not implemented", "not checked", "not extracted", "skipped", "none",
   "disabled", "not sent", "pending", "not performed", "not available",
-  "missing signature", "missing certificate", "unsupported"
+  "missing signature", "missing certificate", "unsupported", "not_checked",
+  "unavailable", "incomplete", "present / not evaluated", "missing_signature",
+  "missing_certificate"
 ]);
 
 function badge(value) {
@@ -56,8 +58,10 @@ function badge(value) {
   if (BADGE_NEUTRAL.has(low)
     || low.includes("not implemented")
     || low.includes("not checked")
+    || low.includes("not_checked")
     || low.includes("not extracted")
-    || low.includes("not performed")) {
+    || low.includes("not performed")
+    || low.includes("not evaluated")) {
     return `<span class="badge badge--neutral">${escapeHtml(str)}</span>`;
   }
   if (BADGE_ERROR.has(low) || low.startsWith("missing") || low === "failure") {
@@ -103,6 +107,29 @@ function rawBtn(title, stepName, type, rawData) {
     data-raw-type="${escapeHtml(label)}"
     data-raw-json="${escapeHtml(encodeRawData(rawData))}"
   >Raw</button>`;
+}
+
+function identitySummaryRaw(decoded) {
+  const assertion = decoded?.rawResponseData?.assertion || {};
+  if (!decoded?.rawResponseData && !decoded?.responseData) return null;
+
+  const resp = decoded.responseData || {};
+  const nameIdPresent = assertion.name_id_present || resp.name_id_present || "not extracted";
+  return {
+    raw_type: "Identity assertion summary redacted",
+    timestamp: decoded.rawResponseData?.timestamp || decoded.completedAt || null,
+    assertion: {
+      present: assertion.present || resp.assertion_present || "not extracted",
+      subject_present: assertion.subject_present || resp.subject_present || "not extracted",
+      name_id_present: nameIdPresent,
+      name_id_preview: assertion.name_id_preview || resp.name_id_preview || (nameIdPresent === "yes" ? "received / redacted" : "(not present)"),
+      name_id_hash: assertion.name_id_hash || resp.name_id_hash || "",
+      name_id_format: assertion.name_id_format || resp.name_id_format || "(not present)",
+      attributes_count: assertion.attributes_count ?? resp.attributes_count ?? 0,
+      attribute_names: assertion.attribute_names || resp.attribute_names || [],
+      attributes_redacted: assertion.attributes_redacted || resp.attributes_redacted || {}
+    }
+  };
 }
 
 function sectionHead(title, summary) {
@@ -237,7 +264,7 @@ function renderAuthenticationExchange(steps) {
         decoded ? row("Issuer (IdP)", plain(dRd.response_issuer)) : null,
         decoded ? row("InResponseTo", plain(dRd.in_response_to)) : null,
         decoded ? row("Destination", plain(dRd.destination)) : null,
-        decoded ? row("SAML Status", badge(dResp.saml_status)) : null,
+        decoded ? row("SAML Status (protocol)", badge(dResp.saml_status)) : null,
         decoded ? row("Status code", plain(dRd.status_code)) : null,
         decoded && dRd.status_message && dRd.status_message !== "(not extracted)"
           ? row("Status message", plain(dRd.status_message)) : null,
@@ -278,7 +305,7 @@ function renderIdentityAssertion(steps) {
       </section>`;
   }
 
-  const rawButton = rawBtn("Raw parsed SAMLResponse", "saml_response_decoded", "response", decoded.rawResponseData);
+  const rawButton = rawBtn("Raw identity summary", "saml_response_decoded", "response", identitySummaryRaw(decoded));
   const userIdentified = resp.name_id_present === "yes" && resp.assertion_present === "yes" ? "yes" : "no";
 
   const identitySummary = analysisPanel("Identity summary", rawButton, dl([
@@ -286,7 +313,7 @@ function renderIdentityAssertion(steps) {
     row("User identified", badge(userIdentified)),
     row("NameID present", badge(resp.name_id_present)),
     row("NameID format", plain(resp.name_id_format)),
-    row("NameID", resp.name_id_preview ? plain(resp.name_id_preview) : badge("missing")),
+    row("NameID", resp.name_id_present === "yes" ? plain(resp.name_id_preview || "received / redacted") : badge("missing")),
     row("Attributes received", plain(String(resp.attributes_count ?? 0))),
     row("Attribute names", pills(resp.attribute_names))
   ]));
@@ -301,13 +328,18 @@ function renderIdentityAssertion(steps) {
   const sigNote = resp.verification_note
     ? `<p class="muted" style="margin:8px 0 0">${escapeHtml(resp.verification_note)}</p>`
     : "";
+  const trustWarning = resp.saml_status === "Success" && resp.trust_validation !== "complete"
+    ? `<div class="form-banner form-banner--warning" style="margin-top:12px">SAML status is Success, but trust validation is incomplete because the signature was not verified against a trusted IdP certificate.</div>`
+    : "";
   const signatureStatus = analysisPanel("Signature status", "", dl([
     row("Response signature", badge(resp.response_signature_present || "not extracted")),
-    row("Response verification", badge(resp.response_signature_verification || "not checked")),
+    row("Response verification", badge(resp.response_signature_verification || "not_checked")),
     row("Assertion signature", badge(resp.assertion_signature_present || "not extracted")),
-    row("Assertion verification", badge(resp.assertion_signature_verification || "not checked")),
-    row("Signature verification result", badge(resp.signature_verification_result || "not checked"))
-  ]) + sigNote);
+    row("Assertion verification", badge(resp.assertion_signature_verification || "not_checked")),
+    row("Signature verification result", badge(resp.signature_verification_result || "not_checked")),
+    row("Trust validation", badge(resp.trust_validation || "incomplete")),
+    row("IdP certificates used", plain(String(resp.idp_certificates_used ?? 0)))
+  ]) + sigNote + trustWarning);
 
   return `
     <section class="flow-section" data-section-panel="identity">

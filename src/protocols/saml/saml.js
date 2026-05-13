@@ -14,6 +14,7 @@ try {
 
 const REDACTED_VALUE = "[redacted]";
 const MAX_REDACTED_XML_LENGTH = 12000;
+const XMLDSIG_NS = "http://www.w3.org/2000/09/xmldsig#";
 
 export function generateAuthnRequestId() {
   return `_${crypto.randomBytes(16).toString("hex")}`;
@@ -102,15 +103,50 @@ export function summarizeEncodedSamlParam(value = "") {
 }
 
 export function summarizeRelayState(value = "") {
-  return summarizeSensitiveValue(value, { includePreview: true });
+  return summarizeSensitiveValue(value);
 }
 
 function redactXmlTextContent(xml, localName, label) {
   const pattern = new RegExp(`(<(?:[^:>]+:)?${localName}[^>]*>)([\\s\\S]*?)(<\\/(?:[^:>]+:)?${localName}>)`, "gi");
   return xml.replace(pattern, (_match, open, value, close) => {
     const text = String(value || "").trim();
+    if (/^\[redacted\b/i.test(text)) {
+      return `${open}${text}${close}`;
+    }
     const marker = text ? `[redacted ${label} sha256:${shortHash(text)}]` : REDACTED_VALUE;
     return `${open}${marker}${close}`;
+  });
+}
+
+function redactXmlAttribute(xml, attrName, label) {
+  const pattern = new RegExp(`\\b${attrName}=("|')([^"']*)(\\1)`, "gi");
+  return xml.replace(pattern, (_match, quote, value) => {
+    const text = String(value || "").trim();
+    if (/^\[redacted\b/i.test(text)) {
+      return `${attrName}=${quote}${text}${quote}`;
+    }
+    const marker = text ? `[redacted ${label} sha256:${shortHash(text)}]` : REDACTED_VALUE;
+    return `${attrName}=${quote}${marker}${quote}`;
+  });
+}
+
+function redactElementIdAttributes(xml, localName, label) {
+  const pattern = new RegExp(`(<(?:[^:>]+:)?${localName}\\b[^>]*?)\\bID=("|')([^"']+)(\\2)`, "gi");
+  return xml.replace(pattern, (_match, prefix, quote, value) => {
+    if (/^\[redacted\b/i.test(value)) {
+      return `${prefix}ID=${quote}${value}${quote}`;
+    }
+    const marker = `[redacted ${label} id sha256:${shortHash(value)}]`;
+    return `${prefix}ID=${quote}${marker}${quote}`;
+  });
+}
+
+function redactReferenceUriAttributes(xml) {
+  return xml.replace(/\bURI=("|')#([^"']+)(\1)/gi, (_match, quote, value) => {
+    if (/^\[redacted\b/i.test(value)) {
+      return `URI=${quote}#${value}${quote}`;
+    }
+    return `URI=${quote}#[redacted reference id sha256:${shortHash(value)}]${quote}`;
   });
 }
 
@@ -120,12 +156,23 @@ export function redactSamlXml(xml = "", { maxLength = MAX_REDACTED_XML_LENGTH } 
   let redacted = String(xml)
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted private key]")
     .replace(/(<(?:[^:>]+:)?X509Certificate[^>]*>)([\s\S]*?)(<\/(?:[^:>]+:)?X509Certificate>)/gi, (_match, open, value, close) => {
+      const text = String(value || "").trim();
+      if (/^\[redacted certificate\b/i.test(text)) {
+        return `${open}${text}${close}`;
+      }
       const normalized = String(value || "").replace(/\s+/g, "");
       return `${open}[redacted certificate sha256:${shortHash(normalized)}]${close}`;
     });
 
+  redacted = redactXmlTextContent(redacted, "SignatureValue", "signature value");
+  redacted = redactXmlTextContent(redacted, "DigestValue", "digest value");
   redacted = redactXmlTextContent(redacted, "NameID", "nameid");
   redacted = redactXmlTextContent(redacted, "AttributeValue", "attribute_value");
+  redacted = redactXmlAttribute(redacted, "SessionIndex", "session index");
+  redacted = redactXmlAttribute(redacted, "InResponseTo", "in response to");
+  redacted = redactElementIdAttributes(redacted, "Response", "response");
+  redacted = redactElementIdAttributes(redacted, "Assertion", "assertion");
+  redacted = redactReferenceUriAttributes(redacted);
   redacted = redacted.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, (match) => `${maskSamlValue(match)} [sha256:${shortHash(match)}]`);
 
   if (redacted.length <= maxLength) {
@@ -142,6 +189,9 @@ export function redactSamlRedirectUrl(url = "") {
     for (const key of ["SAMLRequest", "SAMLResponse", "RelayState", "Signature"]) {
       const value = target.searchParams.get(key);
       if (value) {
+        if (/^\[redacted\b/i.test(value)) {
+          continue;
+        }
         target.searchParams.set(key, `[redacted sha256:${shortHash(value)} size:${byteLength(value)}]`);
       }
     }
@@ -173,6 +223,20 @@ function extractXmlAttrFromElement(element, attrName) {
 
 function hasXmlElement(xml, localName) {
   return new RegExp(`<[^>]*:?${localName}\\b`, "i").test(xml);
+}
+
+function extractXmlElements(xml, localName) {
+  const pattern = new RegExp(`<(?:[^:>]+:)?${localName}\\b[\\s\\S]*?<\\/(?:[^:>]+:)?${localName}>`, "gi");
+  return Array.from(String(xml || "").matchAll(pattern), (match) => match[0]);
+}
+
+function extractXmlAttrValues(xml, localName, attrName) {
+  const pattern = new RegExp(`<(?:[^:>]+:)?${localName}\\b[^>]*\\b${attrName}="([^"]+)"`, "gi");
+  return Array.from(String(xml || "").matchAll(pattern), (match) => match[1].trim()).filter(Boolean);
+}
+
+function summarizeXmlId(value = "") {
+  return value ? { present: true, sha256_12: shortHash(value) } : { present: false };
 }
 
 function directResponseSignaturePresent(xml, assertionXml) {
@@ -231,6 +295,9 @@ export function parseSamlResponse(xml) {
   const recipient = subjectConfirmationXml ? extractXmlAttrFromElement(subjectConfirmationXml, "Recipient") : "";
   const notBefore = conditionsXml ? extractXmlAttrFromElement(conditionsXml, "NotBefore") : "";
   const notOnOrAfter = conditionsXml ? extractXmlAttrFromElement(conditionsXml, "NotOnOrAfter") : "";
+  const responseId = extractXmlAttr(xml, /<[^>]*:?Response[^>]+ID="([^"]+)"/i);
+  const assertionId = assertionXml ? extractXmlAttr(assertionXml, /<[^>]*:?Assertion[^>]+ID="([^"]+)"/i) : "";
+  const sessionIndex = assertionXml ? extractXmlAttr(assertionXml, /SessionIndex="([^"]+)"/i) : "";
 
   const attributes = {};
   const attributeNames = [];
@@ -245,9 +312,9 @@ export function parseSamlResponse(xml) {
     while ((valMatch = valRegex.exec(attrBody)) !== null) {
       const value = valMatch[1].trim();
       values.push({
-        present: value ? "present" : "empty",
+        present: value ? "present" : "missing",
         sha256_12: value ? shortHash(value) : "",
-        redacted: REDACTED_VALUE
+        redacted: value ? "received / redacted" : "missing"
       });
     }
     attributeNames.push(attrName);
@@ -263,16 +330,22 @@ export function parseSamlResponse(xml) {
     statusDetailPresent,
     isSuccess,
     issuer,
+    responseId,
+    responseIdSummary: summarizeXmlId(responseId),
+    assertionId,
+    assertionIdSummary: summarizeXmlId(assertionId),
     assertionIssuer,
     assertionPresent: Boolean(assertionXml),
     subjectPresent: Boolean(subjectXml),
     nameIdPresent: Boolean(nameId),
     nameIdMasked: nameId ? `[redacted nameid sha256:${shortHash(nameId)}]` : "",
-    nameIdPreview: nameId ? maskSamlValue(nameId) : "",
+    nameIdPreview: nameId ? "received / redacted" : "",
     nameIdHash: nameId ? shortHash(nameId) : "",
     nameIdFormat,
     attributes,
     attributeNames,
+    sessionIndexPresent: Boolean(sessionIndex),
+    sessionIndexHash: sessionIndex ? shortHash(sessionIndex) : "",
     inResponseTo,
     destination,
     recipient,
@@ -284,6 +357,58 @@ export function parseSamlResponse(xml) {
     notOnOrAfter,
     responseSignaturePresent: directResponseSignaturePresent(xml, assertionXml),
     assertionSignaturePresent: assertionXml ? hasXmlElement(assertionXml, "Signature") : false
+  };
+}
+
+export function summarizeSamlResponseXml(xml = "") {
+  const responseXml = String(xml || "");
+  if (!responseXml) {
+    return {
+      response_id: summarizeXmlId(""),
+      assertion_id: summarizeXmlId(""),
+      signatures: { response: "missing", assertion: "missing" },
+      certificates: { embedded: "missing", count: 0 }
+    };
+  }
+
+  let parsed = null;
+  try {
+    parsed = parseSamlResponse(responseXml);
+  } catch {
+    parsed = null;
+  }
+
+  const assertionXml = extractXmlElement(responseXml, "Assertion");
+  const certificates = extractXmlElements(responseXml, "X509Certificate")
+    .map((entry) => entry.replace(/<[^>]+>/g, "").replace(/\s+/g, ""))
+    .filter(Boolean);
+  const signatureAlgorithms = [...new Set(extractXmlAttrValues(responseXml, "SignatureMethod", "Algorithm"))];
+  const digestAlgorithms = [...new Set(extractXmlAttrValues(responseXml, "DigestMethod", "Algorithm"))];
+  const signatureValueCount = extractXmlElements(responseXml, "SignatureValue").length;
+  const digestValueCount = extractXmlElements(responseXml, "DigestValue").length;
+
+  return {
+    response_id: parsed?.responseIdSummary || summarizeXmlId(""),
+    assertion_id: parsed?.assertionIdSummary || summarizeXmlId(""),
+    issuer: parsed?.issuer || "(not extracted)",
+    in_response_to: parsed?.inResponseTo || "(not extracted)",
+    destination: parsed?.destination || "(not extracted)",
+    status_code: parsed?.statusCode || "(not extracted)",
+    status_message: parsed?.statusMessage || "(not extracted)",
+    status_detail: parsed?.statusDetailPresent ? "present" : "missing",
+    signatures: {
+      response: directResponseSignaturePresent(responseXml, assertionXml) ? "present" : "missing",
+      assertion: assertionXml && hasXmlElement(assertionXml, "Signature") ? "present" : "missing",
+      signature_value_count: signatureValueCount,
+      digest_value_count: digestValueCount,
+      signature_algorithms: signatureAlgorithms,
+      digest_algorithms: digestAlgorithms
+    },
+    certificates: {
+      embedded: certificates.length > 0 ? "present" : "missing",
+      count: certificates.length,
+      sha256_12: certificates.map((cert) => shortHash(cert))
+    }
   };
 }
 
@@ -335,7 +460,7 @@ function isAssertionLevelNode(node) {
 }
 
 function tryVerifySignatureNodes(xml, sigNodes, rawCerts) {
-  if (sigNodes.length === 0) return { verification: "not checked" };
+  if (sigNodes.length === 0) return { verification: "not_checked" };
 
   let lastError = "";
 
@@ -365,9 +490,10 @@ export function verifySamlXmlSignatures(responseXml, rawCerts = []) {
     return {
       response_signature_present: hasAnySigRegex ? "present" : "missing",
       assertion_signature_present: "not extracted",
-      response_signature_verification: "not checked",
-      assertion_signature_verification: "not checked",
-      signature_verification_result: "unsupported",
+      response_signature_verification: "unavailable",
+      assertion_signature_verification: "unavailable",
+      signature_verification_result: "unavailable",
+      trust_validation: "incomplete",
       verification_note: "xml-crypto library not available; install xml-crypto to enable verification."
     };
   }
@@ -381,14 +507,15 @@ export function verifySamlXmlSignatures(responseXml, rawCerts = []) {
     return {
       response_signature_present: hasAnySigRegex ? "present" : "missing",
       assertion_signature_present: "not extracted",
-      response_signature_verification: "not checked",
-      assertion_signature_verification: "not checked",
-      signature_verification_result: "error",
+      response_signature_verification: "unavailable",
+      assertion_signature_verification: "unavailable",
+      signature_verification_result: "unavailable",
+      trust_validation: "incomplete",
       verification_note: "XML parsing failed during signature verification."
     };
   }
 
-  const allSigNodes = Array.from(doc.getElementsByTagNameNS("http://www.w3.org/2000/09/xmldsig#", "Signature"));
+  const allSigNodes = Array.from(doc.getElementsByTagNameNS(XMLDSIG_NS, "Signature"));
   const assertionSigNodes = allSigNodes.filter(isAssertionLevelNode);
   const responseSigNodes = allSigNodes.filter((n) => !isAssertionLevelNode(n));
 
@@ -400,9 +527,10 @@ export function verifySamlXmlSignatures(responseXml, rawCerts = []) {
     return {
       response_signature_present: "missing",
       assertion_signature_present: "missing",
-      response_signature_verification: "not checked",
-      assertion_signature_verification: "not checked",
-      signature_verification_result: "missing signature",
+      response_signature_verification: "not_checked",
+      assertion_signature_verification: "not_checked",
+      signature_verification_result: "missing_signature",
+      trust_validation: "incomplete",
       verification_note: "No XML Signature element detected in SAMLResponse."
     };
   }
@@ -411,10 +539,11 @@ export function verifySamlXmlSignatures(responseXml, rawCerts = []) {
     return {
       response_signature_present: responsePresent,
       assertion_signature_present: assertionPresent,
-      response_signature_verification: "not checked",
-      assertion_signature_verification: "not checked",
-      signature_verification_result: "missing certificate",
-      verification_note: "Signature detected but no IdP signing certificate found in metadata."
+      response_signature_verification: "unavailable",
+      assertion_signature_verification: "unavailable",
+      signature_verification_result: "unavailable",
+      trust_validation: "incomplete",
+      verification_note: "Signature detected, but no trusted IdP signing certificate from metadata was available for verification."
     };
   }
 
@@ -426,10 +555,8 @@ export function verifySamlXmlSignatures(responseXml, rawCerts = []) {
     overall = "invalid";
   } else if (responseVerif.verification === "valid" || assertionVerif.verification === "valid") {
     overall = "valid";
-  } else if (responseVerif.verification === "error" || assertionVerif.verification === "error") {
-    overall = "error";
   } else {
-    overall = "not checked";
+    overall = "not_checked";
   }
 
   return {
@@ -438,6 +565,7 @@ export function verifySamlXmlSignatures(responseXml, rawCerts = []) {
     response_signature_verification: responseVerif.verification,
     assertion_signature_verification: assertionVerif.verification,
     signature_verification_result: overall,
+    trust_validation: overall === "valid" ? "complete" : overall === "invalid" ? "failed" : "incomplete",
     verification_note: "Signature verification checks cryptographic integrity using the IdP signing certificate.",
     ...(responseVerif.error ? { response_verification_error: responseVerif.error } : {}),
     ...(assertionVerif.error ? { assertion_verification_error: assertionVerif.error } : {})

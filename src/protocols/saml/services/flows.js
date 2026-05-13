@@ -1,3 +1,5 @@
+import crypto from "node:crypto";
+
 const SAML_STEP_ORDER = [
   "authn_request_created",
   "redirect_to_idp",
@@ -18,6 +20,23 @@ function durationMs(startedAt, completedAt = nowIso()) {
   return Math.max(0, end - start);
 }
 
+function shortHash(value = "", length = 12) {
+  if (value === null || value === undefined || value === "") return "";
+  return crypto.createHash("sha256").update(String(value), "utf8").digest("hex").slice(0, length);
+}
+
+function sanitizeRuntime(runtime) {
+  if (!runtime || typeof runtime !== "object" || Array.isArray(runtime)) return runtime || null;
+  const next = { ...runtime };
+  const relayState = typeof next.relayState === "string" ? next.relayState : "";
+  if (relayState && relayState !== "received / redacted") {
+    next.relayStateSha25612 = next.relayStateSha25612 || shortHash(relayState);
+    next.relayState = "received / redacted";
+    next.relayStatePresent = true;
+  }
+  return next;
+}
+
 function normalizeFlow(flow = {}) {
   const startedAt = flow.startedAt || nowIso();
   return {
@@ -30,7 +49,7 @@ function normalizeFlow(flow = {}) {
     errorCode: flow.errorCode || "",
     errorDescription: flow.errorDescription || "",
     durationMs: flow.durationMs ?? (flow.completedAt ? durationMs(startedAt, flow.completedAt) : null),
-    runtime: flow.runtime || null
+    runtime: sanitizeRuntime(flow.runtime)
   };
 }
 
@@ -152,12 +171,13 @@ export function createSamlFlowService({ getFlows, setFlows, getSteps, setSteps, 
 
   function findRunningFlowByRelayState(relayState, maxAgeMs = 0) {
     if (!relayState) return null;
+    const relayStateSha25612 = shortHash(relayState);
     const cutoff = maxAgeMs > 0 ? Date.now() - maxAgeMs : 0;
     return (
       getFlows().find(
         (flow) =>
           flow.status === "running" &&
-          flow.runtime?.relayState === relayState &&
+          (flow.runtime?.relayState === relayState || flow.runtime?.relayStateSha25612 === relayStateSha25612) &&
           (cutoff === 0 || new Date(flow.startedAt).getTime() > cutoff)
       ) || null
     );
