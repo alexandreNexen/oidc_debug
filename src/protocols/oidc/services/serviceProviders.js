@@ -22,6 +22,14 @@ export function normalizeScopes(value = "") {
   return clean(value).replace(/\s+/g, " ");
 }
 
+function normalizeExpectedUserInfoClaims(value = []) {
+  const entries = Array.isArray(value)
+    ? value
+    : clean(value).split(/[,\s]+/);
+
+  return [...new Set(entries.map((entry) => clean(entry)).filter(Boolean))];
+}
+
 export function validateServiceProviderInput(input = {}, { mode = "create" } = {}) {
   const values = {
     name: clean(getInputValue(input, "name")),
@@ -107,6 +115,7 @@ function normalizePersistedServiceProvider(entry, { createId }) {
     clientId: normalized.clientId,
     clientType: normalized.clientType || "confidential",
     scopes: normalizeScopes(normalized.scopes),
+    expectedUserInfoClaims: normalizeExpectedUserInfoClaims(entry.expectedUserInfoClaims ?? entry.expected_userinfo_claims),
     secretRecord: entry.secretRecord || null,
     createdAt: entry.createdAt || entry.created_at || now,
     updatedAt: entry.updatedAt || entry.updated_at || now
@@ -222,6 +231,7 @@ export function createServiceProviderService({ getEntries, setEntries, createId,
       clientId: normalized.clientId,
       clientType: normalized.clientType || "confidential",
       scopes: normalizeScopes(normalized.scopes),
+      expectedUserInfoClaims: normalizeExpectedUserInfoClaims(input.expectedUserInfoClaims ?? input.expected_userinfo_claims ?? existing?.expectedUserInfoClaims),
       secretRecord: existing?.secretRecord || null,
       createdAt: existing?.createdAt || now,
       updatedAt: now

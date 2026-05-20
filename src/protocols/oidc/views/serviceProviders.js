@@ -79,7 +79,7 @@ function renderGeneralPanel(redirectUri) {
     : "";
 
   return `
-    <details class="config-panel" open>
+    <details class="config-panel">
       <summary class="config-panel__summary">General</summary>
       <div class="config-panel__body">
         <div class="redirect-uri-block">

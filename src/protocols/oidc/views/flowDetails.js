@@ -17,10 +17,14 @@ function encodeRawData(value) {
 
 // ---- Status badge helpers ----
 
-const BADGE_SUCCESS = new Set(["yes", "received", "present", "sent", "valid", "success", "match", "ok", "received / redacted"]);
-const BADGE_ERROR = new Set(["no", "missing", "failed", "mismatch", "error", "failure"]);
+const BADGE_SUCCESS = new Set(["yes", "received", "present", "sent", "valid", "success", "match", "ok", "received / redacted", "prepared", "available", "received and decoded", "readable"]);
+const BADGE_ERROR = new Set(["no", "missing", "failed", "mismatch", "error", "failure", "invalid", "expired"]);
 const BADGE_NEUTRAL = new Set(["not implemented", "not checked", "not extracted", "skipped", "none",
-  "disabled", "not sent", "pending", "not performed", "not available"]);
+  "disabled", "not sent", "pending", "not performed", "not available", "unavailable", "incomplete", "not_checked"]);
+
+const PERSONAL_CLAIMS = new Set(["email", "name", "given_name", "family_name", "middle_name", "nickname", "preferred_username", "phone_number", "address", "birthdate", "locale", "zoneinfo", "picture", "website", "profile", "nonce"]);
+const COLLECTION_CLAIMS = new Set(["roles", "role", "groups", "group", "authorities", "entitlements", "realm_access", "resource_access"]);
+const PUBLIC_PROTOCOL_CLAIMS = new Set(["iss", "aud", "azp", "exp", "iat", "nbf", "auth_time", "acr", "amr", "typ", "token_type"]);
 
 function badge(value) {
   if (value === null || value === undefined || value === "") return `<span class="muted">—</span>`;
@@ -64,9 +68,9 @@ function plain(v) {
   return `<span>${escapeHtml(String(v))}</span>`;
 }
 
-function code(v) {
-  if (!v) return `<span class="muted">—</span>`;
-  return `<code class="code-inline">${escapeHtml(String(v))}</code>`;
+function muted(v) {
+  if (v === null || v === undefined || v === "") return "";
+  return `<p class="muted" style="margin:6px 0 0">${escapeHtml(String(v))}</p>`;
 }
 
 // ---- Layout helpers ----
@@ -81,6 +85,219 @@ function row(label, html) {
   return `<div class="flow-data-list__row"><dt>${escapeHtml(label)}</dt><dd>${html}</dd></div>`;
 }
 
+function statusWithDetail(status, detail) {
+  return `${badge(status)}${detail ? muted(detail) : ""}`;
+}
+
+function pkceSummary(value) {
+  const str = String(value || "");
+  if (!str || str === "disabled") return str || "disabled";
+  if (/s256/i.test(str)) return "S256";
+  return str.replace(/\s*challenge sent\s*/i, "").trim() || str;
+}
+
+function providerErrorSummary(callbackResponse = {}) {
+  if (!callbackResponse.error && callbackResponse.provider_error !== "received") return badge("none");
+  const detail = [
+    callbackResponse.error ? `OAuth error: ${callbackResponse.error}` : "",
+    callbackResponse.error_description ? `error_description: ${callbackResponse.error_description}` : ""
+  ].filter(Boolean).join("; ");
+  return statusWithDetail("error", detail);
+}
+
+function callbackStatus(callbackStep) {
+  if (!callbackStep) return "missing";
+  return callbackStep.status === "success" || callbackStep.status === "error" ? "received" : "missing";
+}
+
+function tokenExchangeStatus(tokenStep, response = {}) {
+  if (!tokenStep || tokenStep.status === "pending") return "";
+  if (tokenStep.status === "success" && response.token_error === "none") return "success";
+  return "failed";
+}
+
+function tokenFailureDetail(response = {}) {
+  if (!response.token_error || response.token_error === "none") return "";
+  return [
+    response.http_status ? `HTTP status: ${response.http_status}` : "",
+    `OAuth error: ${response.token_error}`,
+    response.error_description ? `error_description: ${response.error_description}` : ""
+  ].filter(Boolean).join("; ");
+}
+
+function claimsListSummary(claims = [], { max = 8 } = {}) {
+  if (!Array.isArray(claims) || claims.length === 0) return "";
+  const visible = claims.slice(0, max);
+  const suffix = claims.length > max ? `, +${claims.length - max} more` : "";
+  return `${visible.join(", ")}${suffix}`;
+}
+
+function scopesFromFlow(flow = {}, steps = []) {
+  const auth = steps.find((s) => s.stepName === "authorize");
+  const source = flow.runtime?.scopes || flow.scopes || auth?.requestData?.scope || "";
+  return String(source).split(/\s+/).map((scope) => scope.trim()).filter(Boolean);
+}
+
+function claimEntriesFromObject(value = {}) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  return Object.entries(value).filter(([claim]) => claim && !["claims", "raw_claims_available"].includes(claim));
+}
+
+function idTokenClaimEntries(tokenStep = {}) {
+  const payload = tokenStep.rawAnalysisData?.jwt?.payload;
+  if (payload && typeof payload === "object") return claimEntriesFromObject(payload);
+
+  const diag = tokenStep.responseData?.id_token_diagnostics || {};
+  return claimEntriesFromObject({
+    iss: diag.issuer,
+    aud: diag.audience,
+    sub: diag.subject,
+    exp: diag.expiration
+  });
+}
+
+function userInfoClaimEntries(userInfoStep = {}) {
+  const claims = userInfoStep.rawResponseData?.body?.claims;
+  if (claims && typeof claims === "object") return claimEntriesFromObject(claims);
+
+  const receivedClaims = userInfoStep.responseData?.received_claims;
+  if (Array.isArray(receivedClaims) && receivedClaims.length > 0) {
+    return receivedClaims.map((claim) => [claim, claim === "sub" ? userInfoStep.responseData?.subject || "received / redacted" : "received / redacted"]);
+  }
+
+  return userInfoStep.responseData?.subject ? [["sub", userInfoStep.responseData.subject]] : [];
+}
+
+function formatClaimValue(claim, value) {
+  if (value === null || value === undefined || value === "") return "missing";
+  const name = String(claim || "").toLowerCase();
+
+  if (PERSONAL_CLAIMS.has(name)) return "received / redacted";
+  if (name === "sub") return "received / redacted";
+
+  if (Array.isArray(value)) {
+    if (COLLECTION_CLAIMS.has(name)) return `${value.length} value${value.length > 1 ? "s" : ""}`;
+    return value.map((item) => String(item)).join(", ");
+  }
+
+  if (typeof value === "object") {
+    const keys = Object.keys(value);
+    return `${keys.length} nested field${keys.length > 1 ? "s" : ""}`;
+  }
+
+  if (typeof value === "string" && value.length > 80) {
+    return `${value.slice(0, 77)}...`;
+  }
+
+  return PUBLIC_PROTOCOL_CLAIMS.has(name) ? String(value) : "received / redacted";
+}
+
+function claimTable(entries = [], emptyLabel = "Unavailable") {
+  if (!entries.length) return `<p class="muted">${escapeHtml(emptyLabel)}</p>`;
+  return `
+    <div class="table-scroll">
+      <table class="table table--compact">
+        <thead>
+          <tr><th>Claim</th><th>Value</th></tr>
+        </thead>
+        <tbody>
+          ${entries.map(([claim, value]) => `
+            <tr>
+              <td><code class="code-inline">${escapeHtml(String(claim))}</code></td>
+              <td>${escapeHtml(formatClaimValue(claim, value))}</td>
+            </tr>
+          `).join("")}
+        </tbody>
+      </table>
+    </div>`;
+}
+
+function scopesList(scopes = []) {
+  if (!scopes.length) return `<span class="muted">Unavailable</span>`;
+  return scopes.map((scope) => `<span class="badge badge--neutral">${escapeHtml(scope)}</span>`).join(" ");
+}
+
+function userInfoStatus(step) {
+  if (!step || step.status === "pending") return "";
+  if (step.status === "skipped") return "skipped";
+  return step.status === "success" ? "success" : "failed";
+}
+
+function userInfoFailureDetail(response = {}) {
+  if (!response.error || response.error === "none") return "";
+  return [
+    response.http_status ? `HTTP status: ${response.http_status}` : "",
+    `error: ${response.error}`,
+    response.error_description ? `error_description: ${response.error_description}` : ""
+  ].filter(Boolean).join("; ");
+}
+
+function oidcChecksResult(checks = {}) {
+  const values = Object.values(checks).filter(Boolean);
+  if (values.length === 0) return "not_checked";
+  if (values.some((value) => ["invalid", "expired", "missing"].includes(String(value)))) return "failed";
+  return "passed";
+}
+
+function cleanIdTokenAnalysisRaw(rawData) {
+  if (!rawData || typeof rawData !== "object" || Array.isArray(rawData)) return rawData;
+
+  const cleaned = {
+    ...rawData,
+    jwt: rawData.jwt && typeof rawData.jwt === "object"
+      ? {
+          ...rawData.jwt,
+          header: rawData.jwt.header && typeof rawData.jwt.header === "object" ? { ...rawData.jwt.header } : rawData.jwt.header,
+          payload: rawData.jwt.payload && typeof rawData.jwt.payload === "object" ? { ...rawData.jwt.payload } : rawData.jwt.payload
+        }
+      : rawData.jwt
+  };
+
+  if (rawData.validation && typeof rawData.validation === "object") {
+    const { signature: _signature, ...validation } = rawData.validation;
+    if (validation.overall === "incomplete") {
+      const checks = {
+        issuer: validation.issuer,
+        audience: validation.audience,
+        expiration: validation.expiration,
+        nonce: validation.nonce
+      };
+      validation.overall = oidcChecksResult(checks);
+    }
+    cleaned.validation = validation;
+  }
+
+  if (rawData.checks && typeof rawData.checks === "object") {
+    const { signature: _signature, ...checks } = rawData.checks;
+    if (checks.result === "incomplete") {
+      checks.result = oidcChecksResult({
+        issuer: checks.issuer,
+        audience: checks.audience,
+        expiration: checks.expiration,
+        nonce: checks.nonce
+      });
+    }
+    cleaned.checks = checks;
+  }
+
+  return cleaned;
+}
+
+function idTokenAnalysisChecks(rawData = {}, diagnostics = {}) {
+  const rawValidation = rawData?.checks || rawData?.validation || {};
+  const checks = {
+    issuer: rawValidation.issuer || diagnostics.issuer_validation || "",
+    audience: rawValidation.audience || diagnostics.audience_validation || "",
+    expiration: rawValidation.expiration || diagnostics.expiration_validation || "",
+    nonce: rawValidation.nonce || diagnostics.nonce_validation || ""
+  };
+  const rawResult = rawValidation.result || rawValidation.overall || diagnostics.overall_validation || "";
+  return {
+    ...checks,
+    result: rawResult && rawResult !== "incomplete" ? rawResult : oidcChecksResult(checks)
+  };
+}
+
 function rawBtn(title, stepName, type, rawData) {
   if (!rawData) return "";
   const label = type === "request" ? "Request" : "Response";
@@ -90,7 +307,7 @@ function rawBtn(title, stepName, type, rawData) {
     data-raw-step="${escapeHtml(stepName)}"
     data-raw-type="${escapeHtml(label)}"
     data-raw-json="${escapeHtml(encodeRawData(rawData))}"
-  >Sanitized raw</button>`;
+  >Raw</button>`;
 }
 
 function sectionHead(title, summary) {
@@ -165,7 +382,7 @@ function computeSectionTabs(steps) {
     { id: "authorization", label: "Authorization", num: 1, status: authStatus },
     { id: "token-exchange", label: "Token exchange", num: 2, status: tokenStatus },
     { id: "userinfo", label: "UserInfo", num: 3, status: uiStatus },
-    { id: "id-token", label: "ID Token analysis", num: 4, status: idTokenStatus }
+    { id: "scopes-claims", label: "Scopes & Claims", num: 4, status: idTokenStatus }
   ];
 }
 
@@ -181,26 +398,22 @@ function renderAuthorization(steps) {
   const requestContent = authPending
     ? `<p class="muted">Not started.</p>`
     : dl([
-        row("Authorization endpoint", code(rd.endpoint)),
-        row("Client ID", plain(rd.client_id)),
-        row("Redirect URI", plain(rd.redirect_uri)),
-        row("Scopes", plain(rd.scope)),
-        row("Response type", plain(rd.response_type || "code")),
-        row("PKCE", badge(rd.pkce)),
-        row("State", badge(rd.state)),
-        row("Nonce", badge(rd.nonce)),
-        row("Browser redirect", badge(rd.http_mode ? "prepared" : ""))
+        row("Authorization request", badge("prepared")),
+        row("Flow type", plain("authorization_code")),
+        row("PKCE", badge(pkceSummary(rd.pkce))),
+        row("Scopes", plain(rd.scope))
       ]);
 
+  const stateDetail = cbrd.state_validation && cbrd.state_validation !== "valid"
+    ? `Expected state did not match callback state.`
+    : "";
+  const callbackDetail = !cb && !authPending ? "The browser has not returned to the callback yet." : "";
   const responseContent = !cb
     ? `<p class="muted">${authPending ? "Not started." : "Waiting for callback…"}</p>`
     : dl([
-        row("Callback received", badge("yes")),
-        row("Authorization code", badge(cbrd.authorization_code)),
-        row("State", badge(cbrd.state)),
-        row("State validation", badge(cbrd.state_validation)),
-        row("Provider error", cbrd.error ? `<span class="badge badge--error">${escapeHtml(cbrd.error)}</span>` : badge("none")),
-        cbrd.error_description ? row("Error description", plain(cbrd.error_description)) : null
+        row("Callback", statusWithDetail(callbackStatus(cb), callbackDetail)),
+        row("State validation", statusWithDetail(cbrd.state_validation, stateDetail)),
+        row("Provider error", providerErrorSummary(cbrd))
       ]);
 
   return `
@@ -230,29 +443,21 @@ function renderTokenExchange(steps) {
   const requestContent = notReached
     ? `<p class="muted">Not reached.</p>`
     : dl([
-        row("Token endpoint", code(rd.endpoint)),
-        row("Grant type", plain(rd.grant_type)),
-        row("Authorization code", badge(rd.authorization_code)),
-        row("Redirect URI", plain(rd.redirect_uri)),
-        row("Client authentication", plain(rd.client_authentication_method)),
-        row("Client secret", badge(rd.client_secret_used)),
-        row("Code verifier", badge(rd.code_verifier))
+        row("Token request", badge("sent")),
+        row("Client authentication", plain(rd.client_authentication_method))
       ]);
 
   const tokenError = resp.token_error && resp.token_error !== "none";
   const responseContent = notReached
     ? `<p class="muted">Not reached.</p>`
     : dl([
+        row("Token exchange", statusWithDetail(tokenExchangeStatus(token, resp), tokenFailureDetail(resp))),
         row("HTTP status", badge(resp.http_status != null ? String(resp.http_status) : "")),
         row("Access token", badge(resp.access_token)),
         row("ID token", badge(resp.id_token)),
         row("Refresh token", badge(resp.refresh_token)),
-        resp.token_type ? row("Token type", plain(resp.token_type)) : null,
         resp.expires_in != null && resp.expires_in !== "" ? row("Expires in", plain(`${resp.expires_in} s`)) : null,
-        row("Token error", tokenError
-          ? `<span class="badge badge--error">${escapeHtml(String(resp.token_error))}</span>`
-          : badge("none")),
-        tokenError && resp.error_description ? row("Error description", plain(resp.error_description)) : null
+        tokenError ? row("OAuth error", statusWithDetail(resp.token_error, resp.error_description)) : null
       ]);
 
   return `
@@ -279,33 +484,35 @@ function renderUserInfo(steps) {
   const resp = ui?.responseData || {};
   const notReached = !ui || ui.status === "pending";
   const skipped = ui?.status === "skipped";
-  const emailStatus = resp.email || (resp.email_present === "yes" ? "received" : resp.email_present === "no" ? "missing" : "");
-  const nameStatus = resp.name || (resp.name_present === "yes" ? "received" : resp.name_present === "no" ? "missing" : "");
+  const receivedClaims = Array.isArray(resp.received_claims) ? resp.received_claims : (resp.subject ? ["sub"] : []);
 
   const requestContent = notReached
     ? `<p class="muted">Not reached.</p>`
     : dl([
-        row("UserInfo endpoint", code(rd.endpoint)),
-        row("Method", plain(rd.method || "GET")),
-        row("Access token", badge("used / masked")),
-        row("Authorization header", badge("Bearer present"))
+        row("UserInfo request", statusWithDetail(
+          skipped ? "skipped" : "sent",
+          skipped ? (resp.skipped_reason || "UserInfo request skipped.") : ""
+        ))
       ]);
 
   const uiError = resp.error && resp.error !== "none";
   const responseContent = notReached
     ? `<p class="muted">Not reached.</p>`
     : skipped
-    ? `<p class="muted">Skipped — ${escapeHtml(resp.skipped_reason || "no reason provided")}.</p>`
+    ? dl([
+        row("UserInfo", statusWithDetail("skipped", resp.skipped_reason || "No reason provided.")),
+        row("User identified", badge("no")),
+        row("Subject", badge("missing")),
+        row("Claims", badge("missing"))
+      ])
     : dl([
-        row("HTTP status", badge(resp.http_status != null ? String(resp.http_status) : "")),
+        row("UserInfo", statusWithDetail(userInfoStatus(ui), userInfoFailureDetail(resp))),
+        uiError ? row("HTTP status", badge(resp.http_status != null ? String(resp.http_status) : "")) : null,
+        row("User identified", badge(resp.subject ? "yes" : "no")),
         row("Subject", resp.subject ? plain(resp.subject) : badge("missing")),
-        row("Email", badge(emailStatus || "unavailable")),
-        row("Name", badge(nameStatus || "unavailable")),
-        row("Claims available", badge(resp.raw_claims_available)),
-        row("Error", uiError
-          ? `<span class="badge badge--error">${escapeHtml(String(resp.error))}</span>`
-          : badge("none")),
-        uiError && resp.error_description ? row("Error description", plain(resp.error_description)) : null
+        row("Claims", badge(resp.raw_claims_available === "yes" ? "available" : "missing")),
+        receivedClaims.length ? row("Claims received", plain(claimsListSummary(receivedClaims))) : null,
+        uiError ? row("Error", statusWithDetail(resp.error, resp.error_description)) : null
       ]);
 
   return `
@@ -324,44 +531,75 @@ function renderUserInfo(steps) {
     </section>`;
 }
 
-// ---- Section 4: ID Token analysis ----
+// ---- Section 4: Scopes & Claims ----
 
-function renderIdTokenAnalysis(steps) {
+function renderScopesAndClaims(flow, steps) {
   const token = steps.find((s) => s.stepName === "token");
   const diag = token?.responseData?.id_token_diagnostics;
-  const analysisRaw = token?.rawAnalysisData || null;
-  const rawButton = rawBtn("Sanitized ID Token Analysis", "token", "response", analysisRaw);
-  const noData = !diag || diag.id_token_received === "no";
+  const analysisRaw = cleanIdTokenAnalysisRaw(token?.rawAnalysisData || null);
+  const rawButton = rawBtn("Raw ID Token Analysis", "token", "response", analysisRaw);
+  const userInfo = steps.find((s) => s.stepName === "userinfo");
+  const userInfoRawButton = rawBtn("Raw UserInfo Response", "userinfo", "response", userInfo?.rawResponseData);
+  const scopes = scopesFromFlow(flow, steps);
+  const idTokenClaims = idTokenClaimEntries(token);
+  const userInfoClaims = userInfoClaimEntries(userInfo);
+  const analysisChecks = idTokenAnalysisChecks(analysisRaw, diag);
+  const idTokenState = !token || token.status === "pending"
+    ? "Not reached."
+    : !diag || diag.id_token_received === "no"
+      ? "No ID token received."
+      : "";
+  const userInfoState = !userInfo || userInfo.status === "pending"
+    ? "Not requested."
+    : userInfo.status === "skipped"
+      ? "Not requested."
+      : userInfo.status === "error"
+        ? "Request failed."
+        : "";
 
   return `
-    <section class="flow-section" data-section-panel="id-token">
-      ${sectionHead("ID Token analysis", "The SP inspects the identity token received to understand the identity information and available validations.")}
-      <article class="flow-detail-panel">
-        <header>
-          <h3>ID Token</h3>
-          ${rawButton}
-        </header>
-        ${noData
-          ? `<p class="muted">${token ? "No ID token received." : "Not reached."}</p>`
-          : dl([
-              row("ID token received", badge(diag.id_token_received)),
-              row("Decoded", badge(diag.decoded || "yes")),
-              row("Claims readable", badge(diag.claims_readable || "yes")),
-              diag.format ? row("Format", plain(diag.format)) : null,
-              diag.decode_error ? row("Decode error", plain(diag.decode_error)) : null,
-              diag.jwt_header_alg ? row("Algorithm (alg)", plain(diag.jwt_header_alg)) : null,
-              diag.jwt_header_kid ? row("Key ID (kid)", plain(diag.jwt_header_kid)) : null,
-              diag.issuer ? row("Issuer", plain(diag.issuer)) : null,
-              diag.audience ? row("Audience", plain(diag.audience)) : null,
-              diag.subject ? row("Subject", plain(diag.subject)) : null,
-              diag.expiration ? row("Expiration", plain(diag.expiration)) : null,
-              diag.issued_at ? row("Issued at", plain(diag.issued_at)) : null,
-              row("Nonce claim present", badge(diag.nonce_claim_present)),
-              row("Nonce validation", badge(diag.nonce_validation)),
-              row("Signature validation", badge(diag.signature_validation || "not implemented")),
-              row("Overall validation", badge(diag.overall_validation || "incomplete"))
-            ])}
-      </article>
+    <section class="flow-section" data-section-panel="scopes-claims">
+      ${sectionHead("Scopes & Claims", "Scopes are what the SP requested. Claims are what the IdP actually returned in the ID Token and UserInfo response.")}
+      <div class="analysis-grid">
+        <article class="flow-detail-panel">
+          <header>
+            <h3>Scopes demandés</h3>
+          </header>
+          ${scopesList(scopes)}
+        </article>
+        <article class="flow-detail-panel">
+          <header>
+            <h3>ID Token Analysis</h3>
+          </header>
+          ${idTokenState
+            ? `<p class="muted">${escapeHtml(idTokenState)}</p>`
+            : dl([
+                row("Issuer", badge(analysisChecks.issuer)),
+                row("Audience", badge(analysisChecks.audience)),
+                row("Expiration", badge(analysisChecks.expiration)),
+                row("Nonce", badge(analysisChecks.nonce)),
+                row("Result", badge(analysisChecks.result))
+              ])}
+        </article>
+        <article class="flow-detail-panel">
+          <header>
+            <h3>Claims reçus dans l'ID Token</h3>
+            ${rawButton}
+          </header>
+          ${idTokenState
+            ? `<p class="muted">${escapeHtml(idTokenState)}</p>`
+            : claimTable(idTokenClaims, "No readable ID Token claims.")}
+        </article>
+        <article class="flow-detail-panel">
+          <header>
+            <h3>Claims reçus dans UserInfo</h3>
+            ${userInfoRawButton}
+          </header>
+          ${userInfoState
+            ? `<p class="muted">${escapeHtml(userInfoState)}</p>`
+            : claimTable(userInfoClaims, "No readable UserInfo claims.")}
+        </article>
+      </div>
     </section>`;
 }
 
@@ -433,7 +671,7 @@ export function renderFlowDetailsPage({ flow, serviceProvider, steps = [], flash
       ${renderAuthorization(steps)}
       ${renderTokenExchange(steps)}
       ${renderUserInfo(steps)}
-      ${renderIdTokenAnalysis(steps)}
+      ${renderScopesAndClaims(flow, steps)}
     </div>
 
     <div class="modal-backdrop" data-raw-modal hidden>

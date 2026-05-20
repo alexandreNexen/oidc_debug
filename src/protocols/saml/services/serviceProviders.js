@@ -10,12 +10,23 @@ function clean(value = "") {
 }
 
 export function validateSamlServiceProviderInput(input = {}) {
+  const rawMetadataMode = clean(input.idpMetadataMode);
+  const rawIdpMetadataUrl = clean(input.idpMetadataUrl);
+  const rawIdpMetadataXml = clean(input.idpMetadataXml);
+  const metadataMode = rawMetadataMode === "xml"
+    ? "xml"
+    : rawMetadataMode === "url" || rawIdpMetadataUrl || !rawIdpMetadataXml
+      ? "url"
+      : "xml";
+  const idpMetadataUrl = metadataMode === "url" ? rawIdpMetadataUrl : "";
+  const idpMetadataXml = metadataMode === "xml" ? rawIdpMetadataXml : "";
   const values = {
     name: clean(input.name),
     environment: clean(input.environment),
     spEntityId: clean(input.spEntityId),
-    idpMetadataUrl: clean(input.idpMetadataUrl),
-    idpMetadataXml: clean(input.idpMetadataXml)
+    idpMetadataMode: metadataMode,
+    idpMetadataUrl,
+    idpMetadataXml
   };
 
   const errors = {};

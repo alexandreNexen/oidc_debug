@@ -123,7 +123,6 @@ export function renderServiceProviderEditPage({ serviceProvider, flash, form = {
             error: errors.scopes,
             required: true
           })}
-
           <div class="sp-form__actions">
             ${renderIconBtn({ icon: "save", label: "Save changes", type: "submit", variant: "success", showLabel: true })}
             ${renderIconBtn({ icon: "return", label: "Cancel", href: "/oidc/service-providers", variant: "neutral", showLabel: true })}

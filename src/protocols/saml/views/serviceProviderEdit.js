@@ -21,24 +21,57 @@ function renderField({ label, name, type = "text", value = "", placeholder = "",
   `;
 }
 
-function renderTextareaField({ label, name, value = "", placeholder = "", error = "", required = false, hint = "", rows = 4 }) {
-  const fieldId = `field-${name}`;
-  const errorId = `${fieldId}-error`;
+function getMetadataMode(values = {}) {
+  if (values.idpMetadataMode === "xml" || values.idpMetadataMode === "url") {
+    return values.idpMetadataMode;
+  }
+  if (values.idpMetadataUrl) {
+    return "url";
+  }
+  if (values.idpMetadataXml) {
+    return "xml";
+  }
+  return "url";
+}
+
+function renderIdpMetadataField({ values = {}, errors = {} }) {
+  const mode = getMetadataMode(values);
+  const urlSelected = mode === "url";
+  const xmlSelected = mode === "xml";
+
   return `
-    <div class="sp-form__field">
-      <label class="sp-form__label" for="${escapeHtml(fieldId)}">${escapeHtml(label)}${required ? "" : ` <span class="muted">(optionnel)</span>`}</label>
-      <textarea
-        id="${escapeHtml(fieldId)}"
-        name="${escapeHtml(name)}"
-        rows="${rows}"
-        placeholder="${escapeHtml(placeholder)}"
-        ${required ? "required" : ""}
-        ${error ? `aria-invalid="true" aria-describedby="${escapeHtml(errorId)}"` : ""}
-        style="font-family:monospace;font-size:.875rem;resize:vertical"
-      >${escapeHtml(value)}</textarea>
-      ${hint ? `<p class="muted" style="font-size:.85em;margin:.2rem 0 0">${escapeHtml(hint)}</p>` : ""}
-      ${error ? `<p id="${escapeHtml(errorId)}" class="field-error">${escapeHtml(error)}</p>` : ""}
-    </div>
+    <fieldset class="sp-form__field metadata-field" data-metadata-mode>
+      <legend class="sp-form__label">IdP Metadata <span class="muted">(optionnel)</span></legend>
+      <div class="segmented-control" role="radiogroup" aria-label="IdP Metadata mode">
+        <input class="segmented-control__input" type="radio" id="idp-metadata-mode-url" name="idpMetadataMode" value="url"${urlSelected ? " checked" : ""} data-metadata-mode-option>
+        <label class="segmented-control__option" for="idp-metadata-mode-url">URL</label>
+        <input class="segmented-control__input" type="radio" id="idp-metadata-mode-xml" name="idpMetadataMode" value="xml"${xmlSelected ? " checked" : ""} data-metadata-mode-option>
+        <label class="segmented-control__option" for="idp-metadata-mode-xml">XML</label>
+      </div>
+      <div class="metadata-field__panel" data-metadata-panel="url"${urlSelected ? "" : " hidden"}>
+        <input
+          id="field-idpMetadataUrl"
+          name="idpMetadataUrl"
+          type="url"
+          value="${escapeHtml(values.idpMetadataUrl || "")}"
+          placeholder="https://idp.example.com/metadata"
+          ${errors.idpMetadataUrl ? `aria-invalid="true" aria-describedby="field-idpMetadataUrl-error"` : ""}
+          data-metadata-value
+        />
+        ${errors.idpMetadataUrl ? `<p id="field-idpMetadataUrl-error" class="field-error">${escapeHtml(errors.idpMetadataUrl)}</p>` : ""}
+      </div>
+      <div class="metadata-field__panel" data-metadata-panel="xml"${xmlSelected ? "" : " hidden"}>
+        <textarea
+          id="field-idpMetadataXml"
+          name="idpMetadataXml"
+          rows="6"
+          placeholder="${escapeHtml("<?xml version=\"1.0\"?>\n<EntityDescriptor ...>")}"
+          ${errors.idpMetadataXml ? `aria-invalid="true" aria-describedby="field-idpMetadataXml-error"` : ""}
+          data-metadata-value
+        >${escapeHtml(values.idpMetadataXml || "")}</textarea>
+        ${errors.idpMetadataXml ? `<p id="field-idpMetadataXml-error" class="field-error">${escapeHtml(errors.idpMetadataXml)}</p>` : ""}
+      </div>
+    </fieldset>
   `;
 }
 
@@ -113,21 +146,7 @@ export function renderSamlServiceProviderEditPage({ serviceProvider, flash, form
             error: errors.spEntityId,
             required: true,
           })}
-          ${renderField({
-            label: "IdP Metadata URL",
-            name: "idpMetadataUrl",
-            value: values.idpMetadataUrl,
-            error: errors.idpMetadataUrl,
-            placeholder: "https://idp.example.com/metadata",
-          })}
-          ${renderTextareaField({
-            label: "IdP Metadata XML",
-            name: "idpMetadataXml",
-            value: values.idpMetadataXml,
-            error: errors.idpMetadataXml,
-            placeholder: "<?xml version=\"1.0\"?>\n<EntityDescriptor ...>",
-            rows: 6,
-          })}
+          ${renderIdpMetadataField({ values, errors })}
 
           <div class="sp-form__actions">
             ${renderIconBtn({ icon: "save", label: "Save changes", type: "submit", variant: "success" })}

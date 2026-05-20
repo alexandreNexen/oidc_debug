@@ -466,6 +466,26 @@ function sanitizeUserInfoRequestRaw(request = null) {
   };
 }
 
+function userInfoClaimStatus(value) {
+  if (value === undefined || value === null || value === "") return "missing";
+  return "received / redacted";
+}
+
+function userInfoClaimsPresence(claims = {}) {
+  return Object.fromEntries(
+    Object.keys(claims || {}).map((claimName) => [claimName, userInfoClaimStatus(claims[claimName])])
+  );
+}
+
+function buildUserInfoClaimDiagnostics(claims = {}) {
+  const receivedClaims = Object.keys(claims || {});
+
+  return {
+    received_claims: receivedClaims,
+    claim_count: receivedClaims.length
+  };
+}
+
 function sanitizeUserInfoClaims(claims = {}) {
   const sanitized = sanitizeDiagnosticData(claims || {});
   if (!sanitized || typeof sanitized !== "object" || Array.isArray(sanitized)) {
@@ -473,12 +493,10 @@ function sanitizeUserInfoClaims(claims = {}) {
   }
 
   const { claims: _nestedClaims, ...withoutNestedClaims } = sanitized;
-  const redactedClaims = { ...withoutNestedClaims };
+  const redactedClaims = userInfoClaimsPresence(withoutNestedClaims);
 
-  for (const key of ["email", "name"]) {
-    if (redactedClaims[key] !== undefined && redactedClaims[key] !== null && redactedClaims[key] !== "" && redactedClaims[key] !== "missing") {
-      redactedClaims[key] = "received / redacted";
-    }
+  if (withoutNestedClaims.sub !== undefined && withoutNestedClaims.sub !== null && withoutNestedClaims.sub !== "") {
+    redactedClaims.sub = withoutNestedClaims.sub;
   }
 
   return redactedClaims;
@@ -504,8 +522,29 @@ function sanitizeUserInfoResponseRaw(response = null) {
     return null;
   }
 
+  if (response.body?.claims && typeof response.body.claims === "object") {
+    const claims = sanitizeUserInfoClaims(response.body.claims);
+    const diagnostics = response.diagnostics || buildUserInfoClaimDiagnostics(claims);
+
+    return {
+      status: response.status ?? 0,
+      ok: Boolean(response.ok),
+      headers: usefulSanitizedHeaders(response.headers || {}),
+      body: {
+        sub: response.body.sub || claims.sub || "missing",
+        claims
+      },
+      diagnostics: {
+        received_claims: Array.isArray(diagnostics.received_claims) ? diagnostics.received_claims : Object.keys(claims),
+        claim_count: Number.isFinite(Number(diagnostics.claim_count)) ? Number(diagnostics.claim_count) : Object.keys(claims).length
+      },
+      error: response.error ? sanitizeDiagnosticError(response.error) : null
+    };
+  }
+
   const parsed = response.parsed || parseSnapshotBody(response.body || "", response.headers?.["content-type"] || "") || {};
   const claims = extractUserInfoClaims(parsed);
+  const diagnostics = buildUserInfoClaimDiagnostics(claims);
 
   return {
     status: response.status ?? 0,
@@ -513,10 +552,9 @@ function sanitizeUserInfoResponseRaw(response = null) {
     headers: usefulSanitizedHeaders(response.headers || {}),
     body: {
       sub: claims.sub || "missing",
-      email: claimSummaryStatus(claims.email),
-      name: claimSummaryStatus(claims.name),
       claims
     },
+    diagnostics,
     error: response.error ? sanitizeDiagnosticError(response.error) : null
   };
 }
@@ -541,15 +579,16 @@ function buildUserInfoResponseSummary(rawResponseData = null, fallback = {}) {
   const body = rawResponseData?.body || {};
   const claims = body.claims && typeof body.claims === "object" ? body.claims : {};
   const claimCount = Object.keys(claims).length;
+  const diagnostics = rawResponseData?.diagnostics || {};
 
   return {
     ...fallback,
     called: fallback.called || "yes",
     http_status: rawResponseData?.status ?? fallback.http_status ?? 0,
     subject: body.sub && body.sub !== "missing" ? body.sub : fallback.subject || "",
-    email: claimSummaryStatus(body.email ?? fallback.email ?? fallback.email_present),
-    name: claimSummaryStatus(body.name ?? fallback.name ?? fallback.name_present),
     raw_claims_available: claimCount > 0 || fallback.raw_claims_available === "yes" ? "yes" : "no",
+    received_claims: diagnostics.received_claims || fallback.received_claims || Object.keys(claims),
+    claim_count: diagnostics.claim_count ?? fallback.claim_count ?? claimCount,
     error: rawResponseData?.error || fallback.error || "none",
     error_description: fallback.error_description || ""
   };
@@ -576,13 +615,44 @@ function sanitizeJwtPayload(payload = {}) {
   };
 }
 
+function evaluateJwtIssuer(issuer = "", expectedIssuer = "") {
+  if (!issuer) return "missing";
+  if (!expectedIssuer) return "not_checked";
+  return issuer === expectedIssuer ? "valid" : "invalid";
+}
+
+function evaluateJwtAudience(audience = "", expectedAudience = "") {
+  const audienceValues = Array.isArray(audience) ? audience : [audience].filter(Boolean);
+  if (audienceValues.length === 0) return "missing";
+  if (!expectedAudience) return "not_checked";
+  return audienceValues.includes(expectedAudience) ? "valid" : "invalid";
+}
+
 function evaluateJwtExpiration(exp) {
-  const epochSeconds = Number(exp);
-  if (!Number.isFinite(epochSeconds)) {
-    return "not_checked";
+  if (exp === null || exp === undefined || exp === "") {
+    return "missing";
   }
 
-  return epochSeconds * 1000 > Date.now() ? "valid" : "invalid";
+  const epochSeconds = Number(exp);
+  if (!Number.isFinite(epochSeconds)) {
+    return "invalid";
+  }
+
+  return epochSeconds * 1000 > Date.now() ? "valid" : "expired";
+}
+
+function oidcChecksResult(checks = {}) {
+  const values = Object.values(checks).filter(Boolean);
+  if (values.length === 0) {
+    return "not_checked";
+  }
+  if (values.some((value) => ["invalid", "expired"].includes(value))) {
+    return "failed";
+  }
+  if (values.some((value) => value === "missing")) {
+    return "failed";
+  }
+  return "passed";
 }
 
 function buildIdTokenAnalysisRaw(idToken = "", flow = null) {
@@ -593,16 +663,18 @@ function buildIdTokenAnalysisRaw(idToken = "", flow = null) {
   const expectedNonceHash = flow?.runtime?.nonceSha256 || "";
 
   if (!idToken) {
+    const validation = {
+      issuer: "not_checked",
+      audience: "not_checked",
+      expiration: "not_checked",
+      nonce: "missing"
+    };
     return {
       source: "token_response.id_token",
       jwt: null,
       validation: {
-        issuer: "not_checked",
-        audience: "not_checked",
-        expiration: "not_checked",
-        nonce: "missing",
-        signature: "not_implemented",
-        overall: "incomplete"
+        ...validation,
+        overall: oidcChecksResult(validation)
       },
       decoded: "no",
       claims_readable: "no"
@@ -610,6 +682,12 @@ function buildIdTokenAnalysisRaw(idToken = "", flow = null) {
   }
 
   if (!decoded.isJwt) {
+    const validation = {
+      issuer: "not_checked",
+      audience: "not_checked",
+      expiration: "not_checked",
+      nonce: "not_checked"
+    };
     return {
       source: "token_response.id_token",
       jwt: {
@@ -617,12 +695,8 @@ function buildIdTokenAnalysisRaw(idToken = "", flow = null) {
         payload: {}
       },
       validation: {
-        issuer: "not_checked",
-        audience: "not_checked",
-        expiration: "not_checked",
-        nonce: "not_checked",
-        signature: "not_implemented",
-        overall: "incomplete"
+        ...validation,
+        overall: oidcChecksResult(validation)
       },
       decoded: "no",
       claims_readable: "no",
@@ -633,6 +707,16 @@ function buildIdTokenAnalysisRaw(idToken = "", flow = null) {
   const payload = decoded.payload || {};
   const audienceValues = Array.isArray(payload.aud) ? payload.aud : [payload.aud].filter(Boolean);
   const nonceClaim = payload.nonce || "";
+  const validation = {
+    issuer: evaluateJwtIssuer(payload.iss || "", expectedIssuer),
+    audience: evaluateJwtAudience(audienceValues, expectedAudience),
+    expiration: evaluateJwtExpiration(payload.exp),
+    nonce: expectedNonce
+      ? (nonceClaim ? (nonceClaim === expectedNonce ? "valid" : "invalid") : "missing")
+      : expectedNonceHash
+        ? (nonceClaim ? (lifecycleHashMatches(nonceClaim, expectedNonceHash) ? "valid" : "invalid") : "missing")
+        : "not_checked"
+  };
 
   return {
     source: "token_response.id_token",
@@ -645,16 +729,8 @@ function buildIdTokenAnalysisRaw(idToken = "", flow = null) {
       payload: sanitizeJwtPayload(payload)
     },
     validation: {
-      issuer: expectedIssuer ? (payload.iss === expectedIssuer ? "valid" : "invalid") : "not_checked",
-      audience: expectedAudience ? (audienceValues.includes(expectedAudience) ? "valid" : "invalid") : "not_checked",
-      expiration: evaluateJwtExpiration(payload.exp),
-      nonce: expectedNonce
-        ? (nonceClaim ? (nonceClaim === expectedNonce ? "valid" : "invalid") : "missing")
-        : expectedNonceHash
-          ? (nonceClaim ? (lifecycleHashMatches(nonceClaim, expectedNonceHash) ? "valid" : "invalid") : "missing")
-          : "not_checked",
-      signature: "not_implemented",
-      overall: "incomplete"
+      ...validation,
+      overall: oidcChecksResult(validation)
     },
     decoded: "yes",
     claims_readable: "yes"
@@ -2155,37 +2231,60 @@ function epochToIso(value) {
   return new Date(numberValue * 1000).toISOString();
 }
 
-function buildIdTokenDiagnostics(idToken = "", expectedNonce = "", expectedNonceHash = "") {
+function buildIdTokenDiagnostics(idToken = "", {
+  expectedIssuer = "",
+  expectedAudience = "",
+  expectedNonce = "",
+  expectedNonceHash = ""
+} = {}) {
   const decoded = decodeJwt(idToken || "");
   if (!idToken) {
+    const validation = {
+      issuer_validation: "not_checked",
+      audience_validation: "not_checked",
+      expiration_validation: "missing",
+      nonce_validation: "missing"
+    };
     return {
       id_token_received: "no",
       decoded: "no",
       claims_readable: "no",
-      signature_validation: "not implemented",
-      overall_validation: "incomplete"
+      ...validation,
+      overall_validation: oidcChecksResult(validation)
     };
   }
 
   if (!decoded.isJwt) {
+    const validation = {
+      issuer_validation: "not_checked",
+      audience_validation: "not_checked",
+      expiration_validation: "invalid",
+      nonce_validation: "missing"
+    };
     return {
       id_token_received: "yes",
       format: "not JWT",
       decode_error: decoded.error || "JWT could not be decoded.",
       decoded: "no",
       claims_readable: "no",
-      nonce_validation: "not checked",
-      signature_validation: "not implemented",
-      overall_validation: "incomplete"
+      ...validation,
+      overall_validation: oidcChecksResult(validation)
     };
   }
 
   const nonceClaim = decoded.payload?.nonce || "";
+  const audienceClaim = decoded.payload?.aud;
   const nonceValidation = nonceClaim && expectedNonce
     ? (nonceClaim === expectedNonce ? "valid" : "invalid")
     : nonceClaim && expectedNonceHash
       ? (lifecycleHashMatches(nonceClaim, expectedNonceHash) ? "valid" : "invalid")
-      : nonceClaim ? "not checked" : "missing";
+      : "missing";
+  const validation = {
+    issuer_validation: evaluateJwtIssuer(decoded.payload?.iss || "", expectedIssuer),
+    audience_validation: evaluateJwtAudience(audienceClaim, expectedAudience),
+    expiration_validation: evaluateJwtExpiration(decoded.payload?.exp),
+    nonce_validation: nonceValidation
+  };
 
   return {
     id_token_received: "yes",
@@ -2198,10 +2297,12 @@ function buildIdTokenDiagnostics(idToken = "", expectedNonce = "", expectedNonce
     subject: decoded.payload?.sub || "",
     expiration: epochToIso(decoded.payload?.exp),
     issued_at: epochToIso(decoded.payload?.iat),
+    issuer_validation: validation.issuer_validation,
+    audience_validation: validation.audience_validation,
+    expiration_validation: validation.expiration_validation,
     nonce_claim_present: yesNo(nonceClaim),
-    nonce_validation: nonceValidation,
-    signature_validation: "not implemented",
-    overall_validation: "incomplete"
+    nonce_validation: validation.nonce_validation,
+    overall_validation: oidcChecksResult(validation)
   };
 }
 
@@ -2894,7 +2995,12 @@ function buildTokenStep({ requestSnapshot, responseSnapshot, flow = null }) {
       error_description: parsed.error_description || "",
       id_token_claims: idTokenClaims.isJwt ? selectedClaims(idTokenClaims.payload) : {},
       access_token_claims: accessTokenClaims.isJwt ? selectedClaims(accessTokenClaims.payload) : {},
-      id_token_diagnostics: buildIdTokenDiagnostics(parsed.id_token || "", flow?.runtime?.expectedNonce || "", flow?.runtime?.nonceSha256 || "")
+      id_token_diagnostics: buildIdTokenDiagnostics(parsed.id_token || "", {
+        expectedIssuer: flow?.runtime?.provider?.issuer || "",
+        expectedAudience: flow?.runtime?.clientId || "",
+        expectedNonce: flow?.runtime?.expectedNonce || "",
+        expectedNonceHash: flow?.runtime?.nonceSha256 || ""
+      })
     },
     rawRequestData: sanitizeTokenRequestRaw(requestSnapshot),
     rawResponseData,
@@ -2928,7 +3034,9 @@ function buildUserInfoStep({ requestSnapshot = null, responseSnapshot = null, sk
       },
       responseData: {
         called: "no",
-        skipped_reason: skippedReason
+        skipped_reason: skippedReason,
+        received_claims: [],
+        claim_count: 0
       },
       rawRequestData: sanitizeUserInfoRequestRaw(requestSnapshot),
       rawResponseData: null,
@@ -3058,7 +3166,7 @@ async function startNewUiFlow(session, serviceProviderId) {
       environment: environment.key,
       environmentLabel: environmentLabel(environment.key),
       clientId: runConfig.selected.clientId,
-      scopes: runConfig.selected.scopes,
+      scopes: runConfig.config.scopes,
       provider: {
         providerName: runConfig.provider.providerName,
         issuer: runConfig.provider.issuer,

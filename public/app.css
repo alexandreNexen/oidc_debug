@@ -182,6 +182,10 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+body.raw-modal-open {
+  overflow: hidden;
+}
+
 a {
   color: var(--app-link);
   text-decoration: none;
@@ -1312,7 +1316,8 @@ a.text-action:focus-visible {
 }
 
 .sp-form input,
-.sp-form select {
+.sp-form select,
+.sp-form textarea {
   height: 34px;
   padding: 0 10px;
   border: 1px solid var(--app-border-strong);
@@ -1323,20 +1328,32 @@ a.text-action:focus-visible {
   font-size: 13px;
 }
 
+.sp-form textarea {
+  min-height: 148px;
+  height: auto;
+  padding: 8px 10px;
+  resize: vertical;
+  font-family: var(--font-mono);
+  line-height: 1.45;
+}
+
 .sp-form input:focus,
-.sp-form select:focus {
+.sp-form select:focus,
+.sp-form textarea:focus {
   border-color: var(--app-focus-ring);
   box-shadow: 0 0 0 3px var(--color-black-alpha-10);
 }
 
 .sp-form input:focus-visible,
-.sp-form select:focus-visible {
+.sp-form select:focus-visible,
+.sp-form textarea:focus-visible {
   outline: 2px solid var(--app-focus-ring);
   outline-offset: 2px;
 }
 
 .sp-form input[aria-invalid="true"],
-.sp-form select[aria-invalid="true"] {
+.sp-form select[aria-invalid="true"],
+.sp-form textarea[aria-invalid="true"] {
   border-color: var(--app-error-strong);
 }
 
@@ -1380,6 +1397,65 @@ a.text-action:focus-visible {
   background: var(--app-error-bg);
   color: var(--app-error-text);
   border-color: var(--app-error-border);
+}
+
+.metadata-field {
+  padding: 0;
+  margin: 0;
+  border: 0;
+}
+
+.segmented-control {
+  display: inline-flex;
+  width: fit-content;
+  padding: 2px;
+  border: 1px solid var(--app-border-strong);
+  border-radius: var(--button-radius);
+  background: var(--app-surface);
+}
+
+.segmented-control__input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.segmented-control__option {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 48px;
+  min-height: 28px;
+  padding: 0 10px;
+  border-radius: calc(var(--button-radius) - 1px);
+  color: var(--app-text-secondary);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.segmented-control__option:hover {
+  color: var(--button-secondary-hover-text);
+}
+
+.segmented-control__input:checked + .segmented-control__option {
+  background: var(--button-primary-bg);
+  color: var(--button-primary-text);
+}
+
+.segmented-control__input:focus-visible + .segmented-control__option {
+  outline: 2px solid var(--button-focus-outline);
+  outline-offset: 2px;
+}
+
+.metadata-field__panel {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.metadata-field__panel[hidden] {
+  display: none;
 }
 
 /* ===== Helpers ===== */
@@ -1691,15 +1767,17 @@ input[type="password"] {
 }
 
 .table__actions {
-  display: flex;
-  align-items: center;
-  justify-content: flex-end;
-  gap: 4px;
+  text-align: right;
   white-space: nowrap;
 }
 
 .table__actions form {
-  display: contents;
+  display: inline;
+}
+
+.table__actions .btn-icon {
+  vertical-align: middle;
+  margin-left: 4px;
 }
 
 /* ===== Section tab navigation (flow details) ===== */

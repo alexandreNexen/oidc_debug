@@ -26,7 +26,7 @@ function encodeRawData(value) {
 
 // ---- Status badge helpers ----
 
-const BADGE_SUCCESS = new Set(["yes", "received", "present", "sent", "valid", "success", "match", "ok", "decoded: success", "complete", "available"]);
+const BADGE_SUCCESS = new Set(["yes", "received", "present", "sent", "valid", "success", "match", "ok", "decoded: success", "complete", "available", "generated", "used"]);
 const BADGE_ERROR = new Set(["no", "missing", "failed", "mismatch", "error", "failure", "invalid"]);
 const BADGE_NEUTRAL = new Set([
   "not implemented", "not checked", "not extracted", "skipped", "none",
@@ -75,6 +75,11 @@ function plain(v) {
   return `<span>${escapeHtml(String(v))}</span>`;
 }
 
+function muted(v) {
+  if (v === null || v === undefined || v === "") return "";
+  return `<p class="muted" style="margin:6px 0 0">${escapeHtml(String(v))}</p>`;
+}
+
 function code(v) {
   if (!v) return `<span class="muted">—</span>`;
   return `<code class="code-inline">${escapeHtml(String(v))}</code>`;
@@ -95,6 +100,89 @@ function dl(rows) {
 
 function row(label, html) {
   return `<div class="flow-data-list__row"><dt>${escapeHtml(label)}</dt><dd>${html}</dd></div>`;
+}
+
+function diagnosticStatus(value, { missingAs = "missing" } = {}) {
+  const low = String(value || "").toLowerCase().trim();
+  if (!low || low === "(not found)" || low === "(not extracted)") return missingAs;
+  if (["valid", "match", "success", "ok", "complete"].includes(low)) return "valid";
+  if (["missing", "not found"].includes(low)) return missingAs;
+  return "invalid";
+}
+
+function diagnosticReason(value, fallback = "") {
+  const low = String(value || "").toLowerCase().trim();
+  if (!low || ["valid", "match", "success", "ok", "complete"].includes(low)) return "";
+  return fallback || String(value);
+}
+
+function statusWithDetail(status, detail) {
+  return `${badge(status)}${detail ? muted(detail) : ""}`;
+}
+
+function shortNameIdFormat(value) {
+  if (!value || value === "(not present)") return value || "(not present)";
+  const str = String(value);
+  const marker = "nameid-format:";
+  const idx = str.toLowerCase().lastIndexOf(marker);
+  if (idx !== -1) return str.slice(idx + marker.length);
+  return str.split(":").pop() || str;
+}
+
+function attributesSummary(count, names) {
+  const total = Number(count || 0);
+  if (!total) return badge("none");
+  const nameList = Array.isArray(names) && names.length > 0 ? `: ${names.join(", ")}` : "";
+  return plain(`${total}${nameList}`);
+}
+
+function requestSignatureStatus(authnRequestData = {}) {
+  const explicit = authnRequestData.request_signature || authnRequestData.signature;
+  if (explicit) return explicit;
+  if (authnRequestData.binding_used_for_request === "not implemented") return "not implemented";
+  return "not implemented";
+}
+
+function diagnosticsValue(resp = {}, key) {
+  return resp.diagnostic_comparisons?.[key] || "";
+}
+
+function signatureSummary(resp = {}) {
+  const result = resp.signature_verification_result || "unavailable";
+  if (result === "valid") return "valid";
+  if (result === "invalid") return "invalid";
+  if (resp.response_signature_present === "present" || resp.assertion_signature_present === "present") return "unavailable";
+  return "unavailable";
+}
+
+function trustedCertificateSummary(resp = {}) {
+  if (Number(resp.idp_certificates_used || 0) > 0) return "used";
+  if (resp.trust_validation === "failed") return "missing";
+  return "unavailable";
+}
+
+function trustMessage(resp = {}) {
+  const trust = resp.trust_validation || "incomplete";
+  const errors = Array.isArray(resp.trust_validation_errors) ? resp.trust_validation_errors.filter(Boolean) : [];
+  const warnings = Array.isArray(resp.trust_validation_warnings) ? resp.trust_validation_warnings.filter(Boolean) : [];
+
+  if (trust === "complete") {
+    return "Signature verification uses the trusted IdP metadata certificate.";
+  }
+  if (trust === "failed") {
+    return `Trust validation failed: ${errors.join(" ") || "One or more validation checks failed."}`;
+  }
+  return `Trust validation incomplete: ${warnings.join(" ") || errors.join(" ") || resp.verification_note || "The SAML response was not fully verified against trusted IdP metadata."}`;
+}
+
+function securityChecksSummary(resp = {}, diagnostics = {}) {
+  const checks = [
+    resp.issuer_validation || diagnostics.issuer_validation,
+    resp.temporal_validation || diagnostics.temporal_conditions,
+    resp.xsw_protection || diagnostics.xsw_protection,
+    resp.replay_validation
+  ];
+  return checks.every((check) => diagnosticStatus(check, { missingAs: "invalid" }) === "valid") ? "valid" : "invalid";
 }
 
 function rawBtn(title, stepName, type, rawData) {
@@ -237,38 +325,49 @@ function renderAuthenticationExchange(steps) {
   const responseReceived = Boolean(samlResp && samlResp.status !== "pending");
 
   const binding = rRd.binding || aRd.binding_used_for_request || "";
-  const samlRequestPresent = rRd.saml_request || (aRd.saml_request_encoded_size_bytes ? "present" : "");
+  const relayState = aRd.relay_state || rRd.relay_state || "missing";
+  const requestCorrelation = decoded
+    ? diagnosticStatus(diagnosticsValue(dResp, "in_response_to_vs_request_id"))
+    : "missing";
+  const destinationStatus = decoded
+    ? diagnosticStatus(diagnosticsValue(dResp, "destination_vs_acs_url"))
+    : "missing";
+  const correlationDetail = requestCorrelation === "invalid"
+    ? `Expected Request ID: ${aRd.request_id || "(not available)"}; received InResponseTo: ${dRd.in_response_to || "(not found)"}`
+    : "";
+  const destinationDetail = destinationStatus === "invalid"
+    ? `Expected ACS URL: ${aRd.acs_url || "(not available)"}; received Destination: ${dRd.destination || "(not found)"}`
+    : "";
+  const samlStatus = dResp.saml_status || (decoded?.status === "error" ? "Failure" : "");
+  const samlStatusDetail = samlStatus && samlStatus !== "Success"
+    ? [
+        dRd.status_code ? `Status code: ${dRd.status_code}` : "",
+        dRd.status_message && dRd.status_message !== "(not extracted)" ? `Status message: ${dRd.status_message}` : "",
+        dRd.status_detail && dRd.status_detail !== "missing" ? `Status detail: ${dRd.status_detail}` : ""
+      ].filter(Boolean).join("; ")
+    : "";
 
   const requestContent = notStarted
     ? `<p class="muted">Not started.</p>`
     : dl([
-        row("AuthnRequest generated", badge(authn.status === "success" ? "yes" : "no")),
+        row("AuthnRequest", badge(authn.status === "success" ? "generated" : "missing")),
+        binding ? row("Binding", plain(binding)) : null,
         row("SP Entity ID", plain(aRd.sp_entity_id)),
         row("ACS URL", plain(aRd.acs_url)),
         row("IdP SSO URL", plain(aRd.destination)),
-        row("Request ID", plain(aRd.request_id)),
-        row("Issue instant", plain(aRd.issue_instant)),
-        row("NameID format", plain(aRd.name_id_format || "(unspecified)")),
-        binding ? row("Binding", plain(binding)) : null,
-        row("SAMLRequest", badge(samlRequestPresent || "present")),
-        row("RelayState", badge(aRd.relay_state)),
-        row("Request signature", badge("not implemented"))
+        row("RelayState", badge(relayState === "present" ? "present" : "missing")),
+        row("Request signature", badge(requestSignatureStatus(aRd)))
       ]);
 
   const responseContent = !responseReceived
     ? `<p class="muted">${notStarted ? "Not started." : "Waiting for SAMLResponse…"}</p>`
     : dl([
-        row("SAMLResponse received", badge(sRd.saml_response || acRd.saml_response)),
-        row("RelayState received", badge(acRd.relay_state)),
-        row("Response decoded", badge(sRResp.decoded)),
-        decoded ? row("Issuer (IdP)", plain(dRd.response_issuer)) : null,
-        decoded ? row("InResponseTo", plain(dRd.in_response_to)) : null,
-        decoded ? row("Destination", plain(dRd.destination)) : null,
-        decoded ? row("SAML Status (protocol)", badge(dResp.saml_status)) : null,
-        decoded ? row("Status code", plain(dRd.status_code)) : null,
-        decoded && dRd.status_message && dRd.status_message !== "(not extracted)"
-          ? row("Status message", plain(dRd.status_message)) : null,
-        decoded ? row("Status detail", badge(dRd.status_detail)) : null
+        row("SAMLResponse", badge(sRd.saml_response || acRd.saml_response || "missing")),
+        row("Decoded", badge(sRResp.decoded === "success" ? "success" : "failed")),
+        decoded ? row("SAML Status", statusWithDetail(samlStatus || "missing", samlStatusDetail)) : null,
+        decoded ? row("Issuer", plain(dRd.response_issuer)) : null,
+        decoded ? row("Request correlation", statusWithDetail(requestCorrelation, correlationDetail)) : null,
+        decoded ? row("Destination", statusWithDetail(destinationStatus, destinationDetail)) : null
       ]);
 
   const respRawData = samlResp?.rawResponseData || decoded?.rawRequestData;
@@ -307,55 +406,55 @@ function renderIdentityAssertion(steps) {
 
   const rawButton = rawBtn("Raw identity summary", "saml_response_decoded", "response", identitySummaryRaw(decoded));
   const userIdentified = resp.name_id_present === "yes" && resp.assertion_present === "yes" ? "yes" : "no";
+  const nameIdStatus = resp.name_id_present === "yes" ? (resp.name_id_preview || "received / redacted") : "missing";
+
+  const requestCorrelationStatus = diagnosticStatus(diagnostics.in_response_to_vs_request_id, { missingAs: "invalid" });
+  const destinationStatus = diagnosticStatus(diagnostics.destination_vs_acs_url, { missingAs: "invalid" });
+  const audienceStatus = diagnosticStatus(diagnostics.audience_vs_sp_entity_id, { missingAs: "invalid" });
+  const issuerStatus = diagnosticStatus(diagnostics.issuer_validation || resp.issuer_validation, { missingAs: "invalid" });
+  const timingStatus = diagnosticStatus(diagnostics.temporal_conditions || resp.temporal_validation, { missingAs: "invalid" });
+  const securityStatus = securityChecksSummary(resp, diagnostics);
 
   const identitySummary = analysisPanel("Identity summary", rawButton, dl([
-    row("Assertion present", badge(resp.assertion_present)),
     row("User identified", badge(userIdentified)),
-    row("NameID present", badge(resp.name_id_present)),
-    row("NameID format", plain(resp.name_id_format)),
-    row("NameID", resp.name_id_present === "yes" ? plain(resp.name_id_preview || "received / redacted") : badge("missing")),
-    row("Attributes received", plain(String(resp.attributes_count ?? 0))),
-    row("Attribute names", pills(resp.attribute_names))
+    row("NameID", resp.name_id_present === "yes" ? plain(nameIdStatus) : badge(nameIdStatus)),
+    row("NameID format", plain(shortNameIdFormat(resp.name_id_format))),
+    row("Attributes", attributesSummary(resp.attributes_count, resp.attribute_names))
   ]));
 
-  const consistencyChecks = analysisPanel("Consistency checks", "", dl([
-    row("InResponseTo vs Request ID", badge(diagnostics.in_response_to_vs_request_id)),
-    row("Destination vs ACS URL", badge(diagnostics.destination_vs_acs_url)),
-    row("Audience vs SP Entity ID", badge(diagnostics.audience_vs_sp_entity_id)),
-    row("Temporal conditions", badge(diagnostics.temporal_conditions)),
-    row("Issuer validation", badge(diagnostics.issuer_validation || resp.issuer_validation || "not_checked")),
-    row("XSW protection", badge(diagnostics.xsw_protection || resp.xsw_protection || "incomplete"))
+  const consistencyChecks = analysisPanel("Protocol / security summary", "", dl([
+    row("Request correlation", statusWithDetail(
+      requestCorrelationStatus,
+      diagnosticReason(diagnostics.in_response_to_vs_request_id)
+    )),
+    row("Destination", statusWithDetail(
+      destinationStatus,
+      diagnosticReason(diagnostics.destination_vs_acs_url)
+    )),
+    row("Audience", statusWithDetail(
+      audienceStatus,
+      diagnosticReason(diagnostics.audience_vs_sp_entity_id)
+    )),
+    row("Issuer", statusWithDetail(
+      issuerStatus,
+      diagnosticReason(diagnostics.issuer_validation || resp.issuer_validation)
+    )),
+    row("Timing", statusWithDetail(
+      timingStatus,
+      diagnosticReason(diagnostics.temporal_conditions || resp.temporal_validation)
+    )),
+    row("Security checks", statusWithDetail(
+      securityStatus,
+      securityStatus === "invalid" ? diagnosticReason(diagnostics.xsw_protection || resp.xsw_protection || resp.replay_validation, "One or more security checks did not validate.") : ""
+    ))
   ]));
 
-  const sigNote = resp.verification_note
-    ? `<p class="muted" style="margin:8px 0 0">${escapeHtml(resp.verification_note)}</p>`
-    : "";
-
-  let trustWarning = "";
-  if (resp.saml_status === "Success" && resp.trust_validation !== "complete") {
-    const errors = Array.isArray(resp.trust_validation_errors) && resp.trust_validation_errors.length > 0
-      ? resp.trust_validation_errors.join(" ")
-      : resp.trust_validation === "failed"
-        ? "One or more validation checks failed."
-        : "The SAML response was not fully verified against trusted IdP metadata.";
-    const tone = resp.trust_validation === "failed" ? "error" : "warning";
-    const prefix = resp.trust_validation === "failed" ? "Trust validation failed" : "Trust validation incomplete";
-    trustWarning = `<div class="form-banner form-banner--${escapeHtml(tone)}" style="margin-top:12px">${escapeHtml(prefix)}: ${escapeHtml(errors)}</div>`;
-  }
-
-  const signatureStatus = analysisPanel("Signature status", "", dl([
-    row("Response signature", badge(resp.response_signature_present || "not extracted")),
-    row("Response verification", badge(resp.response_signature_verification || "not_checked")),
-    row("Assertion signature", badge(resp.assertion_signature_present || "not extracted")),
-    row("Assertion verification", badge(resp.assertion_signature_verification || "not_checked")),
-    row("Signature verification result", badge(resp.signature_verification_result || "not_checked")),
-    row("Trust validation", badge(resp.trust_validation || "incomplete")),
-    row("IdP certificates used", plain(String(resp.idp_certificates_used ?? 0))),
-    row("Issuer validation", badge(resp.issuer_validation || "not_checked")),
-    row("Temporal validation", badge(resp.temporal_validation || "not_checked")),
-    row("Replay validation", badge(resp.replay_validation || "not_implemented")),
-    row("XSW protection", badge(resp.xsw_protection || "incomplete"))
-  ]) + sigNote + trustWarning);
+  const trustStatus = analysisPanel("Trust status", "", dl([
+    row("Trust validation", statusWithDetail(resp.trust_validation || "incomplete", trustMessage(resp))),
+    row("Signatures", badge(signatureSummary(resp))),
+    row("Trusted IdP certificate", badge(trustedCertificateSummary(resp))),
+    row("Security checks", badge(securityStatus))
+  ]));
 
   return `
     <section class="flow-section" data-section-panel="identity">
@@ -363,7 +462,7 @@ function renderIdentityAssertion(steps) {
       <div class="analysis-grid">
         ${identitySummary}
         ${consistencyChecks}
-        ${signatureStatus}
+        ${trustStatus}
       </div>
     </section>`;
 }

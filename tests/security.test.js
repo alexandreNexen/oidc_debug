@@ -26,6 +26,7 @@ import {
 
 import { createFlowService } from "../src/protocols/oidc/services/flows.js";
 import { validateServiceProviderInput } from "../src/protocols/oidc/services/serviceProviders.js";
+import { renderFlowDetailsPage } from "../src/protocols/oidc/views/flowDetails.js";
 import { renderFlowResultPage } from "../src/protocols/oidc/views/flowResult.js";
 import { createSamlFlowService } from "../src/protocols/saml/services/flows.js";
 import { renderSamlFlowDetailsPage } from "../src/protocols/saml/views/flowDetails.js";
@@ -181,6 +182,93 @@ describe("OIDC lifecycle status", () => {
 
     assert.match(html, /ID Token analysis/);
     assert.doesNotMatch(html, /ID Token analysis[\s\S]*Pending/);
+  });
+
+  it("renders OIDC ID Token analysis without JWT signature validation wording", () => {
+    const html = renderFlowDetailsPage({
+      flow: {
+        id: "flow_1",
+        status: "success",
+        statusBadge: { label: "Success", tone: "success" },
+        runtime: { scopes: "openid profile email" }
+      },
+      serviceProvider: { name: "Test SP", clientId: "client" },
+      steps: [
+        { stepName: "authorize", status: "success", requestData: { scope: "openid profile email" } },
+        { stepName: "callback", status: "success" },
+        {
+          stepName: "token",
+          status: "success",
+          responseData: {
+            id_token: "received and decoded",
+            id_token_diagnostics: {
+              id_token_received: "yes",
+              issuer_validation: "valid",
+              audience_validation: "valid",
+              expiration_validation: "valid",
+              nonce_validation: "valid",
+              signature_validation: "not implemented",
+              overall_validation: "incomplete"
+            }
+          },
+          rawAnalysisData: {
+            source: "token_response.id_token",
+            jwt: {
+              header: { alg: "RS256", kid: "kid-1" },
+              payload: { iss: "https://idp.example", aud: "client", exp: 1770000000, nonce: "nonce-1" }
+            },
+            validation: {
+              issuer: "valid",
+              audience: "valid",
+              expiration: "valid",
+              nonce: "valid",
+              signature: "not_implemented",
+              overall: "incomplete"
+            },
+            decoded: "yes",
+            claims_readable: "yes"
+          }
+        },
+        {
+          stepName: "userinfo",
+          status: "success",
+          responseData: { raw_claims_available: "yes", received_claims: ["sub", "email"] },
+          rawResponseData: { body: { claims: { sub: "user-1", email: "alice@example.test" } } }
+        }
+      ]
+    });
+
+    assert.match(html, /ID Token Analysis/);
+    assert.match(html, /Issuer[\s\S]*valid/);
+    assert.match(html, /Audience[\s\S]*valid/);
+    assert.match(html, /Expiration[\s\S]*valid/);
+    assert.match(html, /Nonce[\s\S]*valid/);
+    assert.match(html, /Result[\s\S]*passed/);
+    assert.match(html, />Raw<\/button>/);
+    assert.match(html, /Scopes &amp; Claims/);
+    assert.match(html, /Claims reçus dans .*ID Token/);
+    assert.match(html, /Claims reçus dans UserInfo/);
+    assert.doesNotMatch(html, /Decoded, not signature-verified/i);
+    assert.doesNotMatch(html, /Token incomplete/i);
+    assert.doesNotMatch(html, /Signature not evaluated/i);
+    assert.doesNotMatch(html, /Signature not implemented/i);
+    assert.doesNotMatch(html, /not_implemented/i);
+    assert.doesNotMatch(html, /overall_validation/i);
+    assert.doesNotMatch(html, /eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+|client_secret|set-cookie/i);
+
+    const rawJson = html.match(/data-raw-title="Raw ID Token Analysis"[\s\S]*?data-raw-json="([^"]+)"/)?.[1];
+    assert.ok(rawJson, "ID Token Analysis Raw button should be present");
+    const raw = JSON.parse(Buffer.from(rawJson, "base64").toString("utf8"));
+    assert.deepEqual(raw.validation, {
+      issuer: "valid",
+      audience: "valid",
+      expiration: "valid",
+      nonce: "valid",
+      overall: "passed"
+    });
+    assert.equal(raw.jwt.payload.iss, "https://idp.example");
+    assert.equal(raw.jwt.payload.aud, "client");
+    assert.equal(raw.validation.signature, undefined);
   });
 });
 

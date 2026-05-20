@@ -73,6 +73,7 @@ function setupRawModal() {
 
   const close = () => {
     modal.hidden = true;
+    document.body.classList.remove("raw-modal-open");
     currentRawText = "";
   };
 
@@ -113,6 +114,7 @@ function setupRawModal() {
       }
 
       modal.hidden = false;
+      document.body.classList.add("raw-modal-open");
     });
   });
 
@@ -121,6 +123,34 @@ function setupRawModal() {
       copyToClipboard(currentRawText, copyButton);
     });
   }
+}
+
+function setupMetadataModeFields() {
+  document.querySelectorAll("[data-metadata-mode]").forEach((field) => {
+    const options = Array.from(field.querySelectorAll("[data-metadata-mode-option]"));
+    const panels = Array.from(field.querySelectorAll("[data-metadata-panel]"));
+
+    if (!options.length || !panels.length) {
+      return;
+    }
+
+    const sync = () => {
+      const selected = options.find((option) => option.checked)?.value || "url";
+      panels.forEach((panel) => {
+        const isActive = panel.dataset.metadataPanel === selected;
+        panel.hidden = !isActive;
+        panel.querySelectorAll("[data-metadata-value]").forEach((input) => {
+          input.disabled = !isActive;
+        });
+      });
+    };
+
+    options.forEach((option) => {
+      option.addEventListener("change", sync);
+    });
+
+    sync();
+  });
 }
 
 function safeEscapeHtml(value) {
@@ -261,6 +291,7 @@ window.addEventListener("DOMContentLoaded", () => {
   setupCopyButtons();
   setupConfirmForms();
   setupRawModal();
+  setupMetadataModeFields();
   setupDiscoveryForms();
   setupSectionTabs();
 });
