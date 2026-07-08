@@ -2,11 +2,10 @@
  * Security tests for the OIDC debug application.
  *
  * Verifies that:
- *   - client_secret is never returned via API responses
- *   - tokens are redacted in diagnostic data
- *   - analyzeTokens never exposes raw token values
+ *   - client_secret is never returned via API responses or server logs
+ *   - sanitizeDiagnosticData redacts sensitive keys on the log path (redactObject/appLog)
  *   - input validation enforces length limits
- *   - sanitizeDiagnosticData redacts all sensitive keys
+ *   - OIDC display path shows real values (tokens, claims, scopes, payloads)
  */
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
@@ -343,8 +342,8 @@ describe("OIDC Access Token Analysis", () => {
         exp: now + 3600,
         iat: now,
         scope: "openid profile",
-        sub: "received / redacted",
-        email: "received / redacted"
+        sub: "user-42",
+        email: "alice@example.test"
       },
       access_token_decode_error: "",
       access_token_fingerprint: "abc123def456"
@@ -360,16 +359,20 @@ describe("OIDC Access Token Analysis", () => {
     assert.match(panel, /Nonce[\s\S]*>not applicable</);
     assert.match(panel, /Result[\s\S]*>passed</);
     assert.match(panel, /Access Token Claims/);
+    assert.match(panel, /user-42/);
+    assert.match(panel, /alice@example\.test/);
+    assert.doesNotMatch(panel, /received \/ redacted/);
   });
 
-  it("handles opaque access tokens with informational result and explanatory empty state", () => {
+  it("handles opaque access tokens with informational result, explanatory hint and raw value shown", () => {
     const html = renderWithTokenStep({
       access_token_present: true,
       access_token_format: "opaque",
       access_token_header: null,
       access_token_claims: null,
       access_token_decode_error: "",
-      access_token_fingerprint: "fingerprint-opaque"
+      access_token_fingerprint: "fingerprint-opaque",
+      access_token_value: "opaque-token-abc-123"
     });
 
     const panel = extractAccessTokenPanel(html);
@@ -380,7 +383,8 @@ describe("OIDC Access Token Analysis", () => {
     assert.match(panel, /Expiration[\s\S]*>not available</);
     assert.match(panel, /Nonce[\s\S]*>not applicable</);
     assert.match(panel, /Result[\s\S]*>informational</);
-    assert.match(panel, /Access token received, but it is opaque and cannot be decoded client-side\./);
+    assert.match(panel, /Access token received, but it is opaque and cannot be decoded as a JWT client-side\./);
+    assert.match(panel, /opaque-token-abc-123/);
   });
 
   it("handles absent access tokens with not available everywhere", () => {
@@ -428,12 +432,7 @@ describe("OIDC Access Token Analysis", () => {
     assert.doesNotMatch(panel, />Format</);
   });
 
-  it("never leaks the raw access token and keeps sensitive claims redacted", () => {
-    const rawAccessToken = makeJwt(
-      { alg: "RS256", kid: "kid-leak" },
-      { iss: "https://idp.example", sub: "secret-user-id", email: "alice@example.test", scope: "openid" }
-    );
-
+  it("renders the raw JWT access token claims exactly as decoded", () => {
     const html = renderWithTokenStep({
       access_token_present: true,
       access_token_format: "jwt",
@@ -441,20 +440,17 @@ describe("OIDC Access Token Analysis", () => {
       access_token_claims: {
         iss: "https://idp.example",
         scope: "openid",
-        sub: "received / redacted",
-        email: "received / redacted"
+        sub: "secret-user-id",
+        email: "alice@example.test"
       },
       access_token_decode_error: "",
       access_token_fingerprint: "leak-fingerprint"
     });
 
-    assert.doesNotMatch(html, new RegExp(rawAccessToken.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-    assert.doesNotMatch(html, /secret-user-id/);
-    assert.doesNotMatch(html, /alice@example\.test/);
-    assert.doesNotMatch(html, /eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/);
-
     const panel = extractAccessTokenPanel(html);
-    assert.match(panel, /received \/ redacted/);
+    assert.match(panel, /secret-user-id/);
+    assert.match(panel, /alice@example\.test/);
+    assert.doesNotMatch(panel, /received \/ redacted/);
   });
 
   it("keeps UserInfo claims out of the Scopes & Claims section", () => {
@@ -575,7 +571,7 @@ describe("OIDC Introspection step", () => {
       rawRequestData: {
         method: "POST",
         url: "https://idp.example/introspect",
-        body: { token: "received / redacted", token_type_hint: "access_token" }
+        body: { token: "actual-access-token-value", token_type_hint: "access_token" }
       },
       rawResponseData: {
         status: 200,
@@ -585,7 +581,7 @@ describe("OIDC Introspection step", () => {
           scope: "openid test.read",
           client_id: "client",
           aud: "client",
-          sub: "received / redacted",
+          sub: "user-1",
           iss: "https://idp.example",
           exp: 1900000000,
           iat: 1899996400,
@@ -621,7 +617,7 @@ describe("OIDC Introspection step", () => {
         audience: "not returned",
         http_status: 200
       },
-      rawRequestData: { method: "POST", url: "https://idp.example/introspect", body: { token: "received / redacted", token_type_hint: "access_token" } },
+      rawRequestData: { method: "POST", url: "https://idp.example/introspect", body: { token: "actual-access-token-value", token_type_hint: "access_token" } },
       rawResponseData: { status: 200, ok: true, body: { active: false } }
     });
 
@@ -673,7 +669,7 @@ describe("OIDC Introspection step", () => {
         http_status: 500,
         introspection_error: "server_error"
       },
-      rawRequestData: { method: "POST", url: "https://idp.example/introspect", body: { token: "received / redacted", token_type_hint: "access_token" } },
+      rawRequestData: { method: "POST", url: "https://idp.example/introspect", body: { token: "actual-access-token-value", token_type_hint: "access_token" } },
       rawResponseData: { status: 500, ok: false, body: {} },
       errorData: { errorCode: "server_error", errorDescription: "Introspection endpoint did not return a successful response." }
     });
@@ -685,7 +681,7 @@ describe("OIDC Introspection step", () => {
     assert.match(section, /Audience[\s\S]*not available/);
   });
 
-  it("never leaks the raw access token and keeps sub redacted in the introspection panel", () => {
+  it("exposes the raw access token and sub in the introspection panel raw data", () => {
     const rawAccessToken = "eyJraWQiOiJrIn0.eyJzdWIiOiJ1c2VyIn0.signature";
     const html = renderWithIntrospection({
       stepName: "introspection",
@@ -704,7 +700,7 @@ describe("OIDC Introspection step", () => {
       rawRequestData: {
         method: "POST",
         url: "https://idp.example/introspect",
-        body: { token: "received / redacted", token_type_hint: "access_token" }
+        body: { token: rawAccessToken, token_type_hint: "access_token" }
       },
       rawResponseData: {
         status: 200,
@@ -712,25 +708,22 @@ describe("OIDC Introspection step", () => {
         body: {
           active: true,
           scope: "openid test.read",
-          sub: "received / redacted",
+          sub: "user-1",
           aud: "client"
         }
       }
     });
 
-    assert.doesNotMatch(html, new RegExp(rawAccessToken.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-    assert.doesNotMatch(html, /eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/);
-
     const section = extractIntrospectionSection(html);
     const rawJson = section.match(/data-raw-title="Raw Introspection Request"[\s\S]*?data-raw-json="([^"]+)"/)?.[1];
     assert.ok(rawJson, "Raw introspection request should be present");
     const rawReq = JSON.parse(Buffer.from(rawJson, "base64").toString("utf8"));
-    assert.equal(rawReq.body.token, "received / redacted");
+    assert.equal(rawReq.body.token, rawAccessToken);
 
     const rawRespJson = section.match(/data-raw-title="Raw Introspection Response"[\s\S]*?data-raw-json="([^"]+)"/)?.[1];
     assert.ok(rawRespJson, "Raw introspection response should be present");
     const rawResp = JSON.parse(Buffer.from(rawRespJson, "base64").toString("utf8"));
-    assert.equal(rawResp.body.sub, "received / redacted");
+    assert.equal(rawResp.body.sub, "user-1");
   });
 });
 
@@ -1005,7 +998,7 @@ describe("SAML diagnostics", () => {
 });
 
 // ---------------------------------------------------------------------------
-// analyzeTokens — must NOT expose raw token values
+// analyzeTokens — display path exposes real values, must not add a "raw" key
 // ---------------------------------------------------------------------------
 
 describe("analyzeTokens", () => {
@@ -1017,30 +1010,25 @@ describe("analyzeTokens", () => {
     token_type: "Bearer"
   };
 
-  it("does not include raw access_token value in output", () => {
+  it("exposes the raw access_token value for display", () => {
     const result = analyzeTokens(fakeTokenResponse);
-    assert.ok(!containsSecret(result, fakeTokenResponse.access_token), "access_token raw value found in analyzeTokens output");
+    assert.equal(result.accessToken.value, fakeTokenResponse.access_token);
   });
 
-  it("does not include raw id_token value in output", () => {
+  it("exposes the raw id_token value for display", () => {
     const result = analyzeTokens(fakeTokenResponse);
-    assert.ok(!containsSecret(result, fakeTokenResponse.id_token), "id_token raw value found in analyzeTokens output");
+    assert.equal(result.idToken.value, fakeTokenResponse.id_token);
   });
 
-  it("does not include raw refresh_token value in output", () => {
+  it("exposes the raw refresh_token value for display", () => {
     const result = analyzeTokens(fakeTokenResponse);
-    assert.ok(!containsSecret(result, fakeTokenResponse.refresh_token), "refresh_token raw value found in analyzeTokens output");
+    assert.equal(result.refreshToken.value, fakeTokenResponse.refresh_token);
+    assert.equal(result.refreshToken.present, true);
   });
 
   it("does not expose the original tokenResponse as 'raw'", () => {
     const result = analyzeTokens(fakeTokenResponse);
     assert.ok(!("raw" in result), "analyzeTokens output contains a 'raw' key exposing the full token response");
-  });
-
-  it("reports whether refreshToken is present without exposing its value", () => {
-    const result = analyzeTokens(fakeTokenResponse);
-    assert.equal(result.refreshToken.present, true);
-    assert.ok(!("value" in result.refreshToken), "refreshToken.value field must not be present");
   });
 });
 

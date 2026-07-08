@@ -472,20 +472,20 @@ export function analyzeTokens(tokenResponse = {}) {
 
   return {
     accessToken: {
-      maskedValue: maskSensitiveValue("access_token", accessToken),
+      value: accessToken,
       format: tokenFormat(accessToken),
       decoded: decodeJwt(accessToken),
       expiration: computeExpiration(accessToken, tokenResponse.expires_in)
     },
     idToken: {
-      maskedValue: maskSensitiveValue("id_token", idToken),
+      value: idToken,
       format: tokenFormat(idToken),
       decoded: decodeJwt(idToken),
       expiration: computeExpiration(idToken)
     },
     refreshToken: {
       present: Boolean(refreshToken),
-      maskedValue: maskSensitiveValue("refresh_token", refreshToken)
+      value: refreshToken
     }
   };
 }

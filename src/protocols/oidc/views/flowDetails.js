@@ -17,15 +17,11 @@ function encodeRawData(value) {
 
 // ---- Status badge helpers ----
 
-const BADGE_SUCCESS = new Set(["yes", "received", "present", "sent", "valid", "success", "match", "ok", "received / redacted", "prepared", "available", "received and decoded", "readable", "passed", "jwt"]);
+const BADGE_SUCCESS = new Set(["yes", "received", "present", "sent", "valid", "success", "match", "ok", "prepared", "available", "received and decoded", "readable", "passed", "jwt"]);
 const BADGE_ERROR = new Set(["no", "missing", "failed", "mismatch", "error", "failure", "invalid", "expired"]);
 const BADGE_NEUTRAL = new Set(["not implemented", "not checked", "not extracted", "skipped", "none",
   "disabled", "not sent", "pending", "not performed", "not available", "unavailable", "incomplete", "not_checked",
   "not applicable", "not evaluated", "informational", "partial", "opaque", "unreadable"]);
-
-const PERSONAL_CLAIMS = new Set(["email", "name", "given_name", "family_name", "middle_name", "nickname", "preferred_username", "phone_number", "address", "birthdate", "locale", "zoneinfo", "picture", "website", "profile", "nonce"]);
-const COLLECTION_CLAIMS = new Set(["roles", "role", "groups", "group", "authorities", "entitlements", "realm_access", "resource_access"]);
-const PUBLIC_PROTOCOL_CLAIMS = new Set(["iss", "aud", "azp", "exp", "iat", "nbf", "auth_time", "acr", "amr", "typ", "token_type"]);
 
 function badge(value) {
   if (value === null || value === undefined || value === "") return `<span class="muted">—</span>`;
@@ -41,9 +37,7 @@ function badge(value) {
   if (BADGE_SUCCESS.has(low)
     || low.includes("generated + sent")
     || low.includes("challenge sent")
-    || low.includes("sent via")
-    || (low.includes("masked") && !low.startsWith("error"))
-    || (low.includes("received") && (low.includes("sent") || low.includes("masked")))) {
+    || low.includes("sent via")) {
     return `<span class="badge badge--success">${escapeHtml(str)}</span>`;
   }
   if (BADGE_ERROR.has(low) || low.startsWith("missing") || (low.startsWith("error") && low.length > 5)) {
@@ -67,6 +61,11 @@ function badge(value) {
 function plain(v) {
   if (v === null || v === undefined || v === "") return `<span class="muted">—</span>`;
   return `<span>${escapeHtml(String(v))}</span>`;
+}
+
+function codeValue(v) {
+  if (v === null || v === undefined || v === "") return `<span class="badge badge--error">missing</span>`;
+  return `<code class="code-inline" style="word-break:break-all">${escapeHtml(String(v))}</code>`;
 }
 
 function muted(v) {
@@ -201,28 +200,18 @@ function accessTokenFormatLabel(format) {
   }
 }
 
-function formatClaimValue(claim, value) {
+function formatClaimValue(_claim, value) {
   if (value === null || value === undefined || value === "") return "missing";
-  const name = String(claim || "").toLowerCase();
-
-  if (PERSONAL_CLAIMS.has(name)) return "received / redacted";
-  if (name === "sub") return "received / redacted";
 
   if (Array.isArray(value)) {
-    if (COLLECTION_CLAIMS.has(name)) return `${value.length} value${value.length > 1 ? "s" : ""}`;
-    return value.map((item) => String(item)).join(", ");
+    return value.map((item) => (typeof item === "object" ? JSON.stringify(item) : String(item))).join(", ");
   }
 
   if (typeof value === "object") {
-    const keys = Object.keys(value);
-    return `${keys.length} nested field${keys.length > 1 ? "s" : ""}`;
+    return JSON.stringify(value);
   }
 
-  if (typeof value === "string" && value.length > 80) {
-    return `${value.slice(0, 77)}...`;
-  }
-
-  return PUBLIC_PROTOCOL_CLAIMS.has(name) ? String(value) : "received / redacted";
+  return String(value);
 }
 
 function claimTable(entries = [], emptyLabel = "Unavailable") {
@@ -561,7 +550,7 @@ function renderAuthorization(steps) {
           requestContent,
           auth?.errorData?.errorDescription)}
         ${exchangePanel("Callback received",
-          rawBtn("Sanitized Callback Received", "callback", "response", cb?.rawResponseData || cb?.rawRequestData),
+          rawBtn("Raw Callback Received", "callback", "response", cb?.rawResponseData || cb?.rawRequestData),
           responseContent,
           cb?.errorData?.errorDescription)}
       </div>
@@ -589,10 +578,12 @@ function renderTokenExchange(steps) {
     : dl([
         row("Token exchange", statusWithDetail(tokenExchangeStatus(token, resp), tokenFailureDetail(resp))),
         row("HTTP status", badge(resp.http_status != null ? String(resp.http_status) : "")),
-        row("Access token", badge(resp.access_token)),
-        row("ID token", badge(resp.id_token)),
-        row("Refresh token", badge(resp.refresh_token)),
+        row("Access token", codeValue(resp.access_token)),
+        row("ID token", codeValue(resp.id_token)),
+        row("Refresh token", codeValue(resp.refresh_token)),
+        resp.token_type ? row("Token type", plain(resp.token_type)) : null,
         resp.expires_in != null && resp.expires_in !== "" ? row("Expires in", plain(`${resp.expires_in} s`)) : null,
+        resp.scope ? row("Scope", plain(resp.scope)) : null,
         tokenError ? row("OAuth error", statusWithDetail(resp.token_error, resp.error_description)) : null
       ]);
 
@@ -760,6 +751,11 @@ function renderScopesAndClaims(flow, steps) {
           accessChecks.decodeError ? row("Decode error", plain(accessChecks.decodeError)) : null
         ]);
 
+  const accessTokenValue = token?.responseData?.access_token_value || token?.responseData?.access_token || "";
+  const rawTokenBlock = accessTokenValue
+    ? `<div class="flow-detail-panel__subsection"><h4 class="flow-detail-panel__subtitle">Raw access token</h4>${codeValue(accessTokenValue)}</div>`
+    : "";
+
   let accessTokenClaimsBody;
   if (!token || token.status === "pending") {
     accessTokenClaimsBody = `<p class="muted">Not reached.</p>`;
@@ -768,9 +764,9 @@ function renderScopesAndClaims(flow, steps) {
   } else if (!accessChecks.present) {
     accessTokenClaimsBody = `<p class="muted">No access token received.</p>`;
   } else if (accessChecks.format === "opaque") {
-    accessTokenClaimsBody = `<p class="muted">Access token received, but it is opaque and cannot be decoded client-side.</p>`;
+    accessTokenClaimsBody = `<p class="muted">Access token received, but it is opaque and cannot be decoded as a JWT client-side.</p>${rawTokenBlock}`;
   } else if (accessChecks.format === "unreadable") {
-    accessTokenClaimsBody = `<p class="muted">Access token received, but it could not be decoded as a JWT.</p>`;
+    accessTokenClaimsBody = `<p class="muted">Access token received, but it could not be decoded as a JWT.</p>${rawTokenBlock}`;
   } else if (accessChecks.format === "jwt") {
     accessTokenClaimsBody = claimTable(accessClaims, "Access token decoded as JWT, but no claims were extracted.");
   } else {
@@ -908,7 +904,7 @@ export function renderFlowDetailsPage({ flow, serviceProvider, steps = [], flash
       <section class="modal" role="dialog" aria-modal="true" aria-labelledby="raw-modal-title">
         <header class="modal__header">
           <div>
-            <h2 id="raw-modal-title">Sanitized raw data</h2>
+            <h2 id="raw-modal-title">Raw data</h2>
             <p class="modal__subtitle muted" data-raw-modal-subtitle></p>
           </div>
         </header>

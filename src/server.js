@@ -258,36 +258,24 @@ function diagnosticPresence(value) {
   return value === undefined || value === null || value === "" ? "missing" : "present";
 }
 
-function diagnosticReceived(value) {
-  return value === undefined || value === null || value === "" ? "missing" : "received";
-}
-
-function redactProtocolParam(key, value) {
+function oidcDisplayParam(key, value) {
   const normalized = String(key || "").toLowerCase();
 
-  if (normalized === "code_challenge_method") {
-    return sanitizeDiagnosticData(value, key);
+  if (normalized === "client_secret" || normalized === "clientsecret") {
+    return value ? "********" : "";
   }
 
-  if (["state", "nonce", "code_challenge"].includes(normalized)) {
-    return diagnosticPresence(value);
-  }
-
-  if (["code", "code_verifier"].includes(normalized)) {
-    return diagnosticPresence(value);
-  }
-
-  return sanitizeDiagnosticData(value, key);
+  return value;
 }
 
-function redactProtocolParams(params = {}) {
+function oidcDisplayParams(params = {}) {
   return Object.entries(params || {}).reduce((acc, [key, value]) => {
-    acc[key] = redactProtocolParam(key, value);
+    acc[key] = oidcDisplayParam(key, value);
     return acc;
   }, {});
 }
 
-function redactDiagnosticUrl(rawUrl = "") {
+function oidcDisplayUrl(rawUrl = "") {
   if (!rawUrl || typeof rawUrl !== "string") {
     return rawUrl || "";
   }
@@ -295,9 +283,10 @@ function redactDiagnosticUrl(rawUrl = "") {
   try {
     const parsed = new URL(rawUrl, BASE_URL);
     for (const key of Array.from(parsed.searchParams.keys())) {
-      const redacted = redactProtocolParam(key, parsed.searchParams.get(key));
-      if (redacted !== parsed.searchParams.get(key)) {
-        parsed.searchParams.set(key, redacted);
+      const original = parsed.searchParams.get(key);
+      const shown = oidcDisplayParam(key, original);
+      if (shown !== original) {
+        parsed.searchParams.set(key, shown);
       }
     }
 
@@ -307,6 +296,21 @@ function redactDiagnosticUrl(rawUrl = "") {
   } catch {
     return rawUrl;
   }
+}
+
+function oidcDisplayHeaders(headers = {}) {
+  const out = {};
+  for (const [key, value] of Object.entries(headers || {})) {
+    const normalized = String(key).toLowerCase();
+    if (normalized === "authorization" && typeof value === "string" && /^basic\s+/i.test(value)) {
+      out[key] = "Basic ********";
+    } else if (normalized === "cookie" || normalized === "set-cookie") {
+      out[key] = value ? "********" : "";
+    } else {
+      out[key] = value;
+    }
+  }
+  return out;
 }
 
 function sanitizeDiagnosticError(value = "") {
@@ -328,72 +332,32 @@ function lifecycleHashMatches(value = "", expectedHash = "") {
   return Boolean(value && expectedHash && lifecycleHash(value) === expectedHash);
 }
 
-function tokenPresence(value) {
-  if (["present", "missing", "received", "redacted", "received / redacted", "unavailable", "unknown"].includes(value)) {
-    return value;
-  }
-
-  return value === undefined || value === null || value === "" ? "missing" : "present";
-}
-
-function tokenSummaryStatus(value) {
-  if (value === "present" || value === "received" || value === "redacted" || value === "received / redacted") {
-    return "received";
-  }
-
-  if (value === "missing") {
-    return "missing";
-  }
-
-  return value === undefined || value === null || value === "" ? "missing" : "received";
-}
-
-function claimSummaryStatus(value) {
-  if (value === undefined || value === null || value === "" || value === "missing" || value === "no") {
-    return "missing";
-  }
-
-  if (value === "yes") {
-    return "received";
-  }
-
-  if (value === "redacted" || value === "received / redacted") {
-    return "received / redacted";
-  }
-
-  if (value === "received" || value === "present") {
-    return "received";
-  }
-
-  return "received";
-}
-
 function usefulSanitizedHeaders(headers = {}) {
-  return sanitizeDiagnosticData(headers || {});
+  return oidcDisplayHeaders(headers || {});
 }
 
 function sanitizeAuthorizationRequestRaw(request = {}) {
   return {
     method: request.method || "GET",
-    url: redactDiagnosticUrl(request.url || ""),
-    headers: usefulSanitizedHeaders(request.headers || {}),
-    params: redactProtocolParams(request.params || {})
+    url: oidcDisplayUrl(request.url || ""),
+    headers: oidcDisplayHeaders(request.headers || {}),
+    params: oidcDisplayParams(request.params || {})
   };
 }
 
 function sanitizeCallbackParams(params = {}) {
-  return sanitizeDiagnosticData({
-    code: diagnosticPresence(params.code),
-    state: diagnosticPresence(params.state),
+  return {
+    ...(params.code !== undefined ? { code: params.code } : {}),
+    ...(params.state !== undefined ? { state: params.state } : {}),
     ...(params.error ? { error: sanitizeDiagnosticError(params.error) } : {}),
     ...(params.error_description ? { error_description: sanitizeDiagnosticError(params.error_description) } : {})
-  });
+  };
 }
 
 function sanitizeCallbackRaw({ req, params = {}, stateCheck = "" }) {
   const method = req?.method || "GET";
   const localUrl = method === "GET"
-    ? redactDiagnosticUrl(req?.url || "/oidc/callback")
+    ? oidcDisplayUrl(req?.url || "/oidc/callback")
     : "/oidc/callback";
   const callbackParams = sanitizeCallbackParams(params);
 
@@ -423,9 +387,9 @@ function sanitizeTokenRequestRaw(request = {}) {
 
   return {
     method: request.method || "POST",
-    url: redactDiagnosticUrl(request.url || ""),
-    headers: usefulSanitizedHeaders(request.headers || {}),
-    body: redactProtocolParams(parsedBody || {})
+    url: oidcDisplayUrl(request.url || ""),
+    headers: oidcDisplayHeaders(request.headers || {}),
+    body: oidcDisplayParams(parsedBody || {})
   };
 }
 
@@ -436,14 +400,14 @@ function sanitizeTokenResponseRaw(response = null) {
 
   const parsed = response.parsed || parseSnapshotBody(response.body || "", response.headers?.["content-type"] || "") || {};
 
-  return sanitizeDiagnosticData({
+  return {
     status: response.status ?? 0,
     ok: Boolean(response.ok),
-    headers: usefulSanitizedHeaders(response.headers || {}),
+    headers: oidcDisplayHeaders(response.headers || {}),
     body: {
-      access_token: tokenPresence(parsed.access_token),
-      id_token: tokenPresence(parsed.id_token),
-      refresh_token: tokenPresence(parsed.refresh_token),
+      ...(parsed.access_token !== undefined ? { access_token: parsed.access_token } : {}),
+      ...(parsed.id_token !== undefined ? { id_token: parsed.id_token } : {}),
+      ...(parsed.refresh_token !== undefined ? { refresh_token: parsed.refresh_token } : {}),
       ...(parsed.token_type !== undefined ? { token_type: parsed.token_type } : {}),
       ...(parsed.expires_in !== undefined ? { expires_in: parsed.expires_in } : {}),
       ...(parsed.scope !== undefined ? { scope: parsed.scope } : {}),
@@ -451,7 +415,7 @@ function sanitizeTokenResponseRaw(response = null) {
       ...(parsed.error_description !== undefined ? { error_description: sanitizeDiagnosticError(parsed.error_description) } : {})
     },
     error: response.error ? sanitizeDiagnosticError(response.error) : null
-  });
+  };
 }
 
 function sanitizeUserInfoRequestRaw(request = null) {
@@ -461,21 +425,10 @@ function sanitizeUserInfoRequestRaw(request = null) {
 
   return {
     method: request.method || "GET",
-    url: redactDiagnosticUrl(request.url || ""),
-    headers: usefulSanitizedHeaders(request.headers || {}),
+    url: oidcDisplayUrl(request.url || ""),
+    headers: oidcDisplayHeaders(request.headers || {}),
     params: {}
   };
-}
-
-function userInfoClaimStatus(value) {
-  if (value === undefined || value === null || value === "") return "missing";
-  return "received / redacted";
-}
-
-function userInfoClaimsPresence(claims = {}) {
-  return Object.fromEntries(
-    Object.keys(claims || {}).map((claimName) => [claimName, userInfoClaimStatus(claims[claimName])])
-  );
 }
 
 function buildUserInfoClaimDiagnostics(claims = {}) {
@@ -487,25 +440,8 @@ function buildUserInfoClaimDiagnostics(claims = {}) {
   };
 }
 
-function sanitizeUserInfoClaims(claims = {}) {
-  const sanitized = sanitizeDiagnosticData(claims || {});
-  if (!sanitized || typeof sanitized !== "object" || Array.isArray(sanitized)) {
-    return sanitized;
-  }
-
-  const { claims: _nestedClaims, ...withoutNestedClaims } = sanitized;
-  const redactedClaims = userInfoClaimsPresence(withoutNestedClaims);
-
-  if (withoutNestedClaims.sub !== undefined && withoutNestedClaims.sub !== null && withoutNestedClaims.sub !== "") {
-    redactedClaims.sub = withoutNestedClaims.sub;
-  }
-
-  return redactedClaims;
-}
-
-function extractUserInfoClaims(parsed = {}) {
+function extractUserInfoClaimsFromParsed(parsed = {}) {
   let claims = parsed || {};
-
   while (
     claims?.claims &&
     typeof claims.claims === "object" &&
@@ -514,8 +450,9 @@ function extractUserInfoClaims(parsed = {}) {
   ) {
     claims = claims.claims;
   }
-
-  return sanitizeUserInfoClaims(claims);
+  if (!claims || typeof claims !== "object" || Array.isArray(claims)) return {};
+  const { claims: _nested, ...rest } = claims;
+  return rest;
 }
 
 function sanitizeUserInfoResponseRaw(response = null) {
@@ -524,13 +461,14 @@ function sanitizeUserInfoResponseRaw(response = null) {
   }
 
   if (response.body?.claims && typeof response.body.claims === "object") {
-    const claims = sanitizeUserInfoClaims(response.body.claims);
+    const { claims: _nested, ...rest } = response.body.claims;
+    const claims = rest;
     const diagnostics = response.diagnostics || buildUserInfoClaimDiagnostics(claims);
 
     return {
       status: response.status ?? 0,
       ok: Boolean(response.ok),
-      headers: usefulSanitizedHeaders(response.headers || {}),
+      headers: oidcDisplayHeaders(response.headers || {}),
       body: {
         sub: response.body.sub || claims.sub || "missing",
         claims
@@ -544,13 +482,13 @@ function sanitizeUserInfoResponseRaw(response = null) {
   }
 
   const parsed = response.parsed || parseSnapshotBody(response.body || "", response.headers?.["content-type"] || "") || {};
-  const claims = extractUserInfoClaims(parsed);
+  const claims = extractUserInfoClaimsFromParsed(parsed);
   const diagnostics = buildUserInfoClaimDiagnostics(claims);
 
   return {
     status: response.status ?? 0,
     ok: Boolean(response.ok),
-    headers: usefulSanitizedHeaders(response.headers || {}),
+    headers: oidcDisplayHeaders(response.headers || {}),
     body: {
       sub: claims.sub || "missing",
       claims
@@ -566,9 +504,9 @@ function buildTokenResponseSummary(rawResponseData = null, fallback = {}) {
   return {
     ...fallback,
     http_status: rawResponseData?.status ?? fallback.http_status ?? 0,
-    access_token: tokenSummaryStatus(body.access_token ?? fallback.access_token),
-    id_token: tokenSummaryStatus(body.id_token ?? fallback.id_token),
-    refresh_token: tokenSummaryStatus(body.refresh_token ?? fallback.refresh_token),
+    access_token: body.access_token ?? fallback.access_token ?? "",
+    id_token: body.id_token ?? fallback.id_token ?? "",
+    refresh_token: body.refresh_token ?? fallback.refresh_token ?? "",
     expires_in: body.expires_in ?? fallback.expires_in ?? "",
     token_type: body.token_type ?? fallback.token_type ?? "",
     token_error: body.error || rawResponseData?.error || fallback.token_error || "none",
@@ -596,7 +534,7 @@ function buildUserInfoResponseSummary(rawResponseData = null, fallback = {}) {
 }
 
 function sanitizeJwtPayload(payload = {}) {
-  const claims = sanitizeDiagnosticData(payload || {});
+  const claims = payload || {};
   const usefulClaims = {};
 
   for (const [key, value] of Object.entries(claims)) {
@@ -611,7 +549,7 @@ function sanitizeJwtPayload(payload = {}) {
     sub: claims.sub || "",
     exp: claims.exp || "",
     iat: claims.iat || "",
-    nonce: diagnosticPresence(payload?.nonce),
+    ...(claims.nonce !== undefined ? { nonce: claims.nonce } : {}),
     ...usefulClaims
   };
 }
@@ -722,11 +660,11 @@ function buildIdTokenAnalysisRaw(idToken = "", flow = null) {
   return {
     source: "token_response.id_token",
     jwt: {
-      header: sanitizeDiagnosticData({
+      header: {
         alg: decoded.header?.alg || "",
         kid: decoded.header?.kid || "",
         ...(decoded.header?.typ ? { typ: decoded.header.typ } : {})
-      }),
+      },
       payload: sanitizeJwtPayload(payload)
     },
     validation: {
@@ -738,43 +676,18 @@ function buildIdTokenAnalysisRaw(idToken = "", flow = null) {
   };
 }
 
-const ACCESS_TOKEN_PUBLIC_CLAIMS = new Set([
-  "iss", "aud", "exp", "iat", "nbf", "azp", "client_id", "scope", "scp",
-  "token_type", "tokentype", "typ", "realm", "jti", "auth_time"
-]);
-
-const ACCESS_TOKEN_REDACTED_CLAIMS = new Set([
-  "sub", "email", "email_verified", "name", "given_name", "family_name",
-  "middle_name", "nickname", "preferred_username", "phone", "phone_number",
-  "phone_number_verified", "address", "birthdate", "picture", "website",
-  "profile", "gender", "locale", "zoneinfo", "groups", "roles", "authorities",
-  "entitlements", "realm_access", "resource_access"
-]);
-
 function sanitizeAccessTokenHeader(header = {}) {
   if (!header || typeof header !== "object" || Array.isArray(header)) return null;
-  return sanitizeDiagnosticData({
+  return {
     alg: header.alg || "",
     kid: header.kid || "",
     ...(header.typ ? { typ: header.typ } : {})
-  });
+  };
 }
 
 function sanitizeAccessTokenClaims(payload = {}) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
-
-  const sanitized = {};
-  for (const [key, value] of Object.entries(payload)) {
-    const normalizedKey = String(key).toLowerCase();
-    if (ACCESS_TOKEN_REDACTED_CLAIMS.has(normalizedKey)) {
-      sanitized[key] = "received / redacted";
-    } else if (ACCESS_TOKEN_PUBLIC_CLAIMS.has(normalizedKey)) {
-      sanitized[key] = sanitizeDiagnosticData(value, key);
-    } else {
-      sanitized[key] = "received / redacted";
-    }
-  }
-  return sanitized;
+  return { ...payload };
 }
 
 function buildAccessTokenMetadata(token = "") {
@@ -785,7 +698,8 @@ function buildAccessTokenMetadata(token = "") {
       header: null,
       claims: null,
       decode_error: "",
-      fingerprint: ""
+      fingerprint: "",
+      value: ""
     };
   }
 
@@ -799,7 +713,8 @@ function buildAccessTokenMetadata(token = "") {
       header: null,
       claims: null,
       decode_error: "",
-      fingerprint
+      fingerprint,
+      value: token
     };
   }
 
@@ -811,7 +726,8 @@ function buildAccessTokenMetadata(token = "") {
       header: null,
       claims: null,
       decode_error: "Access token has JWT shape but could not be decoded.",
-      fingerprint
+      fingerprint,
+      value: token
     };
   }
 
@@ -821,7 +737,8 @@ function buildAccessTokenMetadata(token = "") {
     header: sanitizeAccessTokenHeader(decoded.header),
     claims: sanitizeAccessTokenClaims(decoded.payload),
     decode_error: "",
-    fingerprint
+    fingerprint,
+    value: token
   };
 }
 
@@ -830,29 +747,26 @@ function sanitizeRawRequest(request = null) {
     return null;
   }
 
-  const headers = sanitizeDiagnosticData(request.headers || {});
+  const headers = oidcDisplayHeaders(request.headers || {});
   const contentType = request.headers?.["content-type"] || request.headers?.["Content-Type"] || "";
   const parsedBody = parseSnapshotBody(request.body || "", contentType);
 
-  return sanitizeDiagnosticData({
+  return {
     method: request.method || "",
-    url: redactDiagnosticUrl(request.url || ""),
+    url: oidcDisplayUrl(request.url || ""),
     headers,
-    params: redactProtocolParams(request.params || {}),
-    body: parsedBody && typeof parsedBody === "object" ? redactProtocolParams(parsedBody) : parsedBody || undefined
-  });
+    params: oidcDisplayParams(request.params || {}),
+    body: parsedBody && typeof parsedBody === "object" ? oidcDisplayParams(parsedBody) : parsedBody || undefined
+  };
 }
 
 function summarizeUserInfoClaims(claims = {}) {
   const keys = Object.keys(claims || {});
 
   return {
-    sub: claims.sub || "",
-    email: diagnosticReceived(claims.email),
-    name: diagnosticReceived(claims.name),
+    ...claims,
     raw_claims_available: keys.length > 0 ? "yes" : "no",
-    claim_count: keys.length,
-    body_redaction: keys.length > 0 ? "PII claims limited for display" : ""
+    claim_count: keys.length
   };
 }
 
@@ -867,14 +781,14 @@ function sanitizeRawResponse(response = null, { bodyMode = "default" } = {}) {
     ? summarizeUserInfoClaims(parsedBody)
     : parsedBody || response.redactedBody || response.error || "";
 
-  return sanitizeDiagnosticData({
+  return {
     status: response.status ?? 0,
     ok: Boolean(response.ok),
-    headers: usefulSanitizedHeaders(response.headers || {}),
+    headers: oidcDisplayHeaders(response.headers || {}),
     body,
     error: response.error ? sanitizeDiagnosticError(response.error) : "",
     diagnostics: response.diagnostics || null
-  });
+  };
 }
 
 function callbackStateCheckFromStep(step = {}) {
@@ -957,7 +871,7 @@ function sanitizeOidcRawResponseForStep(stepName, rawResponseData, step = {}) {
   }
 
   if (rawResponseData.body && typeof rawResponseData.body === "object") {
-    return sanitizeDiagnosticData(rawResponseData);
+    return rawResponseData;
   }
 
   return sanitizeRawResponse(rawResponseData);
@@ -1102,7 +1016,7 @@ function sanitizeOidcStepForPersistence(step = {}) {
   const responseData = step.responseData?.authorization_url_full
     ? {
         ...step.responseData,
-        authorization_url_full: redactDiagnosticUrl(step.responseData.authorization_url_full)
+        authorization_url_full: oidcDisplayUrl(step.responseData.authorization_url_full)
       }
     : step.responseData;
   const rawResponseData = step.rawResponseData
@@ -1116,7 +1030,7 @@ function sanitizeOidcStepForPersistence(step = {}) {
       ? sanitizeOidcRawRequestForStep(step.stepName, step.rawRequestData, step)
       : step.rawRequestData,
     rawResponseData,
-    rawAnalysisData: step.rawAnalysisData ? sanitizeDiagnosticData(step.rawAnalysisData) : null
+    rawAnalysisData: step.rawAnalysisData || null
   };
 }
 
@@ -2707,7 +2621,7 @@ function flowStepSummary(stepName, step) {
   const baseResponseData = step?.responseData?.authorization_url_full
     ? {
         ...step.responseData,
-        authorization_url_full: redactDiagnosticUrl(step.responseData.authorization_url_full)
+        authorization_url_full: oidcDisplayUrl(step.responseData.authorization_url_full)
       }
     : step?.responseData || null;
   const responseData = stepName === "token" && rawResponseData
@@ -3082,22 +2996,23 @@ function buildTokenStep({ requestSnapshot, responseSnapshot, flow = null }) {
       grant_type: "authorization_code",
       client_authentication_method: clientAuthenticationMethod,
       client_id: requestSnapshot.params?.client_id || "sent via Authorization header",
-      client_secret_used: clientAuthenticationMethod === "client_secret_basic" ? "yes, masked" : "no",
+      client_secret_used: clientAuthenticationMethod === "client_secret_basic" ? "yes" : "no",
       redirect_uri: requestSnapshot.params?.redirect_uri || "",
-      authorization_code: requestSnapshot.params?.code ? "received + sent, masked" : "missing",
-      code_verifier: requestSnapshot.params?.code_verifier ? "sent" : "not sent"
+      authorization_code: requestSnapshot.params?.code || "",
+      code_verifier: requestSnapshot.params?.code_verifier || ""
     },
     responseData: {
       ...buildTokenResponseSummary(rawResponseData),
       token_error: parsed.error || responseSnapshot.error || "none",
       error_description: parsed.error_description || "",
-      id_token_claims: idTokenClaims.isJwt ? selectedClaims(idTokenClaims.payload) : {},
+      id_token_claims: idTokenClaims.isJwt ? { ...idTokenClaims.payload } : {},
       access_token_present: accessTokenMeta.present,
       access_token_format: accessTokenMeta.format,
       access_token_header: accessTokenMeta.header,
       access_token_claims: accessTokenMeta.claims,
       access_token_decode_error: accessTokenMeta.decode_error,
       access_token_fingerprint: accessTokenMeta.fingerprint,
+      access_token_value: accessTokenMeta.value,
       id_token_diagnostics: buildIdTokenDiagnostics(parsed.id_token || "", {
         expectedIssuer: flow?.runtime?.provider?.issuer || "",
         expectedAudience: flow?.runtime?.clientId || "",
@@ -3122,6 +3037,10 @@ function buildTokenStep({ requestSnapshot, responseSnapshot, flow = null }) {
 }
 
 function buildUserInfoStep({ requestSnapshot = null, responseSnapshot = null, skippedReason = "" }) {
+  const authHeaderValue = requestSnapshot?.headers?.authorization
+    || (requestSnapshot?.headers && Object.entries(requestSnapshot.headers).find(([k]) => String(k).toLowerCase() === "authorization")?.[1])
+    || "";
+
   if (skippedReason) {
     return {
       stepName: "userinfo",
@@ -3133,7 +3052,7 @@ function buildUserInfoStep({ requestSnapshot = null, responseSnapshot = null, sk
         method: "GET",
         endpoint: requestSnapshot?.url || "",
         called: "no",
-        Authorization: "Bearer ********"
+        Authorization: authHeaderValue || ""
       },
       responseData: {
         called: "no",
@@ -3163,7 +3082,7 @@ function buildUserInfoStep({ requestSnapshot = null, responseSnapshot = null, sk
       method: "GET",
       endpoint: requestSnapshot.url,
       called: "yes",
-      Authorization: "Bearer ********"
+      Authorization: authHeaderValue || ""
     },
     responseData: {
       ...buildUserInfoResponseSummary(rawResponseData, {
@@ -3189,8 +3108,6 @@ function buildUserInfoStep({ requestSnapshot = null, responseSnapshot = null, sk
   };
 }
 
-const INTROSPECTION_SAFE_FIELDS = ["active", "scope", "client_id", "exp", "iat", "iss", "aud", "token_type"];
-
 function sanitizeIntrospectionRequestRaw(request = null) {
   if (!request) return null;
   const contentType = request.headers?.["content-type"] || request.headers?.["Content-Type"] || "";
@@ -3198,34 +3115,21 @@ function sanitizeIntrospectionRequestRaw(request = null) {
 
   return {
     method: request.method || "POST",
-    url: redactDiagnosticUrl(request.url || ""),
-    headers: usefulSanitizedHeaders(request.headers || {}),
-    body: {
-      token: "received / redacted",
-      token_type_hint: parsedBody.token_type_hint || "access_token",
-      ...(parsedBody.client_id ? { client_id: sanitizeDiagnosticData(parsedBody.client_id, "client_id") } : {})
-    }
+    url: oidcDisplayUrl(request.url || ""),
+    headers: oidcDisplayHeaders(request.headers || {}),
+    body: oidcDisplayParams(parsedBody || {})
   };
 }
 
 function sanitizeIntrospectionResponseRaw(response = null) {
   if (!response) return null;
   const parsed = response.parsed || parseSnapshotBody(response.body || "", response.headers?.["content-type"] || "") || {};
-  const safeBody = {};
-  for (const field of INTROSPECTION_SAFE_FIELDS) {
-    if (parsed[field] !== undefined && parsed[field] !== null && parsed[field] !== "") {
-      safeBody[field] = sanitizeDiagnosticData(parsed[field], field);
-    }
-  }
-  if (parsed.sub !== undefined && parsed.sub !== null && parsed.sub !== "") {
-    safeBody.sub = "received / redacted";
-  }
 
   return {
     status: response.status ?? 0,
     ok: Boolean(response.ok),
-    headers: usefulSanitizedHeaders(response.headers || {}),
-    body: safeBody,
+    headers: oidcDisplayHeaders(response.headers || {}),
+    body: { ...parsed },
     ...(parsed.error ? { error: sanitizeDiagnosticError(parsed.error) } : {}),
     ...(parsed.error_description ? { error_description: sanitizeDiagnosticError(parsed.error_description) } : {}),
     ...(response.error ? { fetch_error: sanitizeDiagnosticError(response.error) } : {})
