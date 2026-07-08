@@ -1913,6 +1913,42 @@ input[type="password"] {
   gap: 16px;
 }
 
+.scopes-claims-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.scopes-claims-stack > .flow-detail-panel {
+  width: 100%;
+}
+
+.flow-detail-panel__subsection + .flow-detail-panel__subsection {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--app-border);
+}
+
+.flow-detail-panel__subheader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.flow-detail-panel__subtitle {
+  margin: 0 0 8px 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--app-text-secondary);
+  text-transform: none;
+}
+
+.flow-detail-panel__subheader .flow-detail-panel__subtitle {
+  margin-bottom: 0;
+}
+
 .flow-detail-panel h3 {
   font-size: 14px;
   font-weight: 600;

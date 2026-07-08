@@ -20,8 +20,10 @@ import {
   sanitizeDiagnosticData,
   buildTokenExchangeRequest,
   buildUserInfoRequest,
+  buildIntrospectionRequest,
   buildEffectiveConfig,
-  normalizeProviderConfig
+  normalizeProviderConfig,
+  mergeDiscoveryIntoProviderConfig
 } from "../src/protocols/oidc/oidc.js";
 
 import { createFlowService } from "../src/protocols/oidc/services/flows.js";
@@ -246,8 +248,13 @@ describe("OIDC lifecycle status", () => {
     assert.match(html, /Result[\s\S]*passed/);
     assert.match(html, />Raw<\/button>/);
     assert.match(html, /Scopes &amp; Claims/);
-    assert.match(html, /Claims reçus dans .*ID Token/);
-    assert.match(html, /Claims reçus dans UserInfo/);
+    assert.match(html, /Requested Scopes/);
+    assert.match(html, /ID Token Claims/);
+    assert.match(html, /Access Token Analysis/);
+    assert.match(html, /Access Token Claims/);
+    const scopesClaimsSection = html.match(/<section class="flow-section" data-section-panel="scopes-claims">[\s\S]*?<\/section>/)?.[0] || "";
+    assert.doesNotMatch(scopesClaimsSection, /UserInfo/);
+    assert.doesNotMatch(scopesClaimsSection, /Claims reçus/);
     assert.doesNotMatch(html, /Decoded, not signature-verified/i);
     assert.doesNotMatch(html, /Token incomplete/i);
     assert.doesNotMatch(html, /Signature not evaluated/i);
@@ -269,6 +276,534 @@ describe("OIDC lifecycle status", () => {
     assert.equal(raw.jwt.payload.iss, "https://idp.example");
     assert.equal(raw.jwt.payload.aud, "client");
     assert.equal(raw.validation.signature, undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OIDC Access Token Analysis — format detection, redaction, legacy
+// ---------------------------------------------------------------------------
+
+describe("OIDC Access Token Analysis", () => {
+  function base64Url(input) {
+    return Buffer.from(input, "utf8")
+      .toString("base64")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/g, "");
+  }
+
+  function makeJwt(header, payload) {
+    return `${base64Url(JSON.stringify(header))}.${base64Url(JSON.stringify(payload))}.sig`;
+  }
+
+  function renderWithTokenStep(tokenResponseData) {
+    return renderFlowDetailsPage({
+      flow: {
+        id: "flow_at",
+        status: "success",
+        statusBadge: { label: "Success", tone: "success" },
+        runtime: {
+          scopes: "openid profile email",
+          provider: { issuer: "https://idp.example" },
+          clientId: "client"
+        }
+      },
+      serviceProvider: { name: "Test SP", clientId: "client" },
+      steps: [
+        { stepName: "authorize", status: "success", requestData: { scope: "openid profile email" } },
+        { stepName: "callback", status: "success" },
+        {
+          stepName: "token",
+          status: "success",
+          responseData: {
+            id_token: "received and decoded",
+            access_token: tokenResponseData.access_token_present ? "received" : "missing",
+            id_token_diagnostics: { id_token_received: "yes" },
+            ...tokenResponseData
+          }
+        }
+      ]
+    });
+  }
+
+  function extractAccessTokenPanel(html) {
+    const section = html.match(/<section class="flow-section" data-section-panel="scopes-claims">[\s\S]*?<\/section>/)?.[0] || "";
+    return section.match(/Access Token Analysis[\s\S]*?<\/article>/)?.[0] || "";
+  }
+
+  it("renders Received/Format and validates checks when access token is a decodable JWT", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const html = renderWithTokenStep({
+      access_token_present: true,
+      access_token_format: "jwt",
+      access_token_header: { alg: "RS256", kid: "kid-at" },
+      access_token_claims: {
+        iss: "https://idp.example",
+        aud: "client",
+        exp: now + 3600,
+        iat: now,
+        scope: "openid profile",
+        sub: "received / redacted",
+        email: "received / redacted"
+      },
+      access_token_decode_error: "",
+      access_token_fingerprint: "abc123def456"
+    });
+
+    const panel = extractAccessTokenPanel(html);
+    assert.ok(panel, "Access Token Analysis panel should be present");
+    assert.match(panel, /Received[\s\S]*>yes</);
+    assert.match(panel, /Format[\s\S]*>JWT</);
+    assert.match(panel, /Issuer[\s\S]*>valid</);
+    assert.match(panel, /Audience[\s\S]*>valid</);
+    assert.match(panel, /Expiration[\s\S]*>valid</);
+    assert.match(panel, /Nonce[\s\S]*>not applicable</);
+    assert.match(panel, /Result[\s\S]*>passed</);
+    assert.match(panel, /Access Token Claims/);
+  });
+
+  it("handles opaque access tokens with informational result and explanatory empty state", () => {
+    const html = renderWithTokenStep({
+      access_token_present: true,
+      access_token_format: "opaque",
+      access_token_header: null,
+      access_token_claims: null,
+      access_token_decode_error: "",
+      access_token_fingerprint: "fingerprint-opaque"
+    });
+
+    const panel = extractAccessTokenPanel(html);
+    assert.match(panel, /Received[\s\S]*>yes</);
+    assert.match(panel, /Format[\s\S]*>opaque</);
+    assert.match(panel, /Issuer[\s\S]*>not available</);
+    assert.match(panel, /Audience[\s\S]*>not available</);
+    assert.match(panel, /Expiration[\s\S]*>not available</);
+    assert.match(panel, /Nonce[\s\S]*>not applicable</);
+    assert.match(panel, /Result[\s\S]*>informational</);
+    assert.match(panel, /Access token received, but it is opaque and cannot be decoded client-side\./);
+  });
+
+  it("handles absent access tokens with not available everywhere", () => {
+    const html = renderWithTokenStep({
+      access_token_present: false,
+      access_token_format: "not_available",
+      access_token_header: null,
+      access_token_claims: null,
+      access_token_decode_error: "",
+      access_token_fingerprint: ""
+    });
+
+    const panel = extractAccessTokenPanel(html);
+    assert.match(panel, /Received[\s\S]*>no</);
+    assert.match(panel, /Format[\s\S]*>not available</);
+    assert.match(panel, /Result[\s\S]*>not available</);
+    assert.match(panel, /No access token received\./);
+  });
+
+  it("handles unreadable JWT-shaped access tokens with a generic decode error", () => {
+    const html = renderWithTokenStep({
+      access_token_present: true,
+      access_token_format: "unreadable",
+      access_token_header: null,
+      access_token_claims: null,
+      access_token_decode_error: "Access token has JWT shape but could not be decoded.",
+      access_token_fingerprint: "fingerprint-bad"
+    });
+
+    const panel = extractAccessTokenPanel(html);
+    assert.match(panel, /Received[\s\S]*>yes</);
+    assert.match(panel, /Format[\s\S]*>unreadable</);
+    assert.match(panel, /Result[\s\S]*>informational</);
+    assert.match(panel, /Access token has JWT shape but could not be decoded\./);
+    assert.match(panel, /Access token received, but it could not be decoded as a JWT\./);
+  });
+
+  it("falls back to a legacy-friendly message when access token metadata is missing", () => {
+    const html = renderWithTokenStep({});
+
+    const panel = extractAccessTokenPanel(html);
+    assert.match(panel, /Access token metadata is not available for this flow\. Run a new flow to capture access token diagnostics\./);
+    assert.doesNotMatch(panel, /No access token received\./);
+    assert.doesNotMatch(panel, />Received</);
+    assert.doesNotMatch(panel, />Format</);
+  });
+
+  it("never leaks the raw access token and keeps sensitive claims redacted", () => {
+    const rawAccessToken = makeJwt(
+      { alg: "RS256", kid: "kid-leak" },
+      { iss: "https://idp.example", sub: "secret-user-id", email: "alice@example.test", scope: "openid" }
+    );
+
+    const html = renderWithTokenStep({
+      access_token_present: true,
+      access_token_format: "jwt",
+      access_token_header: { alg: "RS256", kid: "kid-leak" },
+      access_token_claims: {
+        iss: "https://idp.example",
+        scope: "openid",
+        sub: "received / redacted",
+        email: "received / redacted"
+      },
+      access_token_decode_error: "",
+      access_token_fingerprint: "leak-fingerprint"
+    });
+
+    assert.doesNotMatch(html, new RegExp(rawAccessToken.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.doesNotMatch(html, /secret-user-id/);
+    assert.doesNotMatch(html, /alice@example\.test/);
+    assert.doesNotMatch(html, /eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/);
+
+    const panel = extractAccessTokenPanel(html);
+    assert.match(panel, /received \/ redacted/);
+  });
+
+  it("keeps UserInfo claims out of the Scopes & Claims section", () => {
+    const html = renderFlowDetailsPage({
+      flow: {
+        id: "flow_at_ui",
+        status: "success",
+        statusBadge: { label: "Success", tone: "success" },
+        runtime: { scopes: "openid profile email" }
+      },
+      serviceProvider: { name: "Test SP", clientId: "client" },
+      steps: [
+        { stepName: "authorize", status: "success" },
+        { stepName: "callback", status: "success" },
+        {
+          stepName: "token",
+          status: "success",
+          responseData: {
+            id_token: "received and decoded",
+            access_token: "received",
+            access_token_present: true,
+            access_token_format: "opaque",
+            id_token_diagnostics: { id_token_received: "yes" }
+          }
+        },
+        {
+          stepName: "userinfo",
+          status: "success",
+          responseData: { raw_claims_available: "yes", received_claims: ["sub", "email"] }
+        }
+      ]
+    });
+
+    const section = html.match(/<section class="flow-section" data-section-panel="scopes-claims">[\s\S]*?<\/section>/)?.[0] || "";
+    assert.ok(section, "Scopes & Claims section should be present");
+    assert.doesNotMatch(section, /UserInfo/);
+    assert.doesNotMatch(section, /Claims reçus/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OIDC Introspection — request building and step rendering
+// ---------------------------------------------------------------------------
+
+describe("OIDC Introspection step", () => {
+  function renderWithIntrospection(introspectionStep) {
+    return renderFlowDetailsPage({
+      flow: {
+        id: "flow_intro",
+        status: "success",
+        statusBadge: { label: "Success", tone: "success" },
+        runtime: { scopes: "openid test.read" }
+      },
+      serviceProvider: { name: "Test SP", clientId: "client" },
+      steps: [
+        { stepName: "authorize", status: "success" },
+        { stepName: "callback", status: "success" },
+        {
+          stepName: "token",
+          status: "success",
+          responseData: {
+            id_token: "received and decoded",
+            access_token: "received",
+            access_token_present: true,
+            access_token_format: "opaque"
+          }
+        },
+        introspectionStep,
+        { stepName: "userinfo", status: "success", responseData: {} }
+      ]
+    });
+  }
+
+  function extractIntrospectionSection(html) {
+    return html.match(/<section class="flow-section" data-section-panel="introspection">[\s\S]*?<\/section>/)?.[0] || "";
+  }
+
+  it("merges introspection_endpoint from discovery document", () => {
+    const config = mergeDiscoveryIntoProviderConfig(normalizeProviderConfig({}), {
+      issuer: "https://idp.example",
+      token_endpoint: "https://idp.example/token",
+      introspection_endpoint: "https://idp.example/introspect"
+    });
+    assert.equal(config.introspectionEndpoint, "https://idp.example/introspect");
+  });
+
+  it("builds a POST introspection request with token + token_type_hint and Basic auth", () => {
+    const req = buildIntrospectionRequest({
+      endpoint: "https://idp.example/introspect",
+      accessToken: "secret-access-token-value",
+      clientId: "client",
+      clientSecret: "secret",
+      tokenEndpointAuthMethod: "client_secret_basic"
+    });
+    assert.equal(req.method, "POST");
+    assert.equal(req.headers["content-type"], "application/x-www-form-urlencoded");
+    assert.match(req.headers.authorization, /^Basic /);
+    assert.match(req.body, /token=secret-access-token-value/);
+    assert.match(req.body, /token_type_hint=access_token/);
+    assert.doesNotMatch(req.redactedBody, /secret-access-token-value/);
+  });
+
+  it("renders Introspection success with active=true, scopes and audience", () => {
+    const html = renderWithIntrospection({
+      stepName: "introspection",
+      status: "success",
+      httpMethod: "POST",
+      endpoint: "https://idp.example/introspect",
+      httpStatus: 200,
+      requestData: { introspection_request: "sent", token_submitted: "access_token" },
+      responseData: {
+        introspection: "success",
+        active: "yes",
+        scopes: "openid, test.read",
+        audience: "client",
+        http_status: 200
+      },
+      rawRequestData: {
+        method: "POST",
+        url: "https://idp.example/introspect",
+        body: { token: "received / redacted", token_type_hint: "access_token" }
+      },
+      rawResponseData: {
+        status: 200,
+        ok: true,
+        body: {
+          active: true,
+          scope: "openid test.read",
+          client_id: "client",
+          aud: "client",
+          sub: "received / redacted",
+          iss: "https://idp.example",
+          exp: 1900000000,
+          iat: 1899996400,
+          token_type: "Bearer"
+        }
+      }
+    });
+
+    const section = extractIntrospectionSection(html);
+    assert.ok(section, "Introspection section should be present");
+    assert.match(section, /Introspection/);
+    assert.match(section, /The SP asks the authorization server to inspect the access token metadata\./);
+    assert.match(section, /Introspection request[\s\S]*>sent</);
+    assert.match(section, /Token submitted[\s\S]*access_token/);
+    assert.match(section, /Introspection<\/dt>[\s\S]*>success</);
+    assert.match(section, /Active[\s\S]*>yes</);
+    assert.match(section, /Scopes[\s\S]*openid, test\.read/);
+    assert.match(section, /Audience[\s\S]*client/);
+  });
+
+  it("renders Introspection success with active=false and not returned scopes/audience", () => {
+    const html = renderWithIntrospection({
+      stepName: "introspection",
+      status: "success",
+      httpMethod: "POST",
+      endpoint: "https://idp.example/introspect",
+      httpStatus: 200,
+      requestData: { introspection_request: "sent", token_submitted: "access_token" },
+      responseData: {
+        introspection: "success",
+        active: "no",
+        scopes: "not returned",
+        audience: "not returned",
+        http_status: 200
+      },
+      rawRequestData: { method: "POST", url: "https://idp.example/introspect", body: { token: "received / redacted", token_type_hint: "access_token" } },
+      rawResponseData: { status: 200, ok: true, body: { active: false } }
+    });
+
+    const section = extractIntrospectionSection(html);
+    assert.match(section, /Introspection<\/dt>[\s\S]*>success</);
+    assert.match(section, /Active[\s\S]*>no</);
+    assert.match(section, /Scopes[\s\S]*not returned/);
+    assert.match(section, /Audience[\s\S]*not returned/);
+  });
+
+  it("renders Introspection skipped when endpoint is missing", () => {
+    const html = renderWithIntrospection({
+      stepName: "introspection",
+      status: "skipped",
+      requestData: { introspection_request: "skipped", token_submitted: "not sent", skipped_reason: "introspection endpoint missing" },
+      responseData: {
+        introspection: "not available",
+        active: "not available",
+        scopes: "not available",
+        audience: "not available",
+        skipped_reason: "introspection endpoint missing"
+      },
+      rawRequestData: null,
+      rawResponseData: null
+    });
+
+    const section = extractIntrospectionSection(html);
+    assert.match(section, /Introspection request[\s\S]*>skipped</);
+    assert.match(section, /Token submitted[\s\S]*>not sent</);
+    assert.match(section, /Introspection<\/dt>[\s\S]*>not available</);
+    assert.match(section, /Active[\s\S]*>not available</);
+    assert.match(section, /Scopes[\s\S]*not available/);
+    assert.match(section, /Audience[\s\S]*not available/);
+  });
+
+  it("renders Introspection failed with sanitized error details", () => {
+    const html = renderWithIntrospection({
+      stepName: "introspection",
+      status: "error",
+      httpMethod: "POST",
+      endpoint: "https://idp.example/introspect",
+      httpStatus: 500,
+      requestData: { introspection_request: "sent", token_submitted: "access_token" },
+      responseData: {
+        introspection: "failed",
+        active: "not available",
+        scopes: "not available",
+        audience: "not available",
+        http_status: 500,
+        introspection_error: "server_error"
+      },
+      rawRequestData: { method: "POST", url: "https://idp.example/introspect", body: { token: "received / redacted", token_type_hint: "access_token" } },
+      rawResponseData: { status: 500, ok: false, body: {} },
+      errorData: { errorCode: "server_error", errorDescription: "Introspection endpoint did not return a successful response." }
+    });
+
+    const section = extractIntrospectionSection(html);
+    assert.match(section, /Introspection<\/dt>[\s\S]*>failed</);
+    assert.match(section, /Active[\s\S]*>not available</);
+    assert.match(section, /Scopes[\s\S]*not available/);
+    assert.match(section, /Audience[\s\S]*not available/);
+  });
+
+  it("never leaks the raw access token and keeps sub redacted in the introspection panel", () => {
+    const rawAccessToken = "eyJraWQiOiJrIn0.eyJzdWIiOiJ1c2VyIn0.signature";
+    const html = renderWithIntrospection({
+      stepName: "introspection",
+      status: "success",
+      httpMethod: "POST",
+      endpoint: "https://idp.example/introspect",
+      httpStatus: 200,
+      requestData: { introspection_request: "sent", token_submitted: "access_token" },
+      responseData: {
+        introspection: "success",
+        active: "yes",
+        scopes: "openid test.read",
+        audience: "client",
+        http_status: 200
+      },
+      rawRequestData: {
+        method: "POST",
+        url: "https://idp.example/introspect",
+        body: { token: "received / redacted", token_type_hint: "access_token" }
+      },
+      rawResponseData: {
+        status: 200,
+        ok: true,
+        body: {
+          active: true,
+          scope: "openid test.read",
+          sub: "received / redacted",
+          aud: "client"
+        }
+      }
+    });
+
+    assert.doesNotMatch(html, new RegExp(rawAccessToken.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.doesNotMatch(html, /eyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+/);
+
+    const section = extractIntrospectionSection(html);
+    const rawJson = section.match(/data-raw-title="Raw Introspection Request"[\s\S]*?data-raw-json="([^"]+)"/)?.[1];
+    assert.ok(rawJson, "Raw introspection request should be present");
+    const rawReq = JSON.parse(Buffer.from(rawJson, "base64").toString("utf8"));
+    assert.equal(rawReq.body.token, "received / redacted");
+
+    const rawRespJson = section.match(/data-raw-title="Raw Introspection Response"[\s\S]*?data-raw-json="([^"]+)"/)?.[1];
+    assert.ok(rawRespJson, "Raw introspection response should be present");
+    const rawResp = JSON.parse(Buffer.from(rawRespJson, "base64").toString("utf8"));
+    assert.equal(rawResp.body.sub, "received / redacted");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OIDC Introspection endpoint mapping — discovery → provider → runtime → config
+// ---------------------------------------------------------------------------
+
+describe("OIDC Introspection endpoint mapping", () => {
+  const DISCOVERY_DOC = {
+    issuer: "https://sso.eiffage.stage.memority.cloud/sso/v2/oauth2/eiffage",
+    authorization_endpoint: "https://sso.eiffage.stage.memority.cloud/sso/v2/oauth2/eiffage/auth",
+    token_endpoint: "https://sso.eiffage.stage.memority.cloud/sso/v2/oauth2/eiffage/token",
+    userinfo_endpoint: "https://sso.eiffage.stage.memority.cloud/sso/v2/oauth2/eiffage/userinfo",
+    introspection_endpoint: "https://sso.eiffage.stage.memority.cloud/sso/v2/oauth2/eiffage/introspect",
+    jwks_uri: "https://sso.eiffage.stage.memority.cloud/sso/v2/oauth2/eiffage/jwks"
+  };
+
+  it("normalizes introspectionEndpoint and preserves it across normalize cycles", () => {
+    const normalized = normalizeProviderConfig({
+      introspectionEndpoint: "https://idp.example/introspect"
+    });
+    assert.equal(normalized.introspectionEndpoint, "https://idp.example/introspect");
+
+    const renormalized = normalizeProviderConfig(normalized);
+    assert.equal(renormalized.introspectionEndpoint, "https://idp.example/introspect");
+  });
+
+  it("imports introspection_endpoint from the discovery document via mergeDiscoveryIntoProviderConfig", () => {
+    const merged = mergeDiscoveryIntoProviderConfig(normalizeProviderConfig({}), DISCOVERY_DOC);
+    assert.equal(
+      merged.introspectionEndpoint,
+      "https://sso.eiffage.stage.memority.cloud/sso/v2/oauth2/eiffage/introspect"
+    );
+  });
+
+  it("threads the introspection endpoint through buildEffectiveConfig", () => {
+    const provider = mergeDiscoveryIntoProviderConfig(normalizeProviderConfig({}), DISCOVERY_DOC);
+    const effective = buildEffectiveConfig({
+      providerConfig: provider,
+      serviceProvider: { id: "sp", name: "SP", clientId: "client", clientType: "confidential", scopes: "openid" },
+      clientSecret: "secret"
+    });
+    assert.equal(
+      effective.introspectionEndpoint,
+      "https://sso.eiffage.stage.memority.cloud/sso/v2/oauth2/eiffage/introspect"
+    );
+  });
+
+  it("keeps legacy provider configs working when introspection_endpoint is absent", () => {
+    const legacyDoc = { ...DISCOVERY_DOC };
+    delete legacyDoc.introspection_endpoint;
+
+    const merged = mergeDiscoveryIntoProviderConfig(normalizeProviderConfig({}), legacyDoc);
+    assert.equal(merged.introspectionEndpoint, "");
+
+    const effective = buildEffectiveConfig({
+      providerConfig: merged,
+      serviceProvider: { id: "sp", name: "SP", clientId: "client", clientType: "confidential", scopes: "openid" },
+      clientSecret: "secret"
+    });
+    assert.equal(effective.introspectionEndpoint, "");
+  });
+
+  it("preserves an existing introspectionEndpoint when a re-imported discovery omits the field", () => {
+    const initial = mergeDiscoveryIntoProviderConfig(normalizeProviderConfig({}), DISCOVERY_DOC);
+    const docWithoutIntrospection = { ...DISCOVERY_DOC };
+    delete docWithoutIntrospection.introspection_endpoint;
+
+    const reMerged = mergeDiscoveryIntoProviderConfig(initial, docWithoutIntrospection);
+    assert.equal(
+      reMerged.introspectionEndpoint,
+      "https://sso.eiffage.stage.memority.cloud/sso/v2/oauth2/eiffage/introspect"
+    );
   });
 });
 

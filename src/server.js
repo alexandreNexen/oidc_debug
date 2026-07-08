@@ -8,6 +8,7 @@ import {
   decodeJwt,
   buildCurlCommand,
   buildEffectiveConfig,
+  buildIntrospectionRequest,
   buildTokenExchangeRequest,
   buildUserInfoRequest,
   createProviderConfig,
@@ -737,6 +738,93 @@ function buildIdTokenAnalysisRaw(idToken = "", flow = null) {
   };
 }
 
+const ACCESS_TOKEN_PUBLIC_CLAIMS = new Set([
+  "iss", "aud", "exp", "iat", "nbf", "azp", "client_id", "scope", "scp",
+  "token_type", "tokentype", "typ", "realm", "jti", "auth_time"
+]);
+
+const ACCESS_TOKEN_REDACTED_CLAIMS = new Set([
+  "sub", "email", "email_verified", "name", "given_name", "family_name",
+  "middle_name", "nickname", "preferred_username", "phone", "phone_number",
+  "phone_number_verified", "address", "birthdate", "picture", "website",
+  "profile", "gender", "locale", "zoneinfo", "groups", "roles", "authorities",
+  "entitlements", "realm_access", "resource_access"
+]);
+
+function sanitizeAccessTokenHeader(header = {}) {
+  if (!header || typeof header !== "object" || Array.isArray(header)) return null;
+  return sanitizeDiagnosticData({
+    alg: header.alg || "",
+    kid: header.kid || "",
+    ...(header.typ ? { typ: header.typ } : {})
+  });
+}
+
+function sanitizeAccessTokenClaims(payload = {}) {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
+
+  const sanitized = {};
+  for (const [key, value] of Object.entries(payload)) {
+    const normalizedKey = String(key).toLowerCase();
+    if (ACCESS_TOKEN_REDACTED_CLAIMS.has(normalizedKey)) {
+      sanitized[key] = "received / redacted";
+    } else if (ACCESS_TOKEN_PUBLIC_CLAIMS.has(normalizedKey)) {
+      sanitized[key] = sanitizeDiagnosticData(value, key);
+    } else {
+      sanitized[key] = "received / redacted";
+    }
+  }
+  return sanitized;
+}
+
+function buildAccessTokenMetadata(token = "") {
+  if (!token || typeof token !== "string") {
+    return {
+      present: false,
+      format: "not_available",
+      header: null,
+      claims: null,
+      decode_error: "",
+      fingerprint: ""
+    };
+  }
+
+  const fingerprint = shortHash(token);
+  const parts = token.split(".");
+
+  if (parts.length !== 3) {
+    return {
+      present: true,
+      format: "opaque",
+      header: null,
+      claims: null,
+      decode_error: "",
+      fingerprint
+    };
+  }
+
+  const decoded = decodeJwt(token);
+  if (!decoded.isJwt) {
+    return {
+      present: true,
+      format: "unreadable",
+      header: null,
+      claims: null,
+      decode_error: "Access token has JWT shape but could not be decoded.",
+      fingerprint
+    };
+  }
+
+  return {
+    present: true,
+    format: "jwt",
+    header: sanitizeAccessTokenHeader(decoded.header),
+    claims: sanitizeAccessTokenClaims(decoded.payload),
+    decode_error: "",
+    fingerprint
+  };
+}
+
 function sanitizeRawRequest(request = null) {
   if (!request) {
     return null;
@@ -840,6 +928,10 @@ function sanitizeOidcRawRequestForStep(stepName, rawRequestData, step = {}) {
     return sanitizeUserInfoRequestRaw(rawRequestData);
   }
 
+  if (stepName === "introspection") {
+    return sanitizeIntrospectionRequestRaw(rawRequestData);
+  }
+
   return sanitizeRawRequest(rawRequestData);
 }
 
@@ -858,6 +950,10 @@ function sanitizeOidcRawResponseForStep(stepName, rawResponseData, step = {}) {
 
   if (stepName === "userinfo") {
     return sanitizeUserInfoResponseRaw(rawResponseData);
+  }
+
+  if (stepName === "introspection") {
+    return sanitizeIntrospectionResponseRaw(rawResponseData);
   }
 
   if (rawResponseData.body && typeof rawResponseData.body === "object") {
@@ -2683,6 +2779,7 @@ function buildOidcPageConfiguration() {
         authorizationEndpoint: envConfig.authorizationEndpoint || "",
         tokenEndpoint: envConfig.tokenEndpoint || "",
         userInfoEndpoint: envConfig.userInfoEndpoint || "",
+        introspectionEndpoint: envConfig.introspectionEndpoint || "",
         jwksUri: envConfig.jwksUri || "",
         scopesSupported: Array.isArray(envConfig.scopesSupported) ? envConfig.scopesSupported : [],
         responseTypesSupported: Array.isArray(envConfig.responseTypesSupported) ? envConfig.responseTypesSupported : [],
@@ -2865,6 +2962,7 @@ async function importDiscoveryMetadata(discoveryUrl) {
       authorizationEndpoint: typeof doc.authorization_endpoint === "string" ? doc.authorization_endpoint : "",
       tokenEndpoint: typeof doc.token_endpoint === "string" ? doc.token_endpoint : "",
       userInfoEndpoint: typeof doc.userinfo_endpoint === "string" ? doc.userinfo_endpoint : "",
+      introspectionEndpoint: typeof doc.introspection_endpoint === "string" ? doc.introspection_endpoint : "",
       jwksUri: typeof doc.jwks_uri === "string" ? doc.jwks_uri : "",
       scopesSupported: Array.isArray(doc.scopes_supported) ? doc.scopes_supported.filter((s) => typeof s === "string") : [],
       responseTypesSupported: Array.isArray(doc.response_types_supported) ? doc.response_types_supported.filter((s) => typeof s === "string") : [],
@@ -2966,7 +3064,7 @@ function buildCallbackStep({ flow, req, params, stateCheck }) {
 function buildTokenStep({ requestSnapshot, responseSnapshot, flow = null }) {
   const parsed = responseSnapshot.parsed || {};
   const idTokenClaims = decodeJwt(parsed.id_token || "");
-  const accessTokenClaims = decodeJwt(parsed.access_token || "");
+  const accessTokenMeta = buildAccessTokenMetadata(parsed.access_token || "");
   const ok = Boolean(responseSnapshot.ok && !parsed.error && !responseSnapshot.error);
   const authHeader = requestSnapshot.headers?.authorization || "";
   const clientAuthenticationMethod = /^basic\s+/i.test(authHeader) ? "client_secret_basic" : "none";
@@ -2994,7 +3092,12 @@ function buildTokenStep({ requestSnapshot, responseSnapshot, flow = null }) {
       token_error: parsed.error || responseSnapshot.error || "none",
       error_description: parsed.error_description || "",
       id_token_claims: idTokenClaims.isJwt ? selectedClaims(idTokenClaims.payload) : {},
-      access_token_claims: accessTokenClaims.isJwt ? selectedClaims(accessTokenClaims.payload) : {},
+      access_token_present: accessTokenMeta.present,
+      access_token_format: accessTokenMeta.format,
+      access_token_header: accessTokenMeta.header,
+      access_token_claims: accessTokenMeta.claims,
+      access_token_decode_error: accessTokenMeta.decode_error,
+      access_token_fingerprint: accessTokenMeta.fingerprint,
       id_token_diagnostics: buildIdTokenDiagnostics(parsed.id_token || "", {
         expectedIssuer: flow?.runtime?.provider?.issuer || "",
         expectedAudience: flow?.runtime?.clientId || "",
@@ -3081,6 +3184,135 @@ function buildUserInfoStep({ requestSnapshot = null, responseSnapshot = null, sk
           errorCode: sanitizeDiagnosticError(parsed.error || responseSnapshot.error || "userinfo_failed"),
           errorDescription: sanitizeDiagnosticError(parsed.error_description || responseSnapshot.error || "UserInfo endpoint did not return a successful response."),
           diagnostics: responseSnapshot.diagnostics || null
+        },
+    completedAt: new Date().toISOString()
+  };
+}
+
+const INTROSPECTION_SAFE_FIELDS = ["active", "scope", "client_id", "exp", "iat", "iss", "aud", "token_type"];
+
+function sanitizeIntrospectionRequestRaw(request = null) {
+  if (!request) return null;
+  const contentType = request.headers?.["content-type"] || request.headers?.["Content-Type"] || "";
+  const parsedBody = parseSnapshotBody(request.body || "", contentType) || request.params || {};
+
+  return {
+    method: request.method || "POST",
+    url: redactDiagnosticUrl(request.url || ""),
+    headers: usefulSanitizedHeaders(request.headers || {}),
+    body: {
+      token: "received / redacted",
+      token_type_hint: parsedBody.token_type_hint || "access_token",
+      ...(parsedBody.client_id ? { client_id: sanitizeDiagnosticData(parsedBody.client_id, "client_id") } : {})
+    }
+  };
+}
+
+function sanitizeIntrospectionResponseRaw(response = null) {
+  if (!response) return null;
+  const parsed = response.parsed || parseSnapshotBody(response.body || "", response.headers?.["content-type"] || "") || {};
+  const safeBody = {};
+  for (const field of INTROSPECTION_SAFE_FIELDS) {
+    if (parsed[field] !== undefined && parsed[field] !== null && parsed[field] !== "") {
+      safeBody[field] = sanitizeDiagnosticData(parsed[field], field);
+    }
+  }
+  if (parsed.sub !== undefined && parsed.sub !== null && parsed.sub !== "") {
+    safeBody.sub = "received / redacted";
+  }
+
+  return {
+    status: response.status ?? 0,
+    ok: Boolean(response.ok),
+    headers: usefulSanitizedHeaders(response.headers || {}),
+    body: safeBody,
+    ...(parsed.error ? { error: sanitizeDiagnosticError(parsed.error) } : {}),
+    ...(parsed.error_description ? { error_description: sanitizeDiagnosticError(parsed.error_description) } : {}),
+    ...(response.error ? { fetch_error: sanitizeDiagnosticError(response.error) } : {})
+  };
+}
+
+function introspectionScopesSummary(scope) {
+  if (scope === undefined || scope === null || scope === "") return "not returned";
+  return String(scope).split(/\s+/).filter(Boolean).join(", ") || "not returned";
+}
+
+function introspectionAudienceSummary(aud) {
+  if (aud === undefined || aud === null || aud === "") return "not returned";
+  if (Array.isArray(aud)) return aud.filter(Boolean).map(String).join(", ") || "not returned";
+  return String(aud);
+}
+
+function buildIntrospectionStep({ requestSnapshot = null, responseSnapshot = null, skippedReason = "" }) {
+  if (skippedReason) {
+    return {
+      stepName: "introspection",
+      status: "skipped",
+      httpMethod: "POST",
+      endpoint: requestSnapshot?.url || "",
+      httpStatus: null,
+      requestData: {
+        introspection_request: "skipped",
+        token_submitted: "not sent",
+        skipped_reason: skippedReason
+      },
+      responseData: {
+        introspection: "not available",
+        active: "not available",
+        scopes: "not available",
+        audience: "not available",
+        skipped_reason: skippedReason
+      },
+      rawRequestData: null,
+      rawResponseData: null,
+      rawRequestNature: "Skipped",
+      rawResponseNature: "Skipped",
+      errorData: null,
+      completedAt: new Date().toISOString()
+    };
+  }
+
+  const parsed = responseSnapshot?.parsed || {};
+  const ok = Boolean(responseSnapshot?.ok && !parsed.error && !responseSnapshot?.error);
+  const sanitizedRequestRaw = sanitizeIntrospectionRequestRaw(requestSnapshot);
+  const sanitizedResponseRaw = sanitizeIntrospectionResponseRaw(responseSnapshot);
+
+  const active = parsed.active === true ? "yes" : parsed.active === false ? "no" : "not available";
+  const scopes = ok && parsed.active === true ? introspectionScopesSummary(parsed.scope) : "not returned";
+  const audience = ok && parsed.active === true ? introspectionAudienceSummary(parsed.aud) : "not returned";
+
+  const introspectionLabel = ok ? "success" : "failed";
+
+  return {
+    stepName: "introspection",
+    status: ok ? "success" : "error",
+    httpMethod: "POST",
+    endpoint: requestSnapshot?.url || "",
+    httpStatus: responseSnapshot?.status || 0,
+    requestData: {
+      introspection_request: "sent",
+      token_submitted: "access_token"
+    },
+    responseData: {
+      introspection: introspectionLabel,
+      active: ok ? active : "not available",
+      scopes: ok ? scopes : "not available",
+      audience: ok ? audience : "not available",
+      http_status: responseSnapshot?.status ?? 0,
+      ...(parsed.error ? { introspection_error: sanitizeDiagnosticError(parsed.error) } : {}),
+      ...(parsed.error_description ? { error_description: sanitizeDiagnosticError(parsed.error_description) } : {}),
+      ...(responseSnapshot?.error ? { fetch_error: sanitizeDiagnosticError(responseSnapshot.error) } : {})
+    },
+    rawRequestData: sanitizedRequestRaw,
+    rawResponseData: sanitizedResponseRaw,
+    rawRequestNature: "Real outbound HTTP request",
+    rawResponseNature: "Real inbound HTTP response",
+    errorData: ok
+      ? null
+      : {
+          errorCode: sanitizeDiagnosticError(parsed.error || responseSnapshot?.error || "introspection_failed"),
+          errorDescription: sanitizeDiagnosticError(parsed.error_description || responseSnapshot?.error || "Introspection endpoint did not return a successful response."),
+          diagnostics: responseSnapshot?.diagnostics || null
         },
     completedAt: new Date().toISOString()
   };
@@ -3173,6 +3405,7 @@ async function startNewUiFlow(session, serviceProviderId) {
         authorizationEndpoint: runConfig.provider.authorizationEndpoint,
         tokenEndpoint: runConfig.provider.tokenEndpoint,
         userInfoEndpoint: runConfig.provider.userInfoEndpoint,
+        introspectionEndpoint: runConfig.provider.introspectionEndpoint || "",
         jwksUri: runConfig.provider.jwksUri,
         redirectUri: runConfig.provider.redirectUri,
         scopesSupported: runConfig.provider.scopesSupported || [],
@@ -3182,6 +3415,7 @@ async function startNewUiFlow(session, serviceProviderId) {
       authorizationEndpoint: runConfig.config.authorizationEndpoint,
       tokenEndpoint: runConfig.config.tokenEndpoint,
       userInfoEndpoint: runConfig.config.userInfoEndpoint,
+      introspectionEndpoint: runConfig.config.introspectionEndpoint || "",
       redirectUri: runConfig.config.redirectUri,
       tokenEndpointAuthMethod: prepared.config.tokenEndpointAuthMethod,
       expectedState: prepared.runtime.state,
@@ -3303,6 +3537,37 @@ async function processNewUiCallback({ req, flow, params }) {
 
     const accessToken = responseSnapshot.parsed?.access_token || "";
     const userInfoEndpoint = effectiveConfig.userInfoEndpoint || "";
+    const introspectionEndpoint = effectiveConfig.introspectionEndpoint || "";
+    const introspectionAuthOk = effectiveConfig.tokenEndpointAuthMethod !== "client_secret_basic"
+      || Boolean(effectiveConfig.clientSecret);
+
+    if (!accessToken || !introspectionEndpoint || !introspectionAuthOk) {
+      const introspectionSkippedReason = !accessToken
+        ? "access_token missing"
+        : !introspectionEndpoint
+          ? "introspection endpoint missing"
+          : "client authentication not available";
+      flowService.addFlowStep(flow.id, buildIntrospectionStep({ skippedReason: introspectionSkippedReason }));
+    } else {
+      try {
+        const introspectionRequest = buildIntrospectionRequest({
+          endpoint: introspectionEndpoint,
+          accessToken,
+          clientId: effectiveConfig.clientId,
+          clientSecret: effectiveConfig.clientSecret,
+          tokenEndpointAuthMethod: effectiveConfig.tokenEndpointAuthMethod
+        });
+        const introspectionResponse = await executeHttp(introspectionRequest);
+        flowService.addFlowStep(flow.id, buildIntrospectionStep({
+          requestSnapshot: introspectionRequest,
+          responseSnapshot: introspectionResponse
+        }));
+      } catch (introspectionError) {
+        flowService.addFlowStep(flow.id, buildIntrospectionStep({
+          skippedReason: sanitizeDiagnosticError(introspectionError?.message || "introspection request could not be built")
+        }));
+      }
+    }
 
     if (!accessToken || !userInfoEndpoint) {
       const skippedReason = !accessToken ? "access_token missing" : "UserInfo endpoint missing";

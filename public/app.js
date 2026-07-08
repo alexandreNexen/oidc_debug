@@ -168,6 +168,7 @@ function updateDiscoveryEndpoints(section, env) {
     ["authorizationEndpoint", env.authorizationEndpoint],
     ["tokenEndpoint", env.tokenEndpoint],
     ["userInfoEndpoint", env.userInfoEndpoint],
+    ["introspectionEndpoint", env.introspectionEndpoint],
     ["jwksUri", env.jwksUri]
   ];
 

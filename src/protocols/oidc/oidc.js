@@ -54,6 +54,7 @@ export function createProviderConfig() {
     authorizationEndpoint: "",
     tokenEndpoint: "",
     userInfoEndpoint: "",
+    introspectionEndpoint: "",
     jwksUri: "",
     redirectUri: FIXED_REDIRECT_URI,
     scopesSupported: [],
@@ -72,6 +73,7 @@ export function normalizeProviderConfig(input = {}) {
     authorizationEndpoint: clean(input.authorizationEndpoint, defaults.authorizationEndpoint),
     tokenEndpoint: clean(input.tokenEndpoint, defaults.tokenEndpoint),
     userInfoEndpoint: clean(input.userInfoEndpoint, defaults.userInfoEndpoint),
+    introspectionEndpoint: clean(input.introspectionEndpoint, defaults.introspectionEndpoint),
     jwksUri: clean(input.jwksUri, defaults.jwksUri),
     redirectUri: clean(input.redirectUri, defaults.redirectUri),
     scopesSupported: cleanList(input.scopesSupported ?? input.scopes_supported),
@@ -99,6 +101,7 @@ export function mergeDiscoveryIntoProviderConfig(config, discovery = {}) {
     authorizationEndpoint: clean(discovery.authorization_endpoint, config.authorizationEndpoint),
     tokenEndpoint: clean(discovery.token_endpoint, config.tokenEndpoint),
     userInfoEndpoint: clean(discovery.userinfo_endpoint, config.userInfoEndpoint),
+    introspectionEndpoint: clean(discovery.introspection_endpoint, config.introspectionEndpoint),
     jwksUri: clean(discovery.jwks_uri, config.jwksUri),
     scopesSupported: cleanList(discovery.scopes_supported),
     responseTypesSupported: cleanList(discovery.response_types_supported),
@@ -118,6 +121,7 @@ export function buildEffectiveConfig({ providerConfig, serviceProvider, clientSe
     authorizationEndpoint: normalizedProvider.authorizationEndpoint,
     tokenEndpoint: normalizedProvider.tokenEndpoint,
     userInfoEndpoint: normalizedProvider.userInfoEndpoint,
+    introspectionEndpoint: normalizedProvider.introspectionEndpoint,
     jwksUri: normalizedProvider.jwksUri,
     scopesSupported: normalizedProvider.scopesSupported,
     responseTypesSupported: normalizedProvider.responseTypesSupported,
@@ -298,6 +302,59 @@ export function buildUserInfoRequest({ endpoint, accessToken }) {
       url: endpoint,
       method: "GET",
       headers
+    })
+  };
+}
+
+export function buildIntrospectionRequest({
+  endpoint,
+  accessToken,
+  clientId = "",
+  clientSecret = "",
+  tokenEndpointAuthMethod = "none"
+}) {
+  if (!endpoint) {
+    throw new Error("Introspection endpoint missing.");
+  }
+
+  if (!accessToken) {
+    throw new Error("Missing access token.");
+  }
+
+  const headers = {
+    "content-type": "application/x-www-form-urlencoded",
+    accept: "application/json"
+  };
+
+  const bodyParams = {
+    token: accessToken,
+    token_type_hint: "access_token"
+  };
+
+  if (tokenEndpointAuthMethod === "client_secret_basic") {
+    if (!clientId || !clientSecret) {
+      throw new Error("client_id and client_secret required for `client_secret_basic`.");
+    }
+    const basic = Buffer.from(`${clientId}:${clientSecret}`, "utf8").toString("base64");
+    headers.authorization = `Basic ${basic}`;
+  } else if (clientId) {
+    bodyParams.client_id = clientId;
+  }
+
+  const body = serializeForm(bodyParams);
+
+  return {
+    url: endpoint,
+    method: "POST",
+    headers,
+    body,
+    redactedBody: redactBodyText(body, headers["content-type"]),
+    params: bodyParams,
+    curl: buildCurlCommand({
+      url: endpoint,
+      method: "POST",
+      headers,
+      body
     })
   };
 }

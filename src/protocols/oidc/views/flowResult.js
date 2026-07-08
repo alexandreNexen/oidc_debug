@@ -32,6 +32,7 @@ const STEP_TO_SECTION = {
   authorize: "Authorization",
   callback: "Authorization",
   token: "Token exchange",
+  introspection: "Introspection",
   userinfo: "UserInfo"
 };
 

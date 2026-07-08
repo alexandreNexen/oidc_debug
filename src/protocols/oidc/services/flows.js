@@ -1,4 +1,4 @@
-const STEP_ORDER = ["authorize", "callback", "token", "userinfo"];
+const STEP_ORDER = ["authorize", "callback", "token", "introspection", "userinfo"];
 
 function nowIso() {
   return new Date().toISOString();

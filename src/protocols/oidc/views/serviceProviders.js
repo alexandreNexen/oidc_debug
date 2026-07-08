@@ -175,6 +175,7 @@ function renderEnvironmentPanel(env) {
             ${renderEndpointRow("Authorization endpoint", env.authorizationEndpoint, "authorizationEndpoint")}
             ${renderEndpointRow("Token endpoint", env.tokenEndpoint, "tokenEndpoint")}
             ${renderEndpointRow("UserInfo endpoint", env.userInfoEndpoint, "userInfoEndpoint")}
+            ${renderEndpointRow("Introspection endpoint", env.introspectionEndpoint, "introspectionEndpoint")}
             ${renderEndpointRow("JWKS URI", env.jwksUri, "jwksUri")}
           </dl>
           ${renderCapabilitiesSection(env)}

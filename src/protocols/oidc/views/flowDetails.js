@@ -17,10 +17,11 @@ function encodeRawData(value) {
 
 // ---- Status badge helpers ----
 
-const BADGE_SUCCESS = new Set(["yes", "received", "present", "sent", "valid", "success", "match", "ok", "received / redacted", "prepared", "available", "received and decoded", "readable"]);
+const BADGE_SUCCESS = new Set(["yes", "received", "present", "sent", "valid", "success", "match", "ok", "received / redacted", "prepared", "available", "received and decoded", "readable", "passed", "jwt"]);
 const BADGE_ERROR = new Set(["no", "missing", "failed", "mismatch", "error", "failure", "invalid", "expired"]);
 const BADGE_NEUTRAL = new Set(["not implemented", "not checked", "not extracted", "skipped", "none",
-  "disabled", "not sent", "pending", "not performed", "not available", "unavailable", "incomplete", "not_checked"]);
+  "disabled", "not sent", "pending", "not performed", "not available", "unavailable", "incomplete", "not_checked",
+  "not applicable", "not evaluated", "informational", "partial", "opaque", "unreadable"]);
 
 const PERSONAL_CLAIMS = new Set(["email", "name", "given_name", "family_name", "middle_name", "nickname", "preferred_username", "phone_number", "address", "birthdate", "locale", "zoneinfo", "picture", "website", "profile", "nonce"]);
 const COLLECTION_CLAIMS = new Set(["roles", "role", "groups", "group", "authorities", "entitlements", "realm_access", "resource_access"]);
@@ -156,16 +157,48 @@ function idTokenClaimEntries(tokenStep = {}) {
   });
 }
 
-function userInfoClaimEntries(userInfoStep = {}) {
-  const claims = userInfoStep.rawResponseData?.body?.claims;
+function accessTokenClaimEntries(tokenStep = {}) {
+  const claims = tokenStep.responseData?.access_token_claims;
   if (claims && typeof claims === "object") return claimEntriesFromObject(claims);
+  return [];
+}
 
-  const receivedClaims = userInfoStep.responseData?.received_claims;
-  if (Array.isArray(receivedClaims) && receivedClaims.length > 0) {
-    return receivedClaims.map((claim) => [claim, claim === "sub" ? userInfoStep.responseData?.subject || "received / redacted" : "received / redacted"]);
+function hasAccessTokenMetadata(tokenStep = {}) {
+  const resp = tokenStep.responseData || {};
+  return resp.access_token_format !== undefined
+    || resp.access_token_present !== undefined
+    || resp.access_token_decode_error !== undefined;
+}
+
+function accessTokenDiagnostics(tokenStep = {}) {
+  const resp = tokenStep.responseData || {};
+
+  if (hasAccessTokenMetadata(tokenStep)) {
+    const format = resp.access_token_format || "not_available";
+    const present = Boolean(resp.access_token_present);
+    return {
+      legacy: false,
+      present,
+      format,
+      decodeError: resp.access_token_decode_error || ""
+    };
   }
 
-  return userInfoStep.responseData?.subject ? [["sub", userInfoStep.responseData.subject]] : [];
+  const presence = resp.access_token;
+  if (!tokenStep || (presence === undefined && resp.access_token_claims === undefined)) {
+    return { legacy: true, present: false, format: "not_available", decodeError: "" };
+  }
+
+  return { legacy: true, present: presence === "received", format: "not_available", decodeError: "" };
+}
+
+function accessTokenFormatLabel(format) {
+  switch (format) {
+    case "jwt": return "JWT";
+    case "opaque": return "opaque";
+    case "unreadable": return "unreadable";
+    default: return "not available";
+  }
 }
 
 function formatClaimValue(claim, value) {
@@ -283,18 +316,118 @@ function cleanIdTokenAnalysisRaw(rawData) {
   return cleaned;
 }
 
+function normalizeCheckValue(value) {
+  const str = String(value || "").toLowerCase();
+  if (!str) return "not available";
+  if (str === "not_checked" || str === "missing" || str === "unavailable" || str === "incomplete") return "not available";
+  return str;
+}
+
 function idTokenAnalysisChecks(rawData = {}, diagnostics = {}) {
   const rawValidation = rawData?.checks || rawData?.validation || {};
   const checks = {
-    issuer: rawValidation.issuer || diagnostics.issuer_validation || "",
-    audience: rawValidation.audience || diagnostics.audience_validation || "",
-    expiration: rawValidation.expiration || diagnostics.expiration_validation || "",
-    nonce: rawValidation.nonce || diagnostics.nonce_validation || ""
+    issuer: normalizeCheckValue(rawValidation.issuer || diagnostics.issuer_validation),
+    audience: normalizeCheckValue(rawValidation.audience || diagnostics.audience_validation),
+    expiration: normalizeCheckValue(rawValidation.expiration || diagnostics.expiration_validation),
+    nonce: normalizeCheckValue(rawValidation.nonce || diagnostics.nonce_validation)
   };
   const rawResult = rawValidation.result || rawValidation.overall || diagnostics.overall_validation || "";
+  const computed = rawResult && rawResult !== "incomplete" ? rawResult : oidcChecksResult({
+    issuer: checks.issuer === "not available" ? "not_checked" : checks.issuer,
+    audience: checks.audience === "not available" ? "not_checked" : checks.audience,
+    expiration: checks.expiration === "not available" ? "not_checked" : checks.expiration,
+    nonce: checks.nonce === "not available" ? "not_checked" : checks.nonce
+  });
   return {
     ...checks,
-    result: rawResult && rawResult !== "incomplete" ? rawResult : oidcChecksResult(checks)
+    result: computed === "not_checked" ? "not available" : computed
+  };
+}
+
+function evaluateAccessTokenIssuer(issuer, expectedIssuer) {
+  if (!issuer) return "not available";
+  if (!expectedIssuer) return "not available";
+  return String(issuer) === String(expectedIssuer) ? "valid" : "invalid";
+}
+
+function evaluateAccessTokenAudience(audience, expectedAudience) {
+  const values = Array.isArray(audience) ? audience : [audience].filter(Boolean);
+  if (values.length === 0) return "not available";
+  if (!expectedAudience) return "not evaluated";
+  return values.map(String).includes(String(expectedAudience)) ? "valid" : "invalid";
+}
+
+function evaluateAccessTokenExpiration(exp) {
+  if (exp === null || exp === undefined || exp === "") return "not available";
+  const epochSeconds = Number(exp);
+  if (!Number.isFinite(epochSeconds)) return "not available";
+  return epochSeconds * 1000 > Date.now() ? "valid" : "expired";
+}
+
+function accessTokenResult(format, checks) {
+  if (format === "absent") return "not available";
+  if (format === "opaque") return "informational";
+
+  const evaluable = [checks.issuer, checks.audience, checks.expiration];
+  if (evaluable.some((value) => value === "invalid" || value === "expired")) return "failed";
+
+  const validCount = evaluable.filter((value) => value === "valid").length;
+  if (validCount === evaluable.length) return "passed";
+  if (validCount > 0) return "partial";
+  return "informational";
+}
+
+function accessTokenAnalysisChecks(tokenStep = {}, flow = {}) {
+  const diag = accessTokenDiagnostics(tokenStep);
+
+  if (!diag.present) {
+    return {
+      ...diag,
+      issuer: "not available",
+      audience: "not available",
+      expiration: "not available",
+      nonce: "not applicable",
+      result: "not available"
+    };
+  }
+
+  if (diag.format === "opaque" || diag.format === "unreadable") {
+    return {
+      ...diag,
+      issuer: "not available",
+      audience: "not available",
+      expiration: "not available",
+      nonce: "not applicable",
+      result: "informational"
+    };
+  }
+
+  if (diag.format !== "jwt") {
+    return {
+      ...diag,
+      issuer: "not available",
+      audience: "not available",
+      expiration: "not available",
+      nonce: "not applicable",
+      result: "not available"
+    };
+  }
+
+  const claims = tokenStep.responseData?.access_token_claims || {};
+  const expectedIssuer = flow?.runtime?.provider?.issuer || "";
+  const expectedAudience = flow?.runtime?.clientId || "";
+
+  const checks = {
+    issuer: evaluateAccessTokenIssuer(claims.iss, expectedIssuer),
+    audience: evaluateAccessTokenAudience(claims.aud, expectedAudience),
+    expiration: evaluateAccessTokenExpiration(claims.exp),
+    nonce: claims.nonce ? "valid" : "not applicable"
+  };
+
+  return {
+    ...diag,
+    ...checks,
+    result: accessTokenResult(diag.format, checks)
   };
 }
 
@@ -364,6 +497,7 @@ function computeSectionTabs(steps) {
   const auth = byName.get("authorize");
   const cb = byName.get("callback");
   const token = byName.get("token");
+  const introspection = byName.get("introspection");
   const ui = byName.get("userinfo");
 
   let authStatus = "pending";
@@ -372,6 +506,7 @@ function computeSectionTabs(steps) {
   else if (auth?.status === "success") authStatus = "running";
 
   const tokenStatus = token?.status || "pending";
+  const introspectionStatus = introspection?.status || "pending";
   const uiStatus = ui?.status || "pending";
 
   const idTokenStatus = token?.status === "error" ? "error"
@@ -381,8 +516,9 @@ function computeSectionTabs(steps) {
   return [
     { id: "authorization", label: "Authorization", num: 1, status: authStatus },
     { id: "token-exchange", label: "Token exchange", num: 2, status: tokenStatus },
-    { id: "userinfo", label: "UserInfo", num: 3, status: uiStatus },
-    { id: "scopes-claims", label: "Scopes & Claims", num: 4, status: idTokenStatus }
+    { id: "introspection", label: "Introspection", num: 3, status: introspectionStatus },
+    { id: "userinfo", label: "UserInfo", num: 4, status: uiStatus },
+    { id: "scopes-claims", label: "Scopes & Claims", num: 5, status: idTokenStatus }
   ];
 }
 
@@ -476,7 +612,63 @@ function renderTokenExchange(steps) {
     </section>`;
 }
 
-// ---- Section 3: UserInfo ----
+// ---- Section 3: Introspection ----
+
+function renderIntrospection(steps) {
+  const intro = steps.find((s) => s.stepName === "introspection");
+  const resp = intro?.responseData || {};
+  const notReached = !intro || intro.status === "pending";
+  const skipped = intro?.status === "skipped";
+  const errored = intro?.status === "error";
+
+  const requestContent = notReached
+    ? `<p class="muted">Not reached.</p>`
+    : skipped
+      ? dl([
+          row("Introspection request", badge("skipped")),
+          row("Token submitted", badge("not sent")),
+          resp.skipped_reason ? row("Reason", plain(resp.skipped_reason)) : null
+        ])
+      : dl([
+          row("Introspection request", badge("sent")),
+          row("Token submitted", plain("access_token"))
+        ]);
+
+  const introspectionLabel = skipped
+    ? "not available"
+    : errored
+      ? "failed"
+      : resp.introspection || "not available";
+
+  const responseContent = notReached
+    ? `<p class="muted">Not reached.</p>`
+    : dl([
+        row("Introspection", badge(introspectionLabel)),
+        row("Active", badge(resp.active || "not available")),
+        row("Scopes", plain(resp.scopes || "not available")),
+        row("Audience", plain(resp.audience || "not available")),
+        errored && resp.introspection_error
+          ? row("Error", statusWithDetail(resp.introspection_error, resp.error_description))
+          : null
+      ]);
+
+  return `
+    <section class="flow-section" data-section-panel="introspection">
+      ${sectionHead("Introspection", "The SP asks the authorization server to inspect the access token metadata.")}
+      <div class="exchange-grid">
+        ${exchangePanel("Request",
+          rawBtn("Raw Introspection Request", "introspection", "request", intro?.rawRequestData),
+          requestContent,
+          null)}
+        ${exchangePanel("Response",
+          rawBtn("Raw Introspection Response", "introspection", "response", intro?.rawResponseData),
+          responseContent,
+          intro?.errorData?.errorDescription)}
+      </div>
+    </section>`;
+}
+
+// ---- Section 4: UserInfo ----
 
 function renderUserInfo(steps) {
   const ui = steps.find((s) => s.stepName === "userinfo");
@@ -537,67 +729,104 @@ function renderScopesAndClaims(flow, steps) {
   const token = steps.find((s) => s.stepName === "token");
   const diag = token?.responseData?.id_token_diagnostics;
   const analysisRaw = cleanIdTokenAnalysisRaw(token?.rawAnalysisData || null);
-  const rawButton = rawBtn("Raw ID Token Analysis", "token", "response", analysisRaw);
-  const userInfo = steps.find((s) => s.stepName === "userinfo");
-  const userInfoRawButton = rawBtn("Raw UserInfo Response", "userinfo", "response", userInfo?.rawResponseData);
+  const idTokenRawButton = rawBtn("Raw ID Token Analysis", "token", "response", analysisRaw);
   const scopes = scopesFromFlow(flow, steps);
   const idTokenClaims = idTokenClaimEntries(token);
-  const userInfoClaims = userInfoClaimEntries(userInfo);
-  const analysisChecks = idTokenAnalysisChecks(analysisRaw, diag);
+  const idTokenChecks = idTokenAnalysisChecks(analysisRaw, diag);
+  const accessChecks = accessTokenAnalysisChecks(token, flow);
+  const accessClaims = accessTokenClaimEntries(token);
+
   const idTokenState = !token || token.status === "pending"
     ? "Not reached."
     : !diag || diag.id_token_received === "no"
       ? "No ID token received."
       : "";
-  const userInfoState = !userInfo || userInfo.status === "pending"
-    ? "Not requested."
-    : userInfo.status === "skipped"
-      ? "Not requested."
-      : userInfo.status === "error"
-        ? "Request failed."
-        : "";
+
+  const accessReceivedLabel = accessChecks.present ? "yes" : "no";
+  const accessFormatLabel = accessTokenFormatLabel(accessChecks.format);
+
+  const accessTokenSummary = !token || token.status === "pending"
+    ? `<p class="muted">Not reached.</p>`
+    : accessChecks.legacy
+      ? `<p class="muted">Access token metadata is not available for this flow. Run a new flow to capture access token diagnostics.</p>`
+      : dl([
+          row("Received", badge(accessReceivedLabel)),
+          row("Format", badge(accessFormatLabel)),
+          row("Issuer", badge(accessChecks.issuer)),
+          row("Audience", badge(accessChecks.audience)),
+          row("Expiration", badge(accessChecks.expiration)),
+          row("Nonce", badge(accessChecks.nonce)),
+          row("Result", badge(accessChecks.result)),
+          accessChecks.decodeError ? row("Decode error", plain(accessChecks.decodeError)) : null
+        ]);
+
+  let accessTokenClaimsBody;
+  if (!token || token.status === "pending") {
+    accessTokenClaimsBody = `<p class="muted">Not reached.</p>`;
+  } else if (accessChecks.legacy) {
+    accessTokenClaimsBody = `<p class="muted">Access token metadata is not available for this flow. Run a new flow to capture access token diagnostics.</p>`;
+  } else if (!accessChecks.present) {
+    accessTokenClaimsBody = `<p class="muted">No access token received.</p>`;
+  } else if (accessChecks.format === "opaque") {
+    accessTokenClaimsBody = `<p class="muted">Access token received, but it is opaque and cannot be decoded client-side.</p>`;
+  } else if (accessChecks.format === "unreadable") {
+    accessTokenClaimsBody = `<p class="muted">Access token received, but it could not be decoded as a JWT.</p>`;
+  } else if (accessChecks.format === "jwt") {
+    accessTokenClaimsBody = claimTable(accessClaims, "Access token decoded as JWT, but no claims were extracted.");
+  } else {
+    accessTokenClaimsBody = `<p class="muted">No decodable access token claims available.</p>`;
+  }
 
   return `
     <section class="flow-section" data-section-panel="scopes-claims">
-      ${sectionHead("Scopes & Claims", "Scopes are what the SP requested. Claims are what the IdP actually returned in the ID Token and UserInfo response.")}
-      <div class="analysis-grid">
+      ${sectionHead("Scopes & Claims", "Scopes are what the SP requested. Claims are what the IdP actually returned in the ID Token and the Access Token.")}
+      <div class="scopes-claims-stack">
         <article class="flow-detail-panel">
           <header>
-            <h3>Scopes demandés</h3>
+            <h3>Requested Scopes</h3>
           </header>
           ${scopesList(scopes)}
         </article>
+
         <article class="flow-detail-panel">
           <header>
             <h3>ID Token Analysis</h3>
           </header>
-          ${idTokenState
-            ? `<p class="muted">${escapeHtml(idTokenState)}</p>`
-            : dl([
-                row("Issuer", badge(analysisChecks.issuer)),
-                row("Audience", badge(analysisChecks.audience)),
-                row("Expiration", badge(analysisChecks.expiration)),
-                row("Nonce", badge(analysisChecks.nonce)),
-                row("Result", badge(analysisChecks.result))
-              ])}
+          <div class="flow-detail-panel__subsection">
+            <h4 class="flow-detail-panel__subtitle">Validation summary</h4>
+            ${idTokenState
+              ? `<p class="muted">${escapeHtml(idTokenState)}</p>`
+              : dl([
+                  row("Issuer", badge(idTokenChecks.issuer)),
+                  row("Audience", badge(idTokenChecks.audience)),
+                  row("Expiration", badge(idTokenChecks.expiration)),
+                  row("Nonce", badge(idTokenChecks.nonce)),
+                  row("Result", badge(idTokenChecks.result))
+                ])}
+          </div>
+          <div class="flow-detail-panel__subsection">
+            <div class="flow-detail-panel__subheader">
+              <h4 class="flow-detail-panel__subtitle">ID Token Claims</h4>
+              ${idTokenRawButton}
+            </div>
+            ${idTokenState
+              ? `<p class="muted">${escapeHtml(idTokenState)}</p>`
+              : claimTable(idTokenClaims, "No readable ID Token claims.")}
+          </div>
         </article>
+
         <article class="flow-detail-panel">
           <header>
-            <h3>Claims reçus dans l'ID Token</h3>
-            ${rawButton}
+            <h3>Access Token Analysis</h3>
           </header>
-          ${idTokenState
-            ? `<p class="muted">${escapeHtml(idTokenState)}</p>`
-            : claimTable(idTokenClaims, "No readable ID Token claims.")}
-        </article>
-        <article class="flow-detail-panel">
-          <header>
-            <h3>Claims reçus dans UserInfo</h3>
-            ${userInfoRawButton}
-          </header>
-          ${userInfoState
-            ? `<p class="muted">${escapeHtml(userInfoState)}</p>`
-            : claimTable(userInfoClaims, "No readable UserInfo claims.")}
+          <div class="flow-detail-panel__subsection">
+            <h4 class="flow-detail-panel__subtitle">Validation summary</h4>
+            ${accessTokenSummary}
+          </div>
+          <div class="flow-detail-panel__subsection">
+            <h4 class="flow-detail-panel__subtitle">Access Token Claims</h4>
+            ${accessTokenClaimsBody}
+          </div>
         </article>
       </div>
     </section>`;
@@ -670,6 +899,7 @@ export function renderFlowDetailsPage({ flow, serviceProvider, steps = [], flash
       ${renderSectionNav(tabs)}
       ${renderAuthorization(steps)}
       ${renderTokenExchange(steps)}
+      ${renderIntrospection(steps)}
       ${renderUserInfo(steps)}
       ${renderScopesAndClaims(flow, steps)}
     </div>
