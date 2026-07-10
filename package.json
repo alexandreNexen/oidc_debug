@@ -7,7 +7,10 @@
   "scripts": {
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
-    "test": "node --test tests/security.test.js tests/saml-trust.test.js"
+    "test": "node --test tests/security.test.js tests/saml-trust.test.js tests/redirect-uri.test.js tests/api-routes.test.js tests/vite-serving.test.js tests/spa-routing.test.js tests/legacy-ssr.test.js tests/flow-actions.test.js tests/api-guard.test.js tests/api-router.test.js tests/favicons.test.js tests/saml-encode-fail.test.js tests/oidc-sp-write.test.js tests/oidc-sp-delete.test.js tests/saml-sp-crud.test.js",
+    "install:frontend": "npm --prefix frontend install",
+    "dev:frontend": "npm --prefix frontend run dev",
+    "build:frontend": "npm --prefix frontend run build"
   },
   "dependencies": {
     "dotenv": "^17.4.2",

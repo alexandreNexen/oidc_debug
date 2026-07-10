@@ -1,4 +1,4 @@
-import { getEzAccessEnvironment } from "../../../common/views/config.js";
+import { getEzAccessEnvironment } from "../../../common/config.js";
 
 const MAX_NAME_LENGTH = 255;
 const MAX_ENTITY_ID_LENGTH = 512;

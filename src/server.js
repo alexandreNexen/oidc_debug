@@ -3,7 +3,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getEzAccessEnvironment, listEzAccessEnvironments } from "./common/views/config.js";
+import { getEzAccessEnvironment, listEzAccessEnvironments } from "./common/config.js";
 import {
   decodeJwt,
   buildCurlCommand,
@@ -24,16 +24,13 @@ import {
 } from "./protocols/oidc/oidc.js";
 import { createFlowService, STEP_ORDER } from "./protocols/oidc/services/flows.js";
 import { createServiceProviderService, isServiceProviderReady, serviceProviderStatus } from "./protocols/oidc/services/serviceProviders.js";
-import { renderDashboard } from "./common/views/dashboard.js";
-import { renderFlowDetailsPage } from "./protocols/oidc/views/flowDetails.js";
-import { renderFlowResultPage } from "./protocols/oidc/views/flowResult.js";
-import { renderServiceProvidersPage } from "./protocols/oidc/views/serviceProviders.js";
-import { renderServiceProviderEditPage } from "./protocols/oidc/views/serviceProviderEdit.js";
-import { renderServiceProviderNewPage } from "./protocols/oidc/views/serviceProviderNew.js";
 import { createSamlServiceProviderService, samlServiceProviderStatus } from "./protocols/saml/services/serviceProviders.js";
-import { renderSamlServiceProvidersPage } from "./protocols/saml/views/serviceProviders.js";
-import { renderSamlServiceProviderNewPage } from "./protocols/saml/views/serviceProviderNew.js";
-import { renderSamlServiceProviderEditPage } from "./protocols/saml/views/serviceProviderEdit.js";
+import { createLegacyRouter, isLegacySsrEnabled } from "./legacy-ssr/routes.js";
+import { createSpaRouter } from "./routes/spa.js";
+import { createStaticRouter } from "./routes/static.js";
+import { createHealthRouter } from "./routes/health.js";
+import { createDeprecatedRouter } from "./routes/deprecated.js";
+import { createApiRouter } from "./routes/api/index.js";
 import {
   generateAuthnRequestId,
   generateRelayState,
@@ -65,8 +62,6 @@ import {
   SAML_CLOCK_SKEW_SECONDS
 } from "./protocols/saml/saml.js";
 import { createSamlFlowService, SAML_STEP_ORDER } from "./protocols/saml/services/flows.js";
-import { renderSamlFlowResultPage } from "./protocols/saml/views/flowResult.js";
-import { renderSamlFlowDetailsPage } from "./protocols/saml/views/flowDetails.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(__dirname, "..");
@@ -87,13 +82,22 @@ const STORAGE_DIR = process.env.STORAGE_DIR || (IS_RENDER ? "/app/storage" : pat
 const STATE_FILE = path.join(STORAGE_DIR, "state.json");
 const SESSION_SECRET_FILE = path.join(STORAGE_DIR, "session-secret");
 
+// Directory where `vite build` writes the SPA bundle. Assets are served under
+// /static/assets/* (canonical); dist/index.html is served on the SPA
+// allow-list (see routes/spa.js). Never served as a global 404 fallback.
+// The transitional /vite/* alias has been removed.
+const VITE_DIST_DIR = path.join(projectRoot, "frontend", "dist");
+const VITE_ASSETS_DIR = path.join(VITE_DIST_DIR, "assets");
+const VITE_INDEX_HTML = path.join(VITE_DIST_DIR, "index.html");
+
+// Only the favicons live in public/ now. Everything the legacy SSR needs is
+// under src/legacy-ssr/assets/ and served by the legacy router.
 const staticFiles = new Map([
-  ["/assets/app.css", { filePath: path.join(projectRoot, "public", "app.css"), contentType: "text/css; charset=utf-8" }],
-  ["/assets/app.js", { filePath: path.join(projectRoot, "public", "app.js"), contentType: "application/javascript; charset=utf-8" }],
-  ["/assets/brand/logo.svg", { filePath: path.join(projectRoot, "public", "assets", "brand", "logo.svg"), contentType: "image/svg+xml" }],
   ["/favicon.svg", { filePath: path.join(projectRoot, "public", "assets", "favicon.svg"), contentType: "image/svg+xml" }],
   ["/favicon.ico", { filePath: path.join(projectRoot, "public", "assets", "favicon.ico"), contentType: "image/x-icon" }]
 ]);
+
+const LEGACY_SSR_ENABLED = isLegacySsrEnabled();
 
 const sessions = new Map();
 let providerConfig = createProviderConfig();
@@ -254,10 +258,6 @@ function parseSnapshotBody(body = "", contentType = "") {
   return body;
 }
 
-function diagnosticPresence(value) {
-  return value === undefined || value === null || value === "" ? "missing" : "present";
-}
-
 function oidcDisplayParam(key, value) {
   const normalized = String(key || "").toLowerCase();
 
@@ -330,10 +330,6 @@ function lifecycleHash(value = "") {
 
 function lifecycleHashMatches(value = "", expectedHash = "") {
   return Boolean(value && expectedHash && lifecycleHash(value) === expectedHash);
-}
-
-function usefulSanitizedHeaders(headers = {}) {
-  return oidcDisplayHeaders(headers || {});
 }
 
 function sanitizeAuthorizationRequestRaw(request = {}) {
@@ -1562,12 +1558,6 @@ function samlParamStatus(searchParams, name) {
   return (searchParams.get(name) || "") ? "present" : "missing";
 }
 
-function compareDiagnostic(actual, expected) {
-  if (!actual) return "missing";
-  if (!expected) return "not_checked";
-  return actual === expected ? "match" : "mismatch";
-}
-
 function buildPreparedRedirectSummary(authorizationUrl = "") {
   const searchParams = authorizationUrl ? new URL(authorizationUrl).searchParams : new URLSearchParams();
   return {
@@ -1907,16 +1897,70 @@ function sendJson(res, statusCode, payload) {
   send(res, statusCode, JSON.stringify(payload, null, 2), "application/json; charset=utf-8");
 }
 
+// Reject cross-site state-changing /api/* requests (POST, PATCH, DELETE).
+// Defense-in-depth for the action and write endpoints which change server
+// state. Callbacks (/oidc/callback, /saml/acs/:spId) are IdP-originated and
+// MUST NOT go through this guard.
+//
+// Policy:
+//   - If Sec-Fetch-Site is present (modern browsers): accept same-origin,
+//     same-site, none; reject cross-site.
+//   - Else if Origin is present (older browsers / cross-origin fetch):
+//     compare host+port to the current request's Host header. Mismatch =
+//     reject.
+//   - Else (no browser fetch metadata, e.g. curl / node fetch / tests):
+//     accept — same-origin same-site can only fabricate these headers with
+//     explicit user cooperation, so absence is not a CSRF vector.
+//
+// Returns true when the request is allowed to proceed. When rejected,
+// responds with 403 JSON and returns false.
+function assertApiPostAllowed(req, res) {
+  const rawSecFetchSite = req.headers["sec-fetch-site"];
+  const secFetchSite = typeof rawSecFetchSite === "string" ? rawSecFetchSite.toLowerCase() : "";
+
+  if (secFetchSite) {
+    if (secFetchSite === "same-origin" || secFetchSite === "same-site" || secFetchSite === "none") {
+      return true;
+    }
+    sendJson(res, 403, { error: "Cross-site API request rejected." });
+    return false;
+  }
+
+  const rawOrigin = req.headers.origin;
+  const origin = typeof rawOrigin === "string" ? rawOrigin.trim() : "";
+  if (!origin || origin.toLowerCase() === "null") {
+    return true;
+  }
+
+  const rawHost = req.headers.host;
+  const host = typeof rawHost === "string" ? rawHost.trim().toLowerCase() : "";
+  if (!host) {
+    sendJson(res, 403, { error: "Cross-site API request rejected." });
+    return false;
+  }
+
+  let originHost;
+  try {
+    originHost = new URL(origin).host.toLowerCase();
+  } catch {
+    sendJson(res, 403, { error: "Cross-site API request rejected." });
+    return false;
+  }
+
+  if (originHost === host) {
+    return true;
+  }
+
+  sendJson(res, 403, { error: "Cross-site API request rejected." });
+  return false;
+}
+
 function redirect(res, location) {
   res.writeHead(302, {
     location,
     ...SECURITY_HEADERS
   });
   res.end();
-}
-
-function routeTab(url) {
-  return url.searchParams.get("tab") || null;
 }
 
 function firstForwardedValue(value = "") {
@@ -1951,53 +1995,8 @@ function currentPath(req) {
   return new URL(req.url, resolvePublicBaseUrl(req));
 }
 
-function matchServiceProviderEditPath(pathname) {
-  const match = pathname.match(/^\/oidc\/service-providers\/([^/]+)\/edit$/);
-  return match ? decodeURIComponent(match[1]) : null;
-}
-
-function matchServiceProviderUpdatePath(pathname) {
-  const match = pathname.match(/^\/oidc\/service-providers\/([^/]+)$/);
-  return match ? decodeURIComponent(match[1]) : null;
-}
-
-function matchServiceProviderDeletePath(pathname) {
-  const match = pathname.match(/^\/oidc\/service-providers\/([^/]+)\/delete$/);
-  return match ? decodeURIComponent(match[1]) : null;
-}
-
 function matchFlowStartPath(pathname) {
   const match = pathname.match(/^\/oidc\/flows\/start\/([^/]+)$/);
-  return match ? decodeURIComponent(match[1]) : null;
-}
-
-function matchFlowResultPath(pathname) {
-  const match = pathname.match(/^\/oidc\/flows\/([^/]+)$/);
-  return match ? decodeURIComponent(match[1]) : null;
-}
-
-function matchFlowDetailsPath(pathname) {
-  const match = pathname.match(/^\/oidc\/flows\/([^/]+)\/details$/);
-  return match ? decodeURIComponent(match[1]) : null;
-}
-
-function matchFlowRerunPath(pathname) {
-  const match = pathname.match(/^\/oidc\/flows\/([^/]+)\/rerun$/);
-  return match ? decodeURIComponent(match[1]) : null;
-}
-
-function matchSamlServiceProviderEditPath(pathname) {
-  const match = pathname.match(/^\/saml\/service-providers\/([^/]+)\/edit$/);
-  return match ? decodeURIComponent(match[1]) : null;
-}
-
-function matchSamlServiceProviderUpdatePath(pathname) {
-  const match = pathname.match(/^\/saml\/service-providers\/([^/]+)$/);
-  return match ? decodeURIComponent(match[1]) : null;
-}
-
-function matchSamlServiceProviderDeletePath(pathname) {
-  const match = pathname.match(/^\/saml\/service-providers\/([^/]+)\/delete$/);
   return match ? decodeURIComponent(match[1]) : null;
 }
 
@@ -2009,21 +2008,6 @@ function matchSamlFlowStartPath(pathname) {
 function matchSamlAcsPath(pathname) {
   const match = pathname.match(/^\/saml\/acs\/([^/]+)$/);
   return match ? decodeURIComponent(match[1]) : null;
-}
-
-function matchSamlFlowResultPath(pathname) {
-  const match = pathname.match(/^\/saml\/flows\/([^/]+)$/);
-  return match ? decodeURIComponent(match[1]) : null;
-}
-
-function matchSamlFlowDetailsPath(pathname) {
-  const match = pathname.match(/^\/saml\/flows\/([^/]+)\/details$/);
-  return match ? decodeURIComponent(match[1]) : null;
-}
-
-async function serveStatic(res, asset) {
-  const content = await readFile(asset.filePath, "utf8");
-  send(res, 200, content, asset.contentType);
 }
 
 function evaluateState(expectedState, receivedState) {
@@ -2212,20 +2196,6 @@ function buildDiscoveryRequest(discoveryUrl) {
 
 function ensureHtmlSessionRoute(req) {
   return req.headers.accept?.includes("text/html") || req.headers.accept === "*/*" || !req.headers.accept;
-}
-
-function selectedClaims(claims = {}) {
-  const allowed = ["iss", "sub", "aud", "exp", "iat"];
-  return allowed.reduce((acc, key) => {
-    if (claims?.[key] !== undefined) {
-      acc[key] = claims[key];
-    }
-    return acc;
-  }, {});
-}
-
-function tokenReceived(value) {
-  return value ? "received" : "missing";
 }
 
 function yesNo(value) {
@@ -2650,30 +2620,6 @@ function flowStepSummary(stepName, step) {
   };
 }
 
-function listValue(values = []) {
-  return Array.isArray(values) && values.length > 0 ? values.join(", ") : "";
-}
-
-function tokenAuthMethodForServiceProviders(serviceProviders = [], environmentKey = "", fallback = "") {
-  const matching = serviceProviders.filter((serviceProvider) => serviceProvider.environment === environmentKey);
-  const source = matching.length > 0 ? matching : serviceProviders;
-  const methods = new Set(
-    source
-      .map((serviceProvider) => (serviceProvider.clientType === "confidential" ? "client_secret_basic" : "none"))
-      .filter(Boolean)
-  );
-
-  if (methods.size === 1) {
-    return Array.from(methods)[0];
-  }
-
-  if (methods.size > 1) {
-    return "Depends on Service Provider";
-  }
-
-  return fallback || "";
-}
-
 function buildOidcPageConfiguration() {
   return {
     redirectUri: sanitizeProviderConfig(providerConfig).redirectUri,
@@ -2802,6 +2748,56 @@ function buildAuthorizeStep({ flow, runConfig, prepared }) {
     rawResponseNature: "Synthetic local response",
     completedAt: new Date().toISOString()
   };
+}
+
+// Shared handler for POST /api/oidc/discovery/import/:env and the legacy
+// SSR POST /oidc/discovery/import/:env. Reads the request body, validates
+// the discovery URL, fetches the metadata, stores it, and returns a JSON
+// payload. CSRF protection is applied by the caller — the legacy SSR route
+// runs unauthenticated (same-origin-only historically), the /api/* route
+// runs behind assertApiPostAllowed.
+async function handleOidcDiscoveryImport({ req, res, environmentKey, sessionId }) {
+  if (!checkRateLimit(sessionId, `discovery-import-${environmentKey}`, 10, 60 * 1000)) {
+    sendJson(res, 429, { ok: false, error: "Too many requests. Please wait before retrying." });
+    return;
+  }
+
+  let body;
+  try {
+    const rawBody = await readBody(req);
+    body = parseBody(req, rawBody);
+  } catch (error) {
+    if (error && error.code === "BODY_TOO_LARGE") {
+      sendJson(res, 413, { ok: false, error: "Request body exceeds size limit." });
+      return;
+    }
+    throw error;
+  }
+  const rawDiscoveryUrl = String(body?.discoveryUrl || "").trim();
+
+  const urlError = validateDiscoveryUrl(rawDiscoveryUrl);
+  if (urlError) {
+    sendJson(res, 400, { ok: false, error: urlError });
+    return;
+  }
+
+  const result = await importDiscoveryMetadata(rawDiscoveryUrl);
+  if (!result.ok) {
+    sendJson(res, 400, { ok: false, error: result.error });
+    return;
+  }
+
+  oidcEnvironmentConfig[environmentKey] = {
+    discoveryUrl: rawDiscoveryUrl,
+    discoveredAt: new Date().toISOString(),
+    ...result.metadata
+  };
+  schedulePersistState();
+
+  sendJson(res, 200, {
+    ok: true,
+    environment: { key: environmentKey, ...oidcEnvironmentConfig[environmentKey] }
+  });
 }
 
 function validateDiscoveryUrl(rawUrl) {
@@ -3362,6 +3358,337 @@ async function startNewUiFlow(session, serviceProviderId) {
   }
 }
 
+// Shared engine used by both the SSR `/saml/flows/start/:spId` handler and
+// the JSON API `POST /api/saml/flows/start/:spId`. RelayState, request id and
+// AuthnRequest XML are generated once here; callers never touch that material.
+async function startNewSamlUiFlow(session, spId, { httpMethod = "POST" } = {}) {
+  const sp = samlServiceProviderService.getSamlServiceProvider(spId);
+  if (!sp) {
+    return { ok: false, notFound: true };
+  }
+
+  if (sp.requestSigned) {
+    return {
+      ok: false,
+      errorCode: "signed_request_not_implemented",
+      errorMessage: "Signed AuthnRequest is not implemented yet.",
+      redirectHint: "sp_edit",
+      spId: sp.id
+    };
+  }
+
+  let idpMetadata;
+  try {
+    let metadataXml = sp.idpMetadataXml;
+    if (!metadataXml && sp.idpMetadataUrl) {
+      metadataXml = await fetchIdpMetadataFromUrl(sp.idpMetadataUrl);
+    }
+    if (!metadataXml) {
+      throw new Error("No IdP metadata configured. Provide an URL or paste XML in the Service Provider settings.");
+    }
+    idpMetadata = parseIdpMetadata(metadataXml);
+    if (!idpMetadata.ssoUrl) {
+      throw new Error("IdP SSO URL not found in metadata. Check the XML or the metadata URL.");
+    }
+  } catch (error) {
+    appLog("warn", "saml_flow_start: metadata error", { spId: sp.id, error: error.message });
+    return {
+      ok: false,
+      errorCode: "idp_metadata_error",
+      errorMessage: `IdP metadata error: ${error.message}`,
+      redirectHint: "sp_edit",
+      spId: sp.id
+    };
+  }
+
+  const requestId = generateAuthnRequestId();
+  const relayState = generateRelayState();
+  const acsUrl = `${BASE_URL}/saml/acs/${sp.id}`;
+  const issueInstant = new Date().toISOString();
+
+  const authnRequestXml = buildAuthnRequestXml({
+    requestId,
+    issueInstant,
+    destination: idpMetadata.ssoUrl,
+    acsUrl,
+    spEntityId: sp.spEntityId,
+    nameIdFormat: sp.nameIdFormat || ""
+  });
+
+  const env = getEzAccessEnvironment(sp.environment || "");
+  const envLabel = env?.key === "preprod" ? "Preprod" : env?.key === "prod" ? "Prod" : "";
+
+  const flow = samlFlowService.createFlow(sp.id, {
+    relayState: "received / redacted",
+    relayStatePresent: true,
+    relayStateSha25612: shortHash(relayState),
+    requestId,
+    ssoUrl: idpMetadata.ssoUrl,
+    idpEntityId: idpMetadata.entityId,
+    spEntityId: sp.spEntityId,
+    acsUrl,
+    nameIdFormat: sp.nameIdFormat || "",
+    authorizationUrl: "",
+    serviceProviderName: sp.name,
+    environment: sp.environment || "",
+    environmentLabel: envLabel
+  });
+
+  const startHttpMethod = httpMethod || "POST";
+
+  if (idpMetadata.ssoBinding !== "HTTP-Redirect") {
+    const unsupportedBindingRaw = buildUnsupportedSamlBindingRaw(idpMetadata);
+    samlFlowService.addFlowStep(flow.id, {
+      stepName: "authn_request_created",
+      status: "success",
+      httpMethod: startHttpMethod,
+      endpoint: `/saml/flows/start/${sp.id}`,
+      completedAt: new Date().toISOString(),
+      requestData: {
+        request_id: requestId,
+        sp_entity_id: sp.spEntityId,
+        acs_url: acsUrl,
+        destination: idpMetadata.ssoUrl,
+        name_id_format: sp.nameIdFormat || "(unspecified)",
+        issue_instant: issueInstant,
+        idp_entity_id: idpMetadata.entityId || "(not found in metadata)",
+        idp_has_certificate: idpMetadata.hasCertificate ? "yes" : "not found",
+        binding_used_for_request: "not implemented"
+      },
+      responseData: {
+        authn_request: "generated",
+        encoding: "not performed",
+        warning: "HTTP-POST AuthnRequest binding not implemented"
+      },
+      rawRequestData: buildSamlAuthnRequestRaw({
+        authnRequestXml,
+        requestId,
+        issueInstant,
+        idpMetadata,
+        sp,
+        acsUrl,
+        samlRequestParam: "",
+        relayState,
+        authorizationUrl: ""
+      }),
+      rawResponseData: buildSamlSyntheticResponseRaw({
+        rawType: "Synthetic local response",
+        status: 0,
+        note: "AuthnRequest generated locally; encoding skipped because HTTP-POST AuthnRequest binding is not implemented."
+      })
+    });
+
+    samlFlowService.addFlowStep(flow.id, {
+      stepName: "redirect_to_idp",
+      status: "error",
+      httpMethod: "POST",
+      endpoint: idpMetadata.ssoUrl,
+      httpStatus: null,
+      completedAt: new Date().toISOString(),
+      requestData: {
+        sso_url: idpMetadata.ssoUrl,
+        metadata_binding: idpMetadata.ssoBinding || "not found",
+        binding_used: "not implemented"
+      },
+      responseData: {
+        redirect_to: "not performed",
+        warning: "HTTP-POST AuthnRequest binding not implemented"
+      },
+      rawRequestData: unsupportedBindingRaw,
+      rawResponseData: {
+        ...unsupportedBindingRaw,
+        raw_type: "Synthetic local response",
+        local_http_status: "not emitted"
+      },
+      errorData: {
+        error: "HTTP-POST AuthnRequest binding not implemented"
+      }
+    });
+
+    samlFlowService.completeFlow(flow.id, {
+      status: "failed",
+      failedStep: "redirect_to_idp",
+      errorCode: "saml_authn_request_post_binding_not_implemented",
+      errorDescription: "HTTP-POST AuthnRequest binding not implemented."
+    });
+
+    return {
+      ok: false,
+      flow: samlFlowService.getFlow(flow.id),
+      errorCode: "saml_authn_request_post_binding_not_implemented",
+      errorMessage: "HTTP-POST AuthnRequest binding not implemented.",
+      redirectHint: "flow_result"
+    };
+  }
+
+  let samlRequestParam;
+  try {
+    samlRequestParam = encodeAuthnRequestForRedirect(authnRequestXml);
+  } catch (error) {
+    appLog("warn", "saml_flow_start: encode error", { spId: sp.id, error: error.message });
+    // The flow exists but the redirect could not be prepared. Mark it as
+    // failed so it does not linger in "running" state until the SAML TTL
+    // sweeps it — otherwise the flow shows up as in-progress on the flows
+    // page while nothing is actually in flight.
+    samlFlowService.addFlowStep(flow.id, {
+      stepName: "authn_request_created",
+      status: "error",
+      httpMethod: startHttpMethod,
+      endpoint: `/saml/flows/start/${sp.id}`,
+      httpStatus: null,
+      completedAt: new Date().toISOString(),
+      requestData: {
+        request_id: requestId,
+        sp_entity_id: sp.spEntityId,
+        acs_url: acsUrl,
+        destination: idpMetadata.ssoUrl,
+        name_id_format: sp.nameIdFormat || "(unspecified)",
+        issue_instant: issueInstant,
+        idp_entity_id: idpMetadata.entityId || "(not found in metadata)",
+        idp_has_certificate: idpMetadata.hasCertificate ? "yes" : "not found",
+        binding_used_for_request: "HTTP-Redirect"
+      },
+      responseData: {
+        authn_request: "generated",
+        encoding: "failed"
+      },
+      rawRequestData: buildSamlAuthnRequestRaw({
+        authnRequestXml,
+        requestId,
+        issueInstant,
+        idpMetadata,
+        sp,
+        acsUrl,
+        samlRequestParam: "",
+        relayState,
+        authorizationUrl: ""
+      }),
+      rawResponseData: buildSamlSyntheticResponseRaw({
+        rawType: "Synthetic local response",
+        status: 0,
+        note: "AuthnRequest could not be encoded for HTTP-Redirect. No redirect emitted."
+      }),
+      errorData: {
+        errorCode: "authn_request_encode_error",
+        errorDescription: "Failed to encode AuthnRequest."
+      }
+    });
+
+    samlFlowService.completeFlow(flow.id, {
+      status: "failed",
+      failedStep: "authn_request_created",
+      errorCode: "authn_request_encode_error",
+      errorDescription: "Failed to encode AuthnRequest."
+    });
+
+    return {
+      ok: false,
+      flow: samlFlowService.getFlow(flow.id),
+      errorCode: "authn_request_encode_error",
+      errorMessage: "Failed to encode AuthnRequest.",
+      redirectHint: "sp_edit",
+      spId: sp.id
+    };
+  }
+
+  const authorizationUrl = buildSsoRedirectUrl(idpMetadata.ssoUrl, samlRequestParam, relayState);
+  samlFlowService.updateFlow(flow.id, {
+    runtime: {
+      ...flow.runtime,
+      authorizationUrl: redactSamlRedirectUrl(authorizationUrl),
+      authorizationUrlNature: "redacted browser redirect URL"
+    }
+  });
+
+  samlFlowService.addFlowStep(flow.id, {
+    stepName: "authn_request_created",
+    status: "success",
+    httpMethod: startHttpMethod,
+    endpoint: `/saml/flows/start/${sp.id}`,
+    completedAt: new Date().toISOString(),
+    requestData: {
+      request_id: requestId,
+      sp_entity_id: sp.spEntityId,
+      acs_url: acsUrl,
+      destination: idpMetadata.ssoUrl,
+      name_id_format: sp.nameIdFormat || "(unspecified)",
+      issue_instant: issueInstant,
+      idp_entity_id: idpMetadata.entityId || "(not found in metadata)",
+      idp_has_certificate: idpMetadata.hasCertificate ? "yes" : "not found",
+      expected_response_protocol_binding: "HTTP-POST",
+      binding_used_for_request: "HTTP-Redirect",
+      saml_request_encoded_size_bytes: Buffer.byteLength(samlRequestParam, "utf8"),
+      saml_request_sha256_12: shortHash(samlRequestParam),
+      relay_state: "present",
+      relay_state_sha256_12: shortHash(relayState)
+    },
+    responseData: {
+      authn_request: "generated",
+      encoding: "HTTP-Redirect (deflate + base64)",
+      raw_nature: "Prepared SAML AuthnRequest"
+    },
+    rawRequestData: buildSamlAuthnRequestRaw({
+      authnRequestXml,
+      requestId,
+      issueInstant,
+      idpMetadata,
+      sp,
+      acsUrl,
+      samlRequestParam,
+      relayState,
+      authorizationUrl
+    }),
+    rawResponseData: buildSamlSyntheticResponseRaw({
+      rawType: "Synthetic local response",
+      status: 0,
+      note: "AuthnRequest generated and encoded locally before redirect."
+    })
+  });
+
+  samlFlowService.addFlowStep(flow.id, {
+    stepName: "redirect_to_idp",
+    status: "success",
+    httpMethod: "GET",
+    endpoint: idpMetadata.ssoUrl,
+    httpStatus: 302,
+    completedAt: new Date().toISOString(),
+    requestData: {
+      sso_url: idpMetadata.ssoUrl,
+      relay_state: "present",
+      relay_state_sha256_12: shortHash(relayState),
+      saml_request: "present",
+      saml_request_encoded_size_bytes: Buffer.byteLength(samlRequestParam, "utf8"),
+      saml_request_sha256_12: shortHash(samlRequestParam),
+      binding: "HTTP-Redirect",
+      http_mode: "browser redirect"
+    },
+    responseData: {
+      redirect_to: "IdP SSO endpoint",
+      redirect_url: "redacted raw available",
+      local_http_status: "302 synthetic/local",
+      awaiting: "SAMLResponse on ACS",
+      raw_nature: "Prepared browser redirect"
+    },
+    rawRequestData: buildSamlRedirectRaw({ authorizationUrl, idpMetadata, samlRequestParam, relayState }),
+    rawResponseData: buildSamlSyntheticResponseRaw({
+      rawType: "Synthetic local response",
+      status: 302,
+      note: "Local 302 sent by this app to the browser; this is not an IdP response."
+    })
+  });
+
+  addSessionLog(session, "info", "saml_flow_started", "SAML flow started.", {
+    flowId: flow.id,
+    serviceProviderId: sp.id
+  });
+
+  return {
+    ok: true,
+    flow: samlFlowService.getFlow(flow.id),
+    authorizationUrl
+  };
+}
+
 async function processNewUiCallback({ req, flow, params }) {
   const stateCheck = evaluateFlowState(flow, params.state);
   const callbackStep = buildCallbackStep({ flow, req, params, stateCheck });
@@ -3580,167 +3907,230 @@ function buildPageModel(session, activeTab, url) {
   };
 }
 
+// ---- Read-only JSON API helpers ----
+// Debug tool: detail endpoints intentionally return exact diagnostic values
+// (raw JWT payloads, decoded claims, SAML assertions, trust validation) so
+// the frontend can render the same fidelity as the SSR pages. Secrets that
+// were never diagnostic (client_secret, code_verifier, expected state/nonce
+// in clear) remain stripped via existing sanitizers.
+
+function apiFlowSummary(flow) {
+  const summary = flowSummary(flow);
+  if (summary && summary.runtime) {
+    summary.runtime = sanitizeTerminalOidcRuntime(summary.runtime);
+  }
+  return summary;
+}
+
+function apiSamlFlowDetailSummary(flow) {
+  const detail = samlFlowDetailSummary(flow);
+  if (detail && flow?.runtime) {
+    detail.runtime = sanitizeSamlRuntimeForPersistence(flow.runtime);
+  }
+  return detail;
+}
+
+function buildApiOidcFlowDetail(flowId) {
+  const flow = flowService.getFlow(flowId);
+  if (!flow) return null;
+
+  const serviceProvider = getServiceProvider(flow.serviceProviderId);
+  const steps = flowService.getFlowSteps(flow.id);
+  const stepsByName = new Map(steps.map((step) => [step.stepName, step]));
+
+  return {
+    flow: apiFlowSummary(flow),
+    serviceProvider: sanitizeServiceProviderForUi(serviceProvider) || {
+      id: flow.serviceProviderId,
+      name: flow.runtime?.serviceProviderName || "Service Provider",
+      environment: flow.runtime?.environment || "",
+      environmentLabel: flow.runtime?.environmentLabel || environmentLabel(flow.runtime?.environment),
+      clientId: flow.runtime?.clientId || "",
+      scopes: flow.runtime?.scopes || ""
+    },
+    steps: STEP_ORDER.map((stepName) => flowStepSummary(stepName, stepsByName.get(stepName))),
+    recommendedAction: recommendedAction(flow.failedStep)
+  };
+}
+
+function buildApiSamlFlowDetail(flowId) {
+  const flow = samlFlowService.getFlow(flowId);
+  if (!flow) return null;
+
+  const sp = samlServiceProviderService.getSamlServiceProvider(flow.serviceProviderId);
+  const steps = samlFlowService.getFlowSteps(flow.id);
+  const stepsByName = new Map(steps.map((step) => [step.stepName, step]));
+
+  return {
+    flow: apiSamlFlowDetailSummary(flow),
+    serviceProvider: sp ? sanitizeSamlServiceProviderForUi(sp) : {
+      id: flow.serviceProviderId,
+      name: flow.runtime?.serviceProviderName || "Service Provider"
+    },
+    steps: SAML_STEP_ORDER.map((stepName) => samlStepSummary(stepName, stepsByName.get(stepName)))
+  };
+}
+
+// ---- Route module wiring ----
+// The dispatcher below composes small modules with a fixed, documented
+// order. Each module returns a boolean-ish handler so `if (await handled)
+// return` keeps server.js readable.
+
+const spaRouter = createSpaRouter({
+  viteIndexHtml: VITE_INDEX_HTML,
+  send,
+  sendHtmlStatus
+});
+
+const staticRouter = createStaticRouter({
+  viteAssetsDir: VITE_ASSETS_DIR,
+  sharedStaticFiles: staticFiles,
+  send,
+  sendJson
+});
+
+const healthRouter = createHealthRouter({
+  sendJson,
+  getSnapshot: () => ({
+    status: "ok",
+    nodeEnv: NODE_ENV,
+    redirectUri: sanitizeProviderConfig(providerConfig).redirectUri,
+    oidc: { serviceProviders: serviceProviders.length, flows: flows.length },
+    saml: { serviceProviders: samlServiceProviders.length, flows: samlFlows.length }
+  })
+});
+
+const deprecatedRouter = createDeprecatedRouter({ sendJson });
+
+const apiRouter = createApiRouter({
+  assertApiPostAllowed,
+  http: { sendJson, readBody, parseBody },
+  security: { checkRateLimit },
+  sessions: { getOrCreateSession, touchSession, addSessionLog, resetFlowState },
+  apiHealth: {
+    getSnapshot: () => ({
+      status: "ok",
+      timestamp: new Date().toISOString(),
+      nodeEnv: NODE_ENV,
+      redirectUri: sanitizeProviderConfig(providerConfig).redirectUri,
+      counts: {
+        oidc: { serviceProviders: serviceProviders.length, flows: flows.length },
+        saml: { serviceProviders: samlServiceProviders.length, flows: samlFlows.length }
+      }
+    })
+  },
+  oidc: {
+    serviceProviderService,
+    flowService,
+    removeServiceProvider,
+    sanitizeServiceProviderForUi,
+    listEzAccessEnvironments,
+    sanitizeEzAccessEnvironmentForUi,
+    apiFlowSummary,
+    buildApiOidcFlowDetail,
+    startNewUiFlow,
+    handleOidcDiscoveryImport
+  },
+  saml: {
+    samlServiceProviderService,
+    samlFlowService,
+    sanitizeSamlServiceProviderForUi,
+    samlFlowSummary,
+    buildApiSamlFlowDetail,
+    startNewSamlUiFlow
+  }
+});
+
+const legacyRouter = createLegacyRouter({
+  getOrCreateSession,
+  buildPageModel,
+  buildFlowViewModel,
+  buildSamlFlowViewModel,
+  getServiceProvider,
+  sanitizeServiceProviderForUi,
+  sanitizeSamlServiceProviderForUi,
+  attachSamlFlowsToServiceProviders,
+  sanitizeEzAccessEnvironmentForUi,
+  consumeFlash,
+  setFlash,
+  redirect,
+  sendHtml,
+  sendJson,
+  send,
+  samlServiceProviderService
+});
+
+// ---- Dispatcher ordering ----
+// Each request runs through the modules below in a fixed order. Ordering
+// invariants (must not change without an updated non-regression check):
+//
+//   1. shared static (favicons)        → `staticRouter.handleStaticRoute`
+//   2. JSON API (/api/*)               → inline (this lot leaves it in place)
+//   3. Vite build assets (/static/…)   → `staticRouter.handleStaticRoute`
+//   4. SPA allow-list                  → `spaRouter.handleSpaRoute`
+//   5. Legacy SSR (/legacy/*, flagged) → `legacyRouter.handleLegacyRoute`
+//   6. Deprecated 410 canonical POSTs  → `deprecatedRouter.handleDeprecatedRoute`
+//   7. Backend OIDC/SAML flow routes   → inline
+//   8. Callbacks (/oidc/callback, /saml/acs/:spId) → inline
+//   9. /health                         → `healthRouter.handleHealthRoute`
+//  10. 404 fallback                    → inline
+//
+// The static module handles both the favicon table AND /static/assets/* to
+// keep static concerns co-located; the dispatcher just calls it before and
+// after /api/* so the pre-refactor ordering is preserved.
+
 const server = http.createServer(async (req, res) => {
   const url = currentPath(req);
 
   try {
+    // 1. Shared static files (favicons). Behavior preserved from pre-refactor
+    //    dispatcher (see routes/static.js).
     if (staticFiles.has(url.pathname)) {
-      await serveStatic(res, staticFiles.get(url.pathname));
-      return;
+      if (await staticRouter.handleStaticRoute(req, res, url)) return;
     }
 
-    if (req.method === "GET" && url.pathname.startsWith("/assets/icons/") && url.pathname.endsWith(".svg")) {
-      const iconName = path.basename(url.pathname);
-      if (/^[a-z-]+\.svg$/.test(iconName)) {
-        try {
-          const iconPath = path.join(projectRoot, "public", "assets", "icons", iconName);
-          const content = await readFile(iconPath, "utf8");
-          send(res, 200, content, "image/svg+xml");
-          return;
-        } catch {
-          // fall through to 404
-        }
-      }
+    // 2. ---- Read-only JSON API (/api/*) ----
+    // Delegated to `apiRouter` (see routes/api/index.js). The router owns
+    // the cross-site guard, /api/health, delegation to /api/oidc/* and
+    // /api/saml/*, and the JSON 404 fallback for unknown /api/* paths.
+    // Sits above SSR routes so it is never shadowed.
+    if (await apiRouter.handle(req, res, url)) return;
+
+    // 3. ---- Vite SPA build assets (/static/assets/*) ----
+    // The build writes assets under frontend/dist/assets/*. `vite build` uses
+    // base: "/static/" so dist/index.html references /static/assets/... — this
+    // namespace is disjoint from /assets/* (SSR public files), so no
+    // collision. GET/HEAD only.
+    if (url.pathname.startsWith("/static/assets/")) {
+      if (await staticRouter.handleStaticRoute(req, res, url)) return;
     }
 
-    if (req.method === "GET" && url.pathname === "/") {
-      const session = getOrCreateSession(req, res);
-      const model = buildPageModel(session, routeTab(url) || "dashboard", url);
-      sendHtml(res, renderDashboard(model));
-      return;
-    }
+    // 4. ---- SPA canonical routes (allow-list) ----
+    // Vite is the primary frontend. Match ONLY the paths the SPA knows how
+    // to render (see routes/spa.js). Everything else — /oidc/callback,
+    // /saml/acs/:spId, /oidc/flows/start/:spId, typos, /api/* — falls through
+    // to the backend so callbacks and typos are never captured by the SPA.
+    if (await spaRouter.handleSpaRoute(req, res, url)) return;
 
-    if (req.method === "GET" && url.pathname === "/oidc/service-providers") {
-      const session = getOrCreateSession(req, res);
-      const model = buildPageModel(session, "service-providers", url);
-      sendHtml(res, renderServiceProvidersPage(model));
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/oidc/service-providers/new") {
-      const session = getOrCreateSession(req, res);
-      const model = buildPageModel(session, "service-providers", url);
-      sendHtml(res, renderServiceProviderNewPage(model));
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/oidc/service-providers") {
-      const session = getOrCreateSession(req, res);
-      if (!checkRateLimit(session.id, "sp-create", 20, 5 * 60 * 1000)) {
-        sendJson(res, 429, { error: "Too many requests. Please wait before retrying." });
+    // 5. ---- Legacy SSR (/legacy/*) ----
+    // Read-only reference of the pre-Vite UI. Gated by ENABLE_LEGACY_SSR=1
+    // only (NODE_ENV alone no longer activates it). When disabled the whole
+    // /legacy/* namespace returns 404 JSON.
+    if (url.pathname === "/legacy" || url.pathname.startsWith("/legacy/")) {
+      if (!LEGACY_SSR_ENABLED) {
+        sendJson(res, 404, { error: "Legacy SSR is disabled." });
         return;
       }
-      const rawBody = await readBody(req);
-      const body = parseBody(req, rawBody);
-      const result = serviceProviderService.createServiceProvider(body);
-
-      if (!result.ok) {
-        const model = {
-          ...buildPageModel(session, "service-providers", url),
-          form: result.validation
-        };
-        sendHtml(res, renderServiceProviderNewPage(model));
-        return;
-      }
-
-      session.selectedServiceProviderId = result.serviceProvider.id;
-      touchSession(session);
-      addSessionLog(session, "info", "service_provider_created", "Service Provider created.", {
-        serviceProvider: sanitizeServiceProviderForUi(result.serviceProvider)
-      });
-      setFlash(
-        session,
-        result.validation.warnings.length ? "warn" : "info",
-        result.validation.warnings.length
-          ? `Service Provider created. ${result.validation.warnings.join(" ")}`
-          : "Service Provider created."
-      );
-      redirect(res, "/oidc/service-providers");
-      return;
+      const handled = await legacyRouter.handleLegacyRoute(req, res, url);
+      if (handled) return;
     }
 
-    const editServiceProviderId = req.method === "GET" ? matchServiceProviderEditPath(url.pathname) : null;
-    if (editServiceProviderId) {
-      const session = getOrCreateSession(req, res);
-      const serviceProvider = getServiceProvider(editServiceProviderId);
-
-      if (!serviceProvider) {
-        setFlash(session, "warn", "Service Provider not found.");
-        redirect(res, "/oidc/service-providers");
-        return;
-      }
-
-      const model = {
-        ...buildPageModel(session, "service-providers", url),
-        serviceProvider: sanitizeServiceProviderForUi(serviceProvider)
-      };
-      sendHtml(res, renderServiceProviderEditPage(model));
-      return;
-    }
-
-    const deleteServiceProviderId = req.method === "POST" ? matchServiceProviderDeletePath(url.pathname) : null;
-    if (deleteServiceProviderId) {
-      const session = getOrCreateSession(req, res);
-
-      if (!removeServiceProvider(deleteServiceProviderId)) {
-        setFlash(session, "warn", "Service Provider not found.");
-        redirect(res, "/oidc/service-providers");
-        return;
-      }
-
-      addSessionLog(session, "info", "service_provider_deleted", "Service Provider deleted.", {
-        serviceProviderId: deleteServiceProviderId
-      });
-      setFlash(session, "info", "Service Provider deleted.");
-      redirect(res, "/oidc/service-providers");
-      return;
-    }
-
-    const updateServiceProviderId = req.method === "POST" ? matchServiceProviderUpdatePath(url.pathname) : null;
-    if (updateServiceProviderId && !["save", "delete", "select", "test"].includes(updateServiceProviderId)) {
-      const session = getOrCreateSession(req, res);
-      const rawBody = await readBody(req);
-      const body = parseBody(req, rawBody);
-      const result = serviceProviderService.updateServiceProvider(updateServiceProviderId, body);
-
-      if (result.notFound) {
-        setFlash(session, "warn", "Service Provider not found.");
-        redirect(res, "/oidc/service-providers");
-        return;
-      }
-
-      if (!result.ok) {
-        const model = {
-          ...buildPageModel(session, "service-providers", url),
-          serviceProvider: sanitizeServiceProviderForUi(result.serviceProvider),
-          form: result.validation
-        };
-        sendHtml(res, renderServiceProviderEditPage(model));
-        return;
-      }
-
-      if (session.selectedServiceProviderId === result.serviceProvider.id) {
-        resetFlowState(session, "service_provider_update");
-      } else {
-        touchSession(session);
-      }
-
-      addSessionLog(session, "info", "service_provider_updated", "Service Provider updated.", {
-        serviceProvider: sanitizeServiceProviderForUi(result.serviceProvider),
-        secretUpdated: result.secretUpdated
-      });
-      setFlash(
-        session,
-        result.validation.warnings.length ? "warn" : "info",
-        result.validation.warnings.length
-          ? `Service Provider updated. ${result.validation.warnings.join(" ")}`
-          : result.secretUpdated
-            ? "Service Provider updated. The secret was replaced."
-            : "Service Provider updated."
-      );
-      redirect(res, "/oidc/service-providers");
-      return;
-    }
+    // 6. ---- Deprecated POST canonical routes ----
+    // The SSR-era write endpoints (SP CRUD, discovery import) have been
+    // retired. The equivalent action is available under /api/*. We respond
+    // 410 Gone explicitly so a caller who was pinned to the old URL sees a
+    // clear signal instead of a silent 404 or a stale success.
+    if (deprecatedRouter.handleDeprecatedRoute(req, res, url)) return;
 
     const startFlowServiceProviderId = (req.method === "POST" || req.method === "GET") ? matchFlowStartPath(url.pathname) : null;
     if (startFlowServiceProviderId) {
@@ -3766,222 +4156,9 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const rerunFlowId = req.method === "POST" ? matchFlowRerunPath(url.pathname) : null;
-    if (rerunFlowId) {
-      const session = getOrCreateSession(req, res);
-      const flow = flowService.getFlow(rerunFlowId);
-
-      if (!flow) {
-        setFlash(session, "warn", "Flow not found.");
-        redirect(res, "/oidc/service-providers");
-        return;
-      }
-
-      const result = await startNewUiFlow(session, flow.serviceProviderId);
-      if (!result.ok) {
-        redirect(res, result.flow ? `/oidc/flows/${encodeURIComponent(result.flow.id)}` : "/oidc/service-providers");
-        return;
-      }
-
-      redirect(res, result.authorizationUrl);
-      return;
-    }
-
-    const flowDetailsId = req.method === "GET" ? matchFlowDetailsPath(url.pathname) : null;
-    if (flowDetailsId) {
-      const session = getOrCreateSession(req, res);
-      const model = buildFlowViewModel(session, flowDetailsId, url);
-
-      if (!model) {
-        setFlash(session, "warn", "Flow not found.");
-        redirect(res, "/oidc/service-providers");
-        return;
-      }
-
-      sendHtml(res, renderFlowDetailsPage(model));
-      return;
-    }
-
-    const flowResultId = req.method === "GET" ? matchFlowResultPath(url.pathname) : null;
-    if (flowResultId) {
-      const session = getOrCreateSession(req, res);
-      const model = buildFlowViewModel(session, flowResultId, url);
-
-      if (!model) {
-        setFlash(session, "warn", "Flow not found.");
-        redirect(res, "/oidc/service-providers");
-        return;
-      }
-
-      sendHtml(res, renderFlowResultPage(model));
-      return;
-    }
-
-    const discoveryImportMatch = req.method === "POST" && url.pathname.match(/^\/oidc\/discovery\/import\/(preprod|prod)$/);
-    if (discoveryImportMatch) {
-      const session = getOrCreateSession(req, res);
-      const environmentKey = discoveryImportMatch[1];
-
-      if (!checkRateLimit(session.id, `discovery-import-${environmentKey}`, 10, 60 * 1000)) {
-        sendJson(res, 429, { ok: false, error: "Too many requests. Please wait before retrying." });
-        return;
-      }
-
-      const rawBody = await readBody(req);
-      const body = parseBody(req, rawBody);
-      const rawDiscoveryUrl = String(body?.discoveryUrl || "").trim();
-
-      const urlError = validateDiscoveryUrl(rawDiscoveryUrl);
-      if (urlError) {
-        sendJson(res, 400, { ok: false, error: urlError });
-        return;
-      }
-
-      const result = await importDiscoveryMetadata(rawDiscoveryUrl);
-      if (!result.ok) {
-        sendJson(res, 400, { ok: false, error: result.error });
-        return;
-      }
-
-      oidcEnvironmentConfig[environmentKey] = {
-        discoveryUrl: rawDiscoveryUrl,
-        discoveredAt: new Date().toISOString(),
-        ...result.metadata
-      };
-      schedulePersistState();
-
-      sendJson(res, 200, {
-        ok: true,
-        environment: { key: environmentKey, ...oidcEnvironmentConfig[environmentKey] }
-      });
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/saml/service-providers") {
-      const session = getOrCreateSession(req, res);
-      const flash = consumeFlash(session);
-      const model = {
-        serviceProviders: attachSamlFlowsToServiceProviders(samlServiceProviderService.listSamlServiceProviders().map(sanitizeSamlServiceProviderForUi)),
-        flash
-      };
-      sendHtml(res, renderSamlServiceProvidersPage(model));
-      return;
-    }
-
-    if (req.method === "GET" && url.pathname === "/saml/service-providers/new") {
-      const session = getOrCreateSession(req, res);
-      sendHtml(res, renderSamlServiceProviderNewPage({
-        flash: consumeFlash(session),
-        ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi)
-      }));
-      return;
-    }
-
-    if (req.method === "POST" && url.pathname === "/saml/service-providers") {
-      const session = getOrCreateSession(req, res);
-      if (!checkRateLimit(session.id, "saml-sp-create", 20, 5 * 60 * 1000)) {
-        sendJson(res, 429, { error: "Too many requests. Please wait before retrying." });
-        return;
-      }
-      const rawBody = await readBody(req);
-      const body = parseBody(req, rawBody);
-      const result = samlServiceProviderService.createSamlServiceProvider(body);
-
-      if (!result.ok) {
-        sendHtml(res, renderSamlServiceProviderNewPage({
-          flash: consumeFlash(session),
-          form: result.validation,
-          ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi)
-        }));
-        return;
-      }
-
-      addSessionLog(session, "info", "saml_sp_created", "SAML Service Provider created.", {
-        serviceProviderId: result.serviceProvider.id,
-        name: result.serviceProvider.name
-      });
-      setFlash(
-        session,
-        result.validation.warnings.length ? "warn" : "info",
-        result.validation.warnings.length
-          ? `SAML Service Provider created. ${result.validation.warnings.join(" ")}`
-          : "SAML Service Provider created."
-      );
-      redirect(res, "/saml/service-providers");
-      return;
-    }
-
-    const samlEditId = req.method === "GET" ? matchSamlServiceProviderEditPath(url.pathname) : null;
-    if (samlEditId) {
-      const session = getOrCreateSession(req, res);
-      const sp = samlServiceProviderService.getSamlServiceProvider(samlEditId);
-      if (!sp) {
-        setFlash(session, "warn", "SAML Service Provider not found.");
-        redirect(res, "/saml/service-providers");
-        return;
-      }
-      const sanitizedSp = sanitizeSamlServiceProviderForUi(sp);
-      sendHtml(res, renderSamlServiceProviderEditPage({
-        serviceProvider: sanitizedSp,
-        flash: consumeFlash(session),
-        ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi),
-        acsUrl: sanitizedSp.acsUrl
-      }));
-      return;
-    }
-
-    const samlDeleteId = req.method === "POST" ? matchSamlServiceProviderDeletePath(url.pathname) : null;
-    if (samlDeleteId) {
-      const session = getOrCreateSession(req, res);
-      if (!samlServiceProviderService.deleteSamlServiceProvider(samlDeleteId)) {
-        setFlash(session, "warn", "SAML Service Provider not found.");
-        redirect(res, "/saml/service-providers");
-        return;
-      }
-      addSessionLog(session, "info", "saml_sp_deleted", "SAML Service Provider deleted.", { serviceProviderId: samlDeleteId });
-      setFlash(session, "info", "SAML Service Provider deleted.");
-      redirect(res, "/saml/service-providers");
-      return;
-    }
-
-    const samlUpdateId = req.method === "POST" ? matchSamlServiceProviderUpdatePath(url.pathname) : null;
-    if (samlUpdateId && samlUpdateId.startsWith("saml_sp_")) {
-      const session = getOrCreateSession(req, res);
-      const rawBody = await readBody(req);
-      const body = parseBody(req, rawBody);
-      const result = samlServiceProviderService.updateSamlServiceProvider(samlUpdateId, body);
-
-      if (result.notFound) {
-        setFlash(session, "warn", "SAML Service Provider not found.");
-        redirect(res, "/saml/service-providers");
-        return;
-      }
-
-      if (!result.ok) {
-        sendHtml(res, renderSamlServiceProviderEditPage({
-          serviceProvider: sanitizeSamlServiceProviderForUi(result.serviceProvider),
-          flash: consumeFlash(session),
-          form: result.validation,
-          ezAccessEnvironments: listEzAccessEnvironments().map(sanitizeEzAccessEnvironmentForUi),
-          acsUrl: `${BASE_URL}/saml/acs/${samlUpdateId}`
-        }));
-        return;
-      }
-
-      addSessionLog(session, "info", "saml_sp_updated", "SAML Service Provider updated.", {
-        serviceProviderId: result.serviceProvider.id,
-        name: result.serviceProvider.name
-      });
-      setFlash(
-        session,
-        result.validation.warnings.length ? "warn" : "info",
-        result.validation.warnings.length
-          ? `SAML Service Provider updated. ${result.validation.warnings.join(" ")}`
-          : "SAML Service Provider updated."
-      );
-      redirect(res, "/saml/service-providers");
-      return;
-    }
+    // Legacy SSR discovery import — kept for public/app.js AJAX until the
+    // SPA Discovery form ships. The /api/oidc/discovery/import/:env twin
+    // is the new canonical endpoint (protected by assertApiPostAllowed).
 
     const samlFlowStartId = (req.method === "POST" || req.method === "GET") ? matchSamlFlowStartPath(url.pathname) : null;
     if (samlFlowStartId) {
@@ -3992,257 +4169,30 @@ const server = http.createServer(async (req, res) => {
         return;
       }
 
-      const sp = samlServiceProviderService.getSamlServiceProvider(samlFlowStartId);
-      if (!sp) {
+      const result = await startNewSamlUiFlow(session, samlFlowStartId, { httpMethod: req.method || "POST" });
+
+      if (result.notFound) {
         setFlash(session, "warn", "SAML Service Provider not found.");
         redirect(res, "/saml/service-providers");
         return;
       }
 
-      if (sp.requestSigned) {
-        setFlash(session, "error", "Signed AuthnRequest is not implemented yet.");
-        redirect(res, `/saml/service-providers/${encodeURIComponent(sp.id)}/edit`);
+      if (!result.ok) {
+        if (result.redirectHint === "sp_edit") {
+          setFlash(session, "error", result.errorMessage || "Failed to start SAML flow.");
+          redirect(res, `/saml/service-providers/${encodeURIComponent(result.spId || samlFlowStartId)}/edit`);
+          return;
+        }
+        if (result.redirectHint === "flow_result" && result.flow) {
+          redirect(res, `/saml/flows/${encodeURIComponent(result.flow.id)}`);
+          return;
+        }
+        setFlash(session, "error", result.errorMessage || "Failed to start SAML flow.");
+        redirect(res, "/saml/service-providers");
         return;
       }
 
-      // Resolve IdP metadata
-      let idpMetadata;
-      try {
-        let metadataXml = sp.idpMetadataXml;
-        if (!metadataXml && sp.idpMetadataUrl) {
-          metadataXml = await fetchIdpMetadataFromUrl(sp.idpMetadataUrl);
-        }
-        if (!metadataXml) {
-          throw new Error("No IdP metadata configured. Provide an URL or paste XML in the Service Provider settings.");
-        }
-        idpMetadata = parseIdpMetadata(metadataXml);
-        if (!idpMetadata.ssoUrl) {
-          throw new Error("IdP SSO URL not found in metadata. Check the XML or the metadata URL.");
-        }
-      } catch (error) {
-        appLog("warn", "saml_flow_start: metadata error", { spId: sp.id, error: error.message });
-        setFlash(session, "error", `IdP metadata error: ${error.message}`);
-        redirect(res, `/saml/service-providers/${encodeURIComponent(sp.id)}/edit`);
-        return;
-      }
-
-      const requestId = generateAuthnRequestId();
-      const relayState = generateRelayState();
-      const acsUrl = `${BASE_URL}/saml/acs/${sp.id}`;
-      const issueInstant = new Date().toISOString();
-
-      const authnRequestXml = buildAuthnRequestXml({
-        requestId,
-        issueInstant,
-        destination: idpMetadata.ssoUrl,
-        acsUrl,
-        spEntityId: sp.spEntityId,
-        nameIdFormat: sp.nameIdFormat || ""
-      });
-
-      const env = getEzAccessEnvironment(sp.environment || "");
-      const envLabel = env?.key === "preprod" ? "Preprod" : env?.key === "prod" ? "Prod" : "";
-
-      const flow = samlFlowService.createFlow(sp.id, {
-        relayState: "received / redacted",
-        relayStatePresent: true,
-        relayStateSha25612: shortHash(relayState),
-        requestId,
-        ssoUrl: idpMetadata.ssoUrl,
-        idpEntityId: idpMetadata.entityId,
-        spEntityId: sp.spEntityId,
-        acsUrl,
-        nameIdFormat: sp.nameIdFormat || "",
-        authorizationUrl: "",
-        serviceProviderName: sp.name,
-        environment: sp.environment || "",
-        environmentLabel: envLabel
-      });
-
-      const startHttpMethod = req.method || "POST";
-
-      if (idpMetadata.ssoBinding !== "HTTP-Redirect") {
-        const unsupportedBindingRaw = buildUnsupportedSamlBindingRaw(idpMetadata);
-        samlFlowService.addFlowStep(flow.id, {
-          stepName: "authn_request_created",
-          status: "success",
-          httpMethod: startHttpMethod,
-          endpoint: `/saml/flows/start/${sp.id}`,
-          completedAt: new Date().toISOString(),
-          requestData: {
-            request_id: requestId,
-            sp_entity_id: sp.spEntityId,
-            acs_url: acsUrl,
-            destination: idpMetadata.ssoUrl,
-            name_id_format: sp.nameIdFormat || "(unspecified)",
-            issue_instant: issueInstant,
-            idp_entity_id: idpMetadata.entityId || "(not found in metadata)",
-            idp_has_certificate: idpMetadata.hasCertificate ? "yes" : "not found",
-            binding_used_for_request: "not implemented"
-          },
-          responseData: {
-            authn_request: "generated",
-            encoding: "not performed",
-            warning: "HTTP-POST AuthnRequest binding not implemented"
-          },
-          rawRequestData: buildSamlAuthnRequestRaw({
-            authnRequestXml,
-            requestId,
-            issueInstant,
-            idpMetadata,
-            sp,
-            acsUrl,
-            samlRequestParam: "",
-            relayState,
-            authorizationUrl: ""
-          }),
-          rawResponseData: buildSamlSyntheticResponseRaw({
-            rawType: "Synthetic local response",
-            status: 0,
-            note: "AuthnRequest generated locally; encoding skipped because HTTP-POST AuthnRequest binding is not implemented."
-          })
-        });
-
-        samlFlowService.addFlowStep(flow.id, {
-          stepName: "redirect_to_idp",
-          status: "error",
-          httpMethod: "POST",
-          endpoint: idpMetadata.ssoUrl,
-          httpStatus: null,
-          completedAt: new Date().toISOString(),
-          requestData: {
-            sso_url: idpMetadata.ssoUrl,
-            metadata_binding: idpMetadata.ssoBinding || "not found",
-            binding_used: "not implemented"
-          },
-          responseData: {
-            redirect_to: "not performed",
-            warning: "HTTP-POST AuthnRequest binding not implemented"
-          },
-          rawRequestData: unsupportedBindingRaw,
-          rawResponseData: {
-            ...unsupportedBindingRaw,
-            raw_type: "Synthetic local response",
-            local_http_status: "not emitted"
-          },
-          errorData: {
-            error: "HTTP-POST AuthnRequest binding not implemented"
-          }
-        });
-
-        samlFlowService.completeFlow(flow.id, {
-          status: "failed",
-          failedStep: "redirect_to_idp",
-          errorCode: "saml_authn_request_post_binding_not_implemented",
-          errorDescription: "HTTP-POST AuthnRequest binding not implemented."
-        });
-
-        redirect(res, `/saml/flows/${encodeURIComponent(flow.id)}`);
-        return;
-      }
-
-      let samlRequestParam;
-      try {
-        samlRequestParam = encodeAuthnRequestForRedirect(authnRequestXml);
-      } catch (error) {
-        appLog("warn", "saml_flow_start: encode error", { spId: sp.id, error: error.message });
-        setFlash(session, "error", "Failed to encode AuthnRequest.");
-        redirect(res, `/saml/service-providers/${encodeURIComponent(sp.id)}/edit`);
-        return;
-      }
-
-      const authorizationUrl = buildSsoRedirectUrl(idpMetadata.ssoUrl, samlRequestParam, relayState);
-      samlFlowService.updateFlow(flow.id, {
-        runtime: {
-          ...flow.runtime,
-          authorizationUrl: redactSamlRedirectUrl(authorizationUrl),
-          authorizationUrlNature: "redacted browser redirect URL"
-        }
-      });
-
-      samlFlowService.addFlowStep(flow.id, {
-        stepName: "authn_request_created",
-        status: "success",
-        httpMethod: startHttpMethod,
-        endpoint: `/saml/flows/start/${sp.id}`,
-        completedAt: new Date().toISOString(),
-        requestData: {
-          request_id: requestId,
-          sp_entity_id: sp.spEntityId,
-          acs_url: acsUrl,
-          destination: idpMetadata.ssoUrl,
-          name_id_format: sp.nameIdFormat || "(unspecified)",
-          issue_instant: issueInstant,
-          idp_entity_id: idpMetadata.entityId || "(not found in metadata)",
-          idp_has_certificate: idpMetadata.hasCertificate ? "yes" : "not found",
-          expected_response_protocol_binding: "HTTP-POST",
-          binding_used_for_request: "HTTP-Redirect",
-          saml_request_encoded_size_bytes: Buffer.byteLength(samlRequestParam, "utf8"),
-          saml_request_sha256_12: shortHash(samlRequestParam),
-          relay_state: "present",
-          relay_state_sha256_12: shortHash(relayState)
-        },
-        responseData: {
-          authn_request: "generated",
-          encoding: "HTTP-Redirect (deflate + base64)",
-          raw_nature: "Prepared SAML AuthnRequest"
-        },
-        rawRequestData: buildSamlAuthnRequestRaw({
-          authnRequestXml,
-          requestId,
-          issueInstant,
-          idpMetadata,
-          sp,
-          acsUrl,
-          samlRequestParam,
-          relayState,
-          authorizationUrl
-        }),
-        rawResponseData: buildSamlSyntheticResponseRaw({
-          rawType: "Synthetic local response",
-          status: 0,
-          note: "AuthnRequest generated and encoded locally before redirect."
-        })
-      });
-
-      samlFlowService.addFlowStep(flow.id, {
-        stepName: "redirect_to_idp",
-        status: "success",
-        httpMethod: "GET",
-        endpoint: idpMetadata.ssoUrl,
-        httpStatus: 302,
-        completedAt: new Date().toISOString(),
-        requestData: {
-          sso_url: idpMetadata.ssoUrl,
-          relay_state: "present",
-          relay_state_sha256_12: shortHash(relayState),
-          saml_request: "present",
-          saml_request_encoded_size_bytes: Buffer.byteLength(samlRequestParam, "utf8"),
-          saml_request_sha256_12: shortHash(samlRequestParam),
-          binding: "HTTP-Redirect",
-          http_mode: "browser redirect"
-        },
-        responseData: {
-          redirect_to: "IdP SSO endpoint",
-          redirect_url: "redacted raw available",
-          local_http_status: "302 synthetic/local",
-          awaiting: "SAMLResponse on ACS",
-          raw_nature: "Prepared browser redirect"
-        },
-        rawRequestData: buildSamlRedirectRaw({ authorizationUrl, idpMetadata, samlRequestParam, relayState }),
-        rawResponseData: buildSamlSyntheticResponseRaw({
-          rawType: "Synthetic local response",
-          status: 302,
-          note: "Local 302 sent by this app to the browser; this is not an IdP response."
-        })
-      });
-
-      addSessionLog(session, "info", "saml_flow_started", "SAML flow started.", {
-        flowId: flow.id,
-        serviceProviderId: sp.id
-      });
-
-      redirect(res, authorizationUrl);
+      redirect(res, result.authorizationUrl);
       return;
     }
 
@@ -4556,32 +4506,6 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    const samlFlowResultId = req.method === "GET" ? matchSamlFlowResultPath(url.pathname) : null;
-    if (samlFlowResultId) {
-      const session = getOrCreateSession(req, res);
-      const model = buildSamlFlowViewModel(session, samlFlowResultId, url);
-      if (!model) {
-        setFlash(session, "warn", "SAML flow not found.");
-        redirect(res, "/saml/service-providers");
-        return;
-      }
-      sendHtml(res, renderSamlFlowResultPage(model));
-      return;
-    }
-
-    const samlFlowDetailsId = req.method === "GET" ? matchSamlFlowDetailsPath(url.pathname) : null;
-    if (samlFlowDetailsId) {
-      const session = getOrCreateSession(req, res);
-      const model = buildSamlFlowViewModel(session, samlFlowDetailsId, url);
-      if (!model) {
-        setFlash(session, "warn", "SAML flow not found.");
-        redirect(res, "/saml/service-providers");
-        return;
-      }
-      sendHtml(res, renderSamlFlowDetailsPage(model));
-      return;
-    }
-
     if ((req.method === "GET" || req.method === "POST") && url.pathname === "/oidc/callback") {
       const session = getOrCreateSession(req, res);
       const rawBody = req.method === "POST" ? await readBody(req) : "";
@@ -4608,17 +4532,10 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    if (req.method === "GET" && url.pathname === "/health") {
-      const currentProviderConfig = sanitizeProviderConfig(providerConfig);
-      sendJson(res, 200, {
-        status: "ok",
-        nodeEnv: NODE_ENV,
-        redirectUri: currentProviderConfig.redirectUri,
-        oidc: { serviceProviders: serviceProviders.length, flows: flows.length },
-        saml: { serviceProviders: samlServiceProviders.length, flows: samlFlows.length }
-      });
-      return;
-    }
+    // 9. ---- /health ----
+    // Plain readiness probe, kept outside /api/* so it has no cross-site
+    // guard.
+    if (healthRouter.handleHealthRoute(req, res, url)) return;
 
     if (ensureHtmlSessionRoute(req)) {
       sendHtmlStatus(

@@ -64,6 +64,44 @@ Un exemple est fourni dans `./.env.example`.
 Si `SESSION_SECRET` n'est pas fourni, l'application genere un secret local persistant dans `STORAGE_DIR/session-secret`.
 Cela permet de conserver le dechiffrement des secrets stockes apres redemarrage ou redeploiement, a condition de conserver le meme `STORAGE_DIR`.
 
+## Frontend Vite (isole, en preparation)
+
+Un dossier `frontend/` accueille une base Vite React strictement isolee. **Aucune
+page existante n'a ete migree**, aucune route SSR n'est modifiee, aucun
+endpoint `/api` n'est ajoute.
+
+```bash
+# Terminal 1 - backend Node (inchange)
+npm start
+
+# Terminal 2 - frontend Vite
+npm run install:frontend    # premiere fois uniquement
+npm run dev:frontend        # lance Vite sur http://127.0.0.1:5173
+```
+
+Le proxy Vite renvoie `/oidc/*`, `/saml/*`, `/assets/*`, `/api/*`, `/health`,
+`/favicon.svg` et `/favicon.ico` vers le backend Node local (`BACKEND_URL`,
+`http://localhost:3000` par defaut). Les callbacks OIDC/SAML restent
+exclusivement geres par le backend Node. Details : `frontend/README.md`.
+
+### URL canonique et matrice d'usage dev
+
+| Usage | URL a utiliser |
+| --- | --- |
+| Tester un vrai flow OIDC/SAML (redirection IdP -> callback) | `http://localhost:3000` (backend direct) |
+| Developper l'UI Vite React | `http://127.0.0.1:5173` (Vite dev) |
+| Callback OIDC enregistre chez l'IdP | `http://localhost:3000/oidc/callback` |
+| ACS SAML enregistre chez l'IdP | `http://localhost:3000/saml/acs/:spId` |
+
+Regle : **l'URL Vite (`127.0.0.1:5173`) ne doit jamais etre enregistree comme
+callback OIDC ou ACS SAML aupres d'un IdP.** L'URL canonique du backend
+(`BASE_URL`) est la seule source de verite pour construire `redirect_uri` et
+`acsUrl`. Cette URL est capturee au demarrage du serveur Node depuis
+`process.env.BASE_URL` ; elle n'est jamais recalculee a partir des headers
+`X-Forwarded-*` de la requete entrante. Le proxy Vite ne transmet volontairement
+pas `X-Forwarded-Host` (`xfwd: false` dans `vite.config.js`) pour eviter tout
+risque futur de contamination.
+
 ## Lancement avec Docker
 
 ```bash
@@ -75,22 +113,163 @@ Application disponible sur `http://localhost:8080`.
 Les donnees sont persistees dans `./data/state.json` et le secret serveur local dans `./data/session-secret` via le volume Docker `./data:/data`.
 Sur Render, le chemin par defaut devient `/app/storage`, qui doit correspondre au point de montage d'un persistent disk.
 
+## API JSON read-only
+
+Les endpoints suivants exposent en JSON, en parallele des routes SSR, les
+memes donnees deja affichees par l'UI actuelle :
+
+- `GET /api/health`
+- `GET /api/oidc/service-providers`
+- `GET /api/oidc/flows`
+- `GET /api/oidc/flows/:id`
+- `GET /api/saml/service-providers`
+- `GET /api/saml/flows`
+- `GET /api/saml/flows/:id`
+
+Aucune ecriture API. Les routes SSR sont inchangees. Details et politique
+de secret : `docs/api.md`.
+
+## Frontend Vite en production sur les routes propres
+
+**Vite est le frontend principal** et est servi par le backend Node sur les
+routes canoniques sans prefixe. La logique sensible (callbacks IdP,
+`/api/*`, `/health`, callbacks OIDC/SAML) reste intacte — aucune n'est
+capturee par le SPA grace a une allow-list explicite (`isSpaRoute` dans
+`src/routes/spa.js`), et non un catch-all `/oidc/*` / `/saml/*`.
+
+### Modules de routing
+
+Le dispatcher HTTP dans `src/server.js` compose des petits modules a
+responsabilite unique :
+
+- `src/routes/api/index.js` — routeur racine `/api/*`. Centralise
+  `assertApiPostAllowed` (guard cross-site applique une seule fois), sert
+  `GET /api/health`, delegue a `oidc.js` / `saml.js`, renvoie 404 JSON pour
+  toute route inconnue.
+- `src/routes/api/oidc.js` — endpoints `/api/oidc/*` (SP CRUD, flows,
+  discovery import).
+- `src/routes/api/saml.js` — endpoints `/api/saml/*` (SP CRUD, flows).
+- `src/routes/spa.js` — allow-list SPA + service de `frontend/dist/index.html`.
+- `src/routes/static.js` — favicons partages + `/static/assets/*` avec
+  protection path traversal.
+- `src/routes/health.js` — `GET /health` (probe readiness, hors `/api/*`).
+- `src/routes/deprecated.js` — anciennes routes POST canoniques -> 410 Gone.
+- `src/legacy-ssr/routes.js` — SSR historique read-only sous `/legacy/*`,
+  active uniquement par `ENABLE_LEGACY_SSR=1`.
+
+**Invariant securite** : chaque `POST/PATCH/DELETE /api/*` passe par
+`assertApiPostAllowed` exactement une fois, applique au niveau du routeur
+racine avant delegation. Aucun sous-routeur ne repete la verification,
+aucun ne peut la contourner. Les callbacks (`/oidc/callback`,
+`/saml/acs/:spId`) restent explicitement hors de l'arborescence
+`/api/*` et gardent leur handler dedie dans `server.js`.
+
+L'ordre du dispatcher est fixe et documente en tete de la fonction
+`http.createServer` de `src/server.js`.
+
+Routes exposees en prod :
+
+| Chemin | Servi par |
+| --- | --- |
+| `/`, `/oidc/service-providers`, `/oidc/service-providers/new`, `/oidc/service-providers/:id/edit`, `/oidc/flows`, `/oidc/flows/:id`, `/saml/service-providers`, `/saml/service-providers/new`, `/saml/service-providers/:id/edit`, `/saml/flows`, `/saml/flows/:id` | Node → `frontend/dist/index.html` (SPA allow-list) |
+| `/static/assets/<hash>.{js,css,...}` | Node → `frontend/dist/assets/<hash>...` |
+| `/api/*` | API JSON — protege par `assertApiPostAllowed` |
+| `/api/oidc/discovery/import/:env` | POST protege par le guard CSRF |
+| `/oidc/callback`, `/saml/acs/:spId` | Callbacks IdP — jamais shadowed |
+| `/oidc/flows/start/:spId`, `/saml/flows/start/:spId` | Backend redirect vers IdP |
+| `/health`, `/favicon.*` | Backend / static |
+| `/legacy/*` | SSR historique **dev-only** — voir section ci-dessous |
+| `/vite/*` | **Retire** — 404 |
+| Route inconnue (typo) | 404 backend — **ne tombe jamais** sur `dist/index.html` |
+
+Toute action applicative (create/edit/delete Service Provider, discovery
+import, start/rerun flow) passe par `/api/*`. Les anciennes routes POST
+canoniques SSR (`POST /oidc/service-providers`, `POST /oidc/discovery/import/:env`,
+etc.) repondent **410 Gone** JSON sans muter d'etat.
+
+En dev, `frontend/` est isole comme avant (`npm run dev:frontend` sur
+`127.0.0.1:5173`). En prod, `npm run build:frontend` produit `frontend/dist/`
+(base `/static/`) que Node sert directement.
+
+## SSR historique isole sous `/legacy/*`
+
+Les anciennes vues SSR ont ete deplacees sous `src/legacy-ssr/views/` et
+leurs assets sous `src/legacy-ssr/assets/`. Elles sont montees en
+**lecture seule** sous `/legacy/*` uniquement si :
+
+- `ENABLE_LEGACY_SSR=1` (flag explicite, dev **ET** prod).
+
+`NODE_ENV` seul n'active plus le legacy — dev et prod se comportent
+identiquement en l'absence du flag. Sans flag, tout GET `/legacy/*` renvoie
+404 JSON. Le SSR historique sert de reference visuelle sur les diagnostics
+— il ne modifie plus jamais d'etat (aucun POST). Les URLs internes des
+pages SSR (form actions, liens inter-vues, assets) pointent sur
+`/legacy/...` afin qu'aucune page legacy ne collide avec les routes
+canoniques SPA/API.
+
+Routes legacy exposees quand active :
+
+| Chemin | Rendu |
+| --- | --- |
+| `/legacy` | Dashboard historique |
+| `/legacy/oidc/service-providers`, `/legacy/oidc/service-providers/new`, `/legacy/oidc/service-providers/:id/edit` | Liste / creation / edition OIDC SP |
+| `/legacy/oidc/flows/:id`, `/legacy/oidc/flows/:id/details` | Resultat + detail flow OIDC |
+| `/legacy/saml/service-providers`, `/legacy/saml/service-providers/new`, `/legacy/saml/service-providers/:id/edit` | Liste / creation / edition SAML SP |
+| `/legacy/saml/flows/:id`, `/legacy/saml/flows/:id/details` | Resultat + detail flow SAML |
+| `/legacy/assets/app.{css,js}`, `/legacy/assets/brand/*`, `/legacy/assets/icons/*.svg` | Assets legacy (isoles de `/static/assets/*`) |
+
+Build local :
+
+```bash
+npm run build:frontend      # produit frontend/dist/ (assets sous /static/)
+npm start                   # Node sert la SPA sur les routes canoniques
+```
+
+Build Docker (multi-stage, ne copie ni `.env` ni `data/`) :
+
+```bash
+docker compose up --build
+```
+
+L'image finale contient uniquement :
+
+- backend Node avec `node_modules` production ;
+- `src/`, `public/` ;
+- `frontend/dist/` (issu du stage de build).
+
 ## Endpoints principaux
 
+Pages SPA (Vite servi par le backend, allow-list explicite) :
+
 - `GET /`
-- `GET /service-providers`
-- `GET /service-providers/new`
-- `GET /service-providers/:id/edit`
-- `POST /service-providers`
-- `POST /service-providers/:id`
-- `POST /service-providers/:id/delete`
-- `POST /flows/start/:spId`
-- `POST /flows/:id/rerun`
-- `GET /flows/:id`
-- `GET /flows/:id/details`
-- `GET /oidc/callback`
-- `POST /oidc/callback`
+- `GET /oidc/service-providers`, `/oidc/service-providers/new`, `/oidc/service-providers/:id/edit`
+- `GET /oidc/flows`, `/oidc/flows/:id`
+- `GET /saml/service-providers`, `/saml/service-providers/new`, `/saml/service-providers/:id/edit`
+- `GET /saml/flows`, `/saml/flows/:id`
+
+Actions applicatives (JSON API, uniquement via `/api/*`) :
+
+- `GET/POST/PATCH/DELETE /api/oidc/service-providers[...]`
+- `GET/POST/PATCH/DELETE /api/saml/service-providers[...]`
+- `POST /api/oidc/flows/start/:spId`, `POST /api/oidc/flows/:id/rerun`
+- `POST /api/saml/flows/start/:spId`, `POST /api/saml/flows/:id/rerun`
+- `POST /api/oidc/discovery/import/:env`
+- `GET /api/oidc/flows`, `GET /api/oidc/flows/:id`, `GET /api/saml/flows`, `GET /api/saml/flows/:id`
+- `GET /api/health`
+
+Callbacks IdP (jamais captures par le SPA) :
+
+- `GET/POST /oidc/callback`
+- `POST /saml/acs/:spId`
+- `GET/POST /oidc/flows/start/:spId`, `GET/POST /saml/flows/start/:spId`
+
+Divers :
+
 - `GET /health`
+- `GET /favicon.svg`, `GET /favicon.ico`
+- `GET /static/assets/*` (bundle Vite)
+- `GET /legacy/*` — flag `ENABLE_LEGACY_SSR=1` uniquement, sinon 404
+- Anciennes routes POST canoniques SSR (`POST /oidc/service-providers`, etc.) → **410 Gone** (voir `src/routes/deprecated.js`)
 
 ## Notes de securite
 

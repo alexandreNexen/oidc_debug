@@ -27,10 +27,10 @@ import {
 
 import { createFlowService } from "../src/protocols/oidc/services/flows.js";
 import { validateServiceProviderInput } from "../src/protocols/oidc/services/serviceProviders.js";
-import { renderFlowDetailsPage } from "../src/protocols/oidc/views/flowDetails.js";
-import { renderFlowResultPage } from "../src/protocols/oidc/views/flowResult.js";
+import { renderFlowDetailsPage } from "../src/legacy-ssr/views/oidc/flowDetails.js";
+import { renderFlowResultPage } from "../src/legacy-ssr/views/oidc/flowResult.js";
 import { createSamlFlowService } from "../src/protocols/saml/services/flows.js";
-import { renderSamlFlowDetailsPage } from "../src/protocols/saml/views/flowDetails.js";
+import { renderSamlFlowDetailsPage } from "../src/legacy-ssr/views/saml/flowDetails.js";
 import {
   parseSamlResponse,
   redactSamlRedirectUrl,
@@ -1326,7 +1326,7 @@ describe("XSS prevention in output", () => {
   const XSS_PAYLOAD = '<script>alert("xss")</script>';
 
   it("escapeHtml neutralizes script tags", async () => {
-    const { escapeHtml } = await import("../src/common/views/layout.js");
+    const { escapeHtml } = await import("../src/legacy-ssr/views/common/layout.js");
     const result = escapeHtml(XSS_PAYLOAD);
     assert.ok(!result.includes("<script>"), "XSS: <script> tag found after escapeHtml");
     assert.ok(result.includes("&lt;script&gt;"), "escapeHtml did not encode <script> to &lt;script&gt;");
