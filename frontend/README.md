@@ -5,15 +5,15 @@ endpoints `/api/*`. La logique OIDC/SAML sensible (callbacks, token
 exchange, ACS, signature, sessions, secrets) reste dans `src/server.js`
 (backend Node). Le SSR historique a été isolé sous `/legacy/*` (dev-only).
 
-## Lancer en développement
+## Deux modes de lancement
 
-Deux processus en parallèle.
+### Mode 1 — Dev HMR (deux processus)
 
 ```bash
-# Terminal 1 — backend Node existant (inchangé)
+# Terminal 1 — backend Node (API JSON, callbacks IdP, sessions)
 npm start                          # ou: npm run dev
 
-# Terminal 2 — frontend Vite (nouveau)
+# Terminal 2 — frontend Vite (UI + HMR)
 npm --prefix frontend install       # une fois
 npm --prefix frontend run dev       # ou: npm run dev:frontend depuis la racine
 ```
@@ -22,18 +22,44 @@ Par défaut :
 - backend Node : `http://localhost:3000` (port configurable via `PORT`)
 - frontend Vite : `http://127.0.0.1:5173`
 
-Le navigateur pointe **uniquement** sur `http://127.0.0.1:5173`. Le proxy Vite
-relaie vers le backend Node pour :
+Le navigateur pointe **uniquement** sur `http://127.0.0.1:5173`. Les routes
+SPA (`/`, `/oidc/service-providers`, `/saml/flows/:id`, ...) sont servies
+par Vite dev via son fallback HTML par défaut : `frontend/index.html` →
+`/src/main.jsx` → React (avec HMR).
 
-- `/api/*`
-- `/oidc/*`
-- `/saml/*`
-- `/assets/*`
-- `/health`
-- `/favicon.svg`, `/favicon.ico`
+Le proxy Vite dev relaie vers le backend Node **uniquement** :
+
+- `/api/*` — API JSON (le seul namespace utilisé par le client React)
+- `/favicon.svg`, `/favicon.ico` — favicons servis par le backend
+
+Ne sont **pas** proxyfiés (donc traités localement par Vite dev) :
+
+- `/oidc/*`, `/saml/*` — routes SPA, fallback vers `frontend/index.html`
+- `/static/*` — namespace du build production, sans emploi en dev
+- `/assets/*`, `/health`, `/legacy/*` — hors périmètre du frontend Vite
 
 Cible du proxy override : `BACKEND_URL=http://localhost:3000` (variable
 d'environnement lue par `vite.config.js`).
+
+### Mode 2 — Build intégré (backend seul)
+
+```bash
+npm run build:frontend             # produit frontend/dist/ (base /static/)
+npm start                          # backend sert la SPA + /api/*
+```
+
+Ouvrir `http://localhost:3000`. Vite dev n'est pas lancé — le backend Node
+sert `frontend/dist/index.html` sur les routes SPA (allow-list
+`isSpaRoute`) et streame `frontend/dist/assets/<hash>.{js,css}` sous
+`/static/assets/*`. Aucune HMR : chaque modif front demande un rebuild.
+
+### Symptôme d'une mauvaise configuration
+
+Si en mode dev le navigateur reçoit un 404 sur `/static/assets/index-<hash>.js`,
+c'est le signe qu'une route SPA a été proxyfiée vers le backend et que
+celui-ci a répondu avec `dist/index.html` (référence `/static/...`). Le
+proxy Vite dev doit rester limité à `/api/*` et aux favicons ; sinon la
+SPA reçoit un HTML de build qui n'existe pas en dev.
 
 ## Pourquoi passer par le proxy ?
 

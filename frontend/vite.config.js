@@ -3,12 +3,19 @@ import react from "@vitejs/plugin-react";
 
 const BACKEND_URL = process.env.BACKEND_URL || "http://localhost:3000";
 
+// Only /api/* (and the two backend-owned favicons) are proxied. The SPA
+// routes ("/", "/oidc/service-providers", "/saml/flows/:id", ...) MUST NOT
+// be proxied in dev: they are handled by Vite's default HTML fallback which
+// serves index.html → /src/main.jsx → React. Proxying "/oidc" or "/saml"
+// would forward the SPA navigation to the backend, which would return its
+// production dist/index.html (referencing /static/assets/<hash>.js) — assets
+// that the Vite dev server has no way to serve, producing a 404 chain.
+//
+// The /health probe is intentionally not proxied: the frontend client uses
+// /api/health. Legacy SSR assets under /assets/* are only referenced by the
+// SSR views under /legacy/*, which the SPA never renders.
 const PROXIED_PREFIXES = [
   "/api",
-  "/oidc",
-  "/saml",
-  "/assets",
-  "/health",
   "/favicon.svg",
   "/favicon.ico"
 ];
@@ -30,15 +37,21 @@ function buildProxyConfig() {
   return proxy;
 }
 
-// In production, the backend serves the build assets under /static/assets/*
-// and serves dist/index.html on the canonical SPA routes ("/",
-// "/oidc/service-providers", ...) via an explicit allow-list. Setting `base`
-// to "/static/" during `vite build` makes dist/index.html reference
-// /static/assets/... which matches the Node handler.
-// The /vite/* prefix is still served as a temporary alias by the backend to
-// preserve older bookmarks and existing integration tests.
-// In dev, the Vite dev server keeps `base: /` so navigating directly to
-// http://127.0.0.1:5173/ hits the dashboard as before.
+// Two run modes, distinct base URL:
+//   - dev (vite serve):  base: "/"        → index.html loads /src/main.jsx
+//   - build (vite build): base: "/static/" → dist/index.html references
+//                                             /static/assets/<hash>.{js,css}
+//
+// In build mode, the backend serves dist/index.html on the canonical SPA
+// routes ("/", "/oidc/service-providers", ...) via an explicit allow-list
+// (isSpaRoute in src/routes/spa.js) and streams the hashed assets from
+// /static/assets/* (src/routes/static.js).
+//
+// In dev mode, Vite dev is authoritative on port 5173: any HTML navigation
+// under an SPA route falls through to Vite's built-in history fallback and
+// receives frontend/index.html, which references /src/main.jsx (source).
+// The dev server never touches dist/. Rebuilding is not required to see
+// changes — HMR does that.
 export default defineConfig(({ command }) => ({
   root: ".",
   base: command === "build" ? "/static/" : "/",

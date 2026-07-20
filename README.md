@@ -64,43 +64,85 @@ Un exemple est fourni dans `./.env.example`.
 Si `SESSION_SECRET` n'est pas fourni, l'application genere un secret local persistant dans `STORAGE_DIR/session-secret`.
 Cela permet de conserver le dechiffrement des secrets stockes apres redemarrage ou redeploiement, a condition de conserver le meme `STORAGE_DIR`.
 
-## Frontend Vite (isole, en preparation)
+## Frontend Vite — Deux modes de lancement
 
-Un dossier `frontend/` accueille une base Vite React strictement isolee. **Aucune
-page existante n'a ete migree**, aucune route SSR n'est modifiee, aucun
-endpoint `/api` n'est ajoute.
+Vite est le frontend principal. Deux modes distincts, chacun avec sa propre
+URL canonique.
+
+### Mode 1 — Dev HMR (deux processus)
+
+Recommande pour developper l'UI. Vite dev sert `frontend/index.html` avec
+HMR sur toutes les routes SPA. Le backend Node n'est utilise que via son
+API JSON.
 
 ```bash
-# Terminal 1 - backend Node (inchange)
-npm start
+# Terminal 1 - backend Node (API /api/*, callbacks, sessions)
+npm run dev                 # ou: npm start
 
-# Terminal 2 - frontend Vite
+# Terminal 2 - Vite dev (UI + HMR)
 npm run install:frontend    # premiere fois uniquement
 npm run dev:frontend        # lance Vite sur http://127.0.0.1:5173
 ```
 
-Le proxy Vite renvoie `/oidc/*`, `/saml/*`, `/assets/*`, `/api/*`, `/health`,
-`/favicon.svg` et `/favicon.ico` vers le backend Node local (`BACKEND_URL`,
-`http://localhost:3000` par defaut). Les callbacks OIDC/SAML restent
-exclusivement geres par le backend Node. Details : `frontend/README.md`.
+Ouvrir dans le navigateur : **`http://127.0.0.1:5173`**.
 
-### URL canonique et matrice d'usage dev
+Toutes les routes SPA (`/`, `/oidc/service-providers`, `/saml/flows/:id`,
+...) sont servies par Vite dev via son fallback HTML par defaut :
+`frontend/index.html` -> `/src/main.jsx` -> React (avec HMR).
 
-| Usage | URL a utiliser |
-| --- | --- |
-| Tester un vrai flow OIDC/SAML (redirection IdP -> callback) | `http://localhost:3000` (backend direct) |
-| Developper l'UI Vite React | `http://127.0.0.1:5173` (Vite dev) |
-| Callback OIDC enregistre chez l'IdP | `http://localhost:3000/oidc/callback` |
-| ACS SAML enregistre chez l'IdP | `http://localhost:3000/saml/acs/:spId` |
+Le proxy Vite dev **ne relaie que** `/api/*`, `/favicon.svg` et
+`/favicon.ico` vers le backend Node local (`BACKEND_URL`, `http://localhost:3000`
+par defaut). Il ne relaie **jamais** `/oidc/*`, `/saml/*`, `/static/*` — ces
+prefixes sont soit des routes SPA (fallback Vite), soit des artefacts de build
+qui n'ont pas leur place en dev.
 
-Regle : **l'URL Vite (`127.0.0.1:5173`) ne doit jamais etre enregistree comme
-callback OIDC ou ACS SAML aupres d'un IdP.** L'URL canonique du backend
-(`BASE_URL`) est la seule source de verite pour construire `redirect_uri` et
-`acsUrl`. Cette URL est capturee au demarrage du serveur Node depuis
-`process.env.BASE_URL` ; elle n'est jamais recalculee a partir des headers
-`X-Forwarded-*` de la requete entrante. Le proxy Vite ne transmet volontairement
-pas `X-Forwarded-Host` (`xfwd: false` dans `vite.config.js`) pour eviter tout
-risque futur de contamination.
+Les callbacks IdP (`/oidc/callback`, `/saml/acs/:spId`) et le start des flows
+(`POST /api/oidc/flows/start/:spId`) restent exclusivement geres par le
+backend Node sur son URL canonique (`BASE_URL`, ex. `http://localhost:3000`).
+Le proxy Vite ne les intercepte pas — cela imposerait l'enregistrement du
+port 5173 chez l'IdP, ce qui n'est pas voulu.
+
+Details : `frontend/README.md`.
+
+### Mode 2 — Build integre (un seul processus)
+
+Recommande pour tester la version deployee, valider la parite prod ou en
+CI. Aucune HMR : chaque modif front demande un rebuild.
+
+```bash
+npm run build:frontend      # produit frontend/dist/ (assets sous /static/)
+npm start                   # ou: npm run dev
+```
+
+Ouvrir dans le navigateur : **`http://localhost:3000`**.
+
+Le backend Node sert directement :
+- `frontend/dist/index.html` sur les routes SPA (allow-list `isSpaRoute`) ;
+- `frontend/dist/assets/<hash>.{js,css}` sous `/static/assets/*` ;
+- `/api/*`, callbacks IdP, `/health`, favicons — comme avant.
+
+Vite n'est pas lance dans ce mode.
+
+### Recap des URLs par mode
+
+| Objectif | Mode | URL a ouvrir |
+| --- | --- | --- |
+| Developper l'UI (HMR) | Dev HMR | `http://127.0.0.1:5173` |
+| Tester la version integree | Build | `http://localhost:3000` |
+| Callback OIDC enregistre chez l'IdP | (n'importe quel mode) | `http://localhost:3000/oidc/callback` |
+| ACS SAML enregistre chez l'IdP | (n'importe quel mode) | `http://localhost:3000/saml/acs/:spId` |
+
+**Regle** : l'URL Vite dev (`127.0.0.1:5173`) ne doit jamais etre
+enregistree comme `redirect_uri` OIDC ou ACS SAML aupres d'un IdP.
+
+### Invariant securite — origine canonique du backend
+
+L'URL canonique du backend (`BASE_URL`) est la seule source de verite pour
+construire `redirect_uri` et `acsUrl`. Cette URL est capturee au demarrage
+du serveur Node depuis `process.env.BASE_URL` ; elle n'est jamais recalculee
+a partir des headers `X-Forwarded-*` de la requete entrante. Le proxy Vite
+ne transmet volontairement pas `X-Forwarded-Host` (`xfwd: false` dans
+`vite.config.js`) pour eviter tout risque futur de contamination.
 
 ## Lancement avec Docker
 
